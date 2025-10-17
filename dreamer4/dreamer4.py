@@ -65,7 +65,7 @@ TokenizerLosses = namedtuple('TokenizerLosses', ('recon', 'lpips'))
 WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'reward', 'behavior_clone'))
 
 @dataclass
-class WorldModelGenerations:
+class Experience:
     latents: Tensor
     video: Tensor | None = None
     rewards: Tensor | None = None
@@ -74,6 +74,7 @@ class WorldModelGenerations:
     values: Tensor | None = None
     step_size: int | None = None
     agent_index: int = 0
+    is_from_world_model: bool = True
 
 # helpers
 
@@ -1665,7 +1666,7 @@ class DynamicsWorldModel(Module):
 
     def learn_policy_from_generations(
         self,
-        generation: WorldModelGenerations
+        generation: Experience
     ):
         latents = generation.latents
         actions = generation.actions
@@ -1914,7 +1915,7 @@ class DynamicsWorldModel(Module):
 
         # returning agent actions, rewards, and log probs + values for policy optimization
 
-        gen = WorldModelGenerations(
+        gen = Experience(
             latents = latents,
             video = video,
             step_size = step_size,
