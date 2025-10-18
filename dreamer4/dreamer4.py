@@ -2503,12 +2503,12 @@ class DynamicsWorldModel(Module):
             )
 
             if exists(discrete_log_probs):
-                discrete_log_probs = discrete_log_probs.masked_fill(discrete_mask[..., None], 0.)
+                discrete_log_probs = discrete_log_probs.masked_fill(~discrete_mask[..., None], 0.)
 
                 behavior_clone_loss = behavior_clone_loss - reduce(discrete_log_probs, 'mtp b t na -> b t', 'sum').mean()
 
             if exists(continuous_log_probs):
-                continuous_log_probs = continuous_log_probs.masked_fill(continuous_mask[..., None], 0.)
+                continuous_log_probs = continuous_log_probs.masked_fill(~continuous_mask[..., None], 0.)
 
                 behavior_clone_loss = behavior_clone_loss - reduce(continuous_log_probs, 'mtp b t na -> b t', 'sum').mean()
 
