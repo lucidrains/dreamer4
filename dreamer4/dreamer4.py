@@ -1883,6 +1883,8 @@ class DynamicsWorldModel(Module):
         policy_optim: Optimizer | None = None,
         value_optim: Optimizer | None = None
     ):
+        assert experience.is_batched
+
         latents = experience.latents
         actions = experience.actions
         old_log_probs = experience.log_probs
