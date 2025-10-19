@@ -423,3 +423,16 @@ def test_mtp():
     discrete_logits, continuous_logits = embedder.unembed(action_embed, pred_head_index = 0)
 
     assert discrete_logits.shape == (2, 16, 8)
+
+def test_loss_normalizer():
+    from torch import cat
+    from dreamer4.dreamer4 import LossNormalizer
+
+    loss_normalizer = LossNormalizer(4, beta = 0.)
+
+    losses = torch.rand(4)
+
+    _ = loss_normalizer(losses)
+    normed_losses = loss_normalizer(losses)
+
+    assert (normed_losses == 1.).all()
