@@ -2171,7 +2171,8 @@ class DynamicsWorldModel(Module):
         latent_is_noised = False,
         return_all_losses = False,
         return_agent_tokens = False,
-        add_autoregressive_action_loss = False
+        add_autoregressive_action_loss = False,
+        update_loss_ema = None
     ):
         # handle video or latents
 
@@ -2567,16 +2568,16 @@ class DynamicsWorldModel(Module):
         losses = WorldModelLosses(flow_loss, reward_loss, discrete_action_loss, continuous_action_loss)
 
         if exists(self.flow_loss_normalizer):
-            flow_loss = self.flow_loss_normalizer(flow_loss)
+            flow_loss = self.flow_loss_normalizer(flow_loss, update_ema = update_loss_ema)
 
         if exists(rewards) and exists(self.reward_loss_normalizer):
-            reward_loss = self.reward_loss_normalizer(reward_loss)
+            reward_loss = self.reward_loss_normalizer(reward_loss, update_ema = update_loss_ema)
 
         if exists(discrete_actions) and exists(self.discrete_actions_loss_normalizer):
-            discrete_action_loss = self.discrete_actions_loss_normalizer(discrete_action_loss)
+            discrete_action_loss = self.discrete_actions_loss_normalizer(discrete_action_loss, update_ema = update_loss_ema)
 
         if exists(continuous_actions) and exists(self.continuous_actions_loss_normalizer):
-            continuous_action_loss = self.continuous_actions_loss_normalizer(continuous_action_loss)
+            continuous_action_loss = self.continuous_actions_loss_normalizer(continuous_action_loss, update_ema = update_loss_ema)
 
         # gather losses - they sum across the multi token prediction steps for rewards and actions - eq (9)
 
