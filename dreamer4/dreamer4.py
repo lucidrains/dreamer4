@@ -1949,7 +1949,7 @@ class DynamicsWorldModel(Module):
 
         discrete_actions, continuous_actions = actions
 
-        _, agent_embed = self.forward(
+        _, (agent_embed, _) = self.forward(
             latents = latents,
             signal_levels = self.max_steps - 1,
             step_sizes = step_size,
@@ -1958,7 +1958,7 @@ class DynamicsWorldModel(Module):
             continuous_actions = continuous_actions,
             latent_is_noised = True,
             return_pred_only = True,
-            return_agent_tokens = True
+            return_intermediates = True
         )
 
         agent_embed = agent_embed[..., agent_index, :]
