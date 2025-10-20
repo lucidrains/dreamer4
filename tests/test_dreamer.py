@@ -12,6 +12,7 @@ import torch
 @param('condition_on_actions', (False, True))
 @param('num_residual_streams', (1, 4))
 @param('add_reward_embed_to_agent_token', (False, True))
+@param('use_time_kv_cache', (False, True))
 def test_e2e(
     pred_orig_latent,
     grouped_query_attn,
@@ -22,7 +23,8 @@ def test_e2e(
     signal_and_step_passed_in,
     condition_on_actions,
     num_residual_streams,
-    add_reward_embed_to_agent_token
+    add_reward_embed_to_agent_token,
+    use_time_kv_cache
 ):
     from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
 
@@ -108,7 +110,8 @@ def test_e2e(
         image_height = 128,
         image_width = 128,
         batch_size = 2,
-        return_rewards_per_frame = True
+        return_rewards_per_frame = True,
+        use_time_kv_cache = use_time_kv_cache
     )
 
     assert generations.video.shape == (2, 3, 10, 128, 128)
