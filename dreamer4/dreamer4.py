@@ -1078,6 +1078,7 @@ class Attention(Module):
         query_heads = None,
         heads = 8,
         pre_rmsnorm = True,
+        gate_values = True
     ):
         super().__init__()
         self.norm = RMSNorm(dim) if pre_rmsnorm else Identity()
@@ -1099,6 +1100,17 @@ class Attention(Module):
         self.to_k = LinearNoBias(dim, dim_kv_inner)
         self.to_v = LinearNoBias(dim, dim_kv_inner)
         self.to_out = LinearNoBias(dim_q_inner, dim)
+
+        # alphafold gating per head, for attending to nothing
+
+        self.to_gates = None
+
+        if gate_values:
+            self.to_gates = Sequential(
+                LinearNoBias(dim, query_heads),
+                Rearrange('b n h -> b h n 1'),
+                nn.Sigmoid()
+            )
 
         # stability related
 
@@ -1152,6 +1164,12 @@ class Attention(Module):
         attend_fn = default(attend_fn, naive_attend)
 
         out = attend_fn(q, k, v)
+
+        # gate values
+
+        if exists(self.to_gates):
+            gates = self.to_gates(tokens)
+            out = out * gates
 
         # merge heads
 
