@@ -30,8 +30,8 @@ def test_e2e(
 
     tokenizer = VideoTokenizer(
         16,
-        encoder_depth = 1,
-        decoder_depth = 1,
+        encoder_depth = 4,
+        decoder_depth = 4,
         dim_latent = 16,
         patch_size = 32,
         attn_dim_head = 16,
@@ -197,8 +197,8 @@ def test_action_with_world_model():
         512,
         dim_latent = 32,
         patch_size = 32,
-        encoder_depth = 1,
-        decoder_depth = 1,
+        encoder_depth = 4,
+        decoder_depth = 4,
         attn_heads = 8,
         image_height = 256,
         image_width = 256,
@@ -212,6 +212,7 @@ def test_action_with_world_model():
         num_agents = 1,
         video_tokenizer = tokenizer,
         dim_latent = 32,
+        depth = 4,
         num_discrete_actions = 4
     )
 
@@ -483,7 +484,7 @@ def test_cache_generate():
         max_steps = 64,
         num_tasks = 4,
         num_latent_tokens = 4,
-        depth = 1,
+        depth = 4,
         num_spatial_tokens = 1,
         pred_orig_latent = True,
         num_discrete_actions = 4,

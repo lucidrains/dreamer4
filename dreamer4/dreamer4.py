@@ -1251,6 +1251,7 @@ class AxialSpaceTimeTransformer(Module):
         final_norm = True
     ):
         super().__init__()
+        assert depth >= time_block_every, f'depth must be at least {time_block_every}'
 
         # hyper connections
 
