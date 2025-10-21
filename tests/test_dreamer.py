@@ -457,8 +457,8 @@ def test_tokenizer_trainer():
 
     tokenizer = VideoTokenizer(
         16,
-        encoder_depth = 1,
-        decoder_depth = 1,
+        encoder_depth = 4,
+        decoder_depth = 4,
         dim_latent = 16,
         patch_size = 32,
         attn_dim_head = 16,
@@ -470,6 +470,73 @@ def test_tokenizer_trainer():
         dataset = dataset,
         num_train_steps = 1,
         batch_size = 1,
+        cpu = True,
+        max_grad_norm = 0.5
+    )
+
+    trainer()
+
+@param('with_actions', (True, False))
+@param('with_rewards', (True, False))
+def test_bc_trainer(
+    with_actions,
+    with_rewards
+):
+    from dreamer4.trainers import BehaviorCloneTrainer
+    from dreamer4.dreamer4 import DynamicsWorldModel, VideoTokenizer
+
+    from torch.utils.data import Dataset
+
+    class MockDataset(Dataset):
+        def __len__(self):
+            return 2
+
+        def __getitem__(self, idx):
+            state = torch.randn(3, 2, 64, 64)
+
+            pkg = dict(video = state)
+
+            if with_actions:
+                pkg.update(discrete_actions = torch.randint(0, 4, (2, 1)))
+
+            if with_rewards:
+                pkg.update(rewards = torch.randn(2,))
+
+            return pkg
+
+    dataset = MockDataset()
+
+    tokenizer = VideoTokenizer(
+        16,
+        encoder_depth = 4,
+        decoder_depth = 4,
+        dim_latent = 16,
+        patch_size = 32,
+        attn_dim_head = 16,
+        num_latent_tokens = 1
+    )
+
+    model = DynamicsWorldModel(
+        video_tokenizer = tokenizer,
+        dim = 16,
+        dim_latent = 16,
+        max_steps = 64,
+        num_tasks = 4,
+        num_latent_tokens = 1,
+        depth = 4,
+        num_spatial_tokens = 1,
+        pred_orig_latent = True,
+        num_discrete_actions = 4,
+        attn_dim_head = 16,
+        prob_no_shortcut_train = 0.1,
+        num_residual_streams = 1
+    )
+
+    trainer = BehaviorCloneTrainer(
+        model,
+        dataset = dataset,
+        batch_size = 1,
+        num_train_steps = 1,
         cpu = True
     )
 
