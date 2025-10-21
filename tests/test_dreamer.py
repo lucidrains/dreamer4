@@ -483,7 +483,7 @@ def test_cache_generate():
         max_steps = 64,
         num_tasks = 4,
         num_latent_tokens = 4,
-        depth = 1,
+        depth = 4,
         num_spatial_tokens = 1,
         pred_orig_latent = True,
         num_discrete_actions = 4,
