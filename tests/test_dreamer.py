@@ -473,3 +473,33 @@ def test_tokenizer_trainer():
     )
 
     trainer()
+
+def test_cache_generate():
+    from dreamer4.dreamer4 import DynamicsWorldModel
+
+    dynamics = DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 16,
+        max_steps = 64,
+        num_tasks = 4,
+        num_latent_tokens = 4,
+        depth = 4,
+        num_spatial_tokens = 1,
+        pred_orig_latent = True,
+        num_discrete_actions = 4,
+        attn_dim_head = 16,
+        prob_no_shortcut_train = 0.1,
+        num_residual_streams = 1
+    )
+
+    generated, time_kv_cache = dynamics.generate(1, return_time_kv_cache = True)
+    generated, time_kv_cache = dynamics.generate(1, time_kv_cache = time_kv_cache, return_time_kv_cache = True)
+    generated, time_kv_cache = dynamics.generate(1, time_kv_cache = time_kv_cache, return_time_kv_cache = True)
+
+@param('vectorized', (False, True))
+def test_online_rl(
+    vectorized
+):
+    from dreamer4.mocks import MockEnv
+
+    mock_env = MockEnv((256, 256), vectorized = vectorized, batch_size = 4)

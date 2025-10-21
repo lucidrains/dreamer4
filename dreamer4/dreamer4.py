@@ -2069,6 +2069,7 @@ class DynamicsWorldModel(Module):
         image_width = None,
         return_decoded_video = None,
         context_signal_noise = 0.1,       # they do a noising of the past, this was from an old diffusion world modeling paper from EPFL iirc
+        time_kv_cache: Tensor | None = None,
         use_time_kv_cache = True,
         return_rewards_per_frame = False,
         return_agent_actions = False,
@@ -2120,12 +2121,9 @@ class DynamicsWorldModel(Module):
 
         # maybe return rewards
 
+        decoded_rewards = None
         if return_rewards_per_frame:
             decoded_rewards = empty((batch_size, 0), device = self.device, dtype = torch.float32)
-
-        # handle maybe time kv cache
-
-        time_kv_cache = None
 
         # while all the frames of the video (per latent) is not generated
 
