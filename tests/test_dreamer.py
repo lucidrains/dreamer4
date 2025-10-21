@@ -457,8 +457,9 @@ def test_tokenizer_trainer():
 
     tokenizer = VideoTokenizer(
         16,
-        encoder_depth = 4,
-        decoder_depth = 4,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        time_block_every = 1,
         dim_latent = 16,
         patch_size = 32,
         attn_dim_head = 16,
@@ -508,8 +509,9 @@ def test_bc_trainer(
 
     tokenizer = VideoTokenizer(
         16,
-        encoder_depth = 4,
-        decoder_depth = 4,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        time_block_every = 1,
         dim_latent = 16,
         patch_size = 32,
         attn_dim_head = 16,
@@ -523,7 +525,8 @@ def test_bc_trainer(
         max_steps = 64,
         num_tasks = 4,
         num_latent_tokens = 1,
-        depth = 4,
+        depth = 1,
+        time_block_every = 1,
         num_spatial_tokens = 1,
         pred_orig_latent = True,
         num_discrete_actions = 4,
@@ -551,7 +554,8 @@ def test_cache_generate():
         max_steps = 64,
         num_tasks = 4,
         num_latent_tokens = 4,
-        depth = 4,
+        depth = 1,
+        time_block_every = 1,
         num_spatial_tokens = 1,
         pred_orig_latent = True,
         num_discrete_actions = 4,
@@ -570,4 +574,4 @@ def test_online_rl(
 ):
     from dreamer4.mocks import MockEnv
 
-    mock_env = MockEnv((256, 256), vectorized = vectorized, batch_size = 4)
+    mock_env = MockEnv((256, 256), vectorized = vectorized, num_envs = 4)

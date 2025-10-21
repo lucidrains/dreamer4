@@ -1701,6 +1701,7 @@ class DynamicsWorldModel(Module):
         attn_kwargs: dict = dict(
             heads = 8,
         ),
+        transformer_kwargs: dict = dict(),
         attn_dim_head = 64,
         attn_softclamp_value = 50.,
         ff_kwargs: dict = dict(),
@@ -1888,7 +1889,9 @@ class DynamicsWorldModel(Module):
             ff_kwargs = ff_kwargs,
             num_residual_streams = num_residual_streams,
             num_special_spatial_tokens = num_agents,
-            final_norm = False
+            time_block_every = time_block_every,
+            final_norm = False,
+            **transformer_kwargs
         )
 
         # ppo related
