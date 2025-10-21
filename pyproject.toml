@@ -31,6 +31,7 @@ dependencies = [
     "assoc-scan",
     "einx>=0.3.0",
     "einops>=0.8.1",
+    "ema-pytorch",
     "hl-gauss-pytorch",
     "hyper-connections>=0.2.1",
     "torch>=2.4",

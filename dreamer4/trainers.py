@@ -13,6 +13,8 @@ from dreamer4.dreamer4 import (
     DynamicsWorldModel
 )
 
+from ema_pytorch import EMA
+
 # helpers
 
 def exists(v):
@@ -94,7 +96,6 @@ class VideoTokenizerTrainer(Module):
     def forward(
         self
     ):
-
         iter_train_dl = cycle(self.train_dataloader)
 
         for _ in range(self.num_train_steps):
