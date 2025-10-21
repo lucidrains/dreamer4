@@ -1132,6 +1132,8 @@ class Attention(Module):
         self.k_heads_rmsnorm = MultiHeadRMSNorm(dim_head, heads = heads) if rmsnorm_key else nn.Identity()
 
     def muon_parameters(self):
+        # omit the queries and keys for now given what we learned from kimi 2 paper
+
         return [
             *self.to_v.parameters(),
             *self.to_out.parameters(),
@@ -1297,6 +1299,15 @@ class AxialSpaceTimeTransformer(Module):
         # special tokens
 
         self.num_special_spatial_tokens = num_special_spatial_tokens
+
+    def muon_parameters(self):
+        muon_params = []
+
+        for m in self.modules():
+            if isinstance(m, (Attention, SwiGLUFeedforward)):
+                muon_params.extend(m.muon_parameters())
+
+        return muon_params
 
     def forward(
         self,
@@ -1522,6 +1533,12 @@ class VideoTokenizer(Module):
     @property
     def device(self):
         return self.zero.device
+
+    def muon_parameters(self):
+        return [
+            *self.encoder_transformer.muon_parameters(),
+            *self.decoder_transformer.muon_parameters()
+        ]
 
     @torch.no_grad()
     def tokenize(
@@ -1905,6 +1922,9 @@ class DynamicsWorldModel(Module):
     @property
     def device(self):
         return self.zero.device
+
+    def muon_parameters(self):
+        return self.transformer.muon_parameters()
 
     def get_times_from_signal_level(
         self,
