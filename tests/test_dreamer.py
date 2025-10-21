@@ -439,3 +439,37 @@ def test_loss_normalizer():
     normed_losses = loss_normalizer(losses)
 
     assert (normed_losses == 1.).all()
+
+def test_tokenizer_trainer():
+    from dreamer4.trainers import VideoTokenizerTrainer
+    from dreamer4.dreamer4 import VideoTokenizer
+    from torch.utils.data import Dataset
+
+    class MockDataset(Dataset):
+        def __len__(self):
+            return 4
+
+        def __getitem__(self, idx):
+            return torch.randn(3, 16, 256, 256)
+
+    dataset = MockDataset()
+
+    tokenizer = VideoTokenizer(
+        16,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        dim_latent = 16,
+        patch_size = 32,
+        attn_dim_head = 16,
+        num_latent_tokens = 4
+    )
+
+    trainer = VideoTokenizerTrainer(
+        tokenizer,
+        dataset = dataset,
+        num_train_steps = 1,
+        batch_size = 2,
+        cpu = True
+    )
+
+    trainer()
