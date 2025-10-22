@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 from torch import is_tensor
 from torch.nn import Module
+from torch.optim import AdamW
 from torch.utils.data import Dataset, DataLoader
 
 from accelerate import Accelerator
@@ -211,5 +212,108 @@ class BehaviorCloneTrainer(Module):
 
             self.optim.step()
             self.optim.zero_grad()
+
+        self.print('training complete')
+
+# training from dreams
+
+class DreamTrainer(Module):
+    def __init__(
+        self,
+        model: DynamicsWorldModel,
+        optim_klass = AdamW,
+        batch_size = 16,
+        generate_timesteps = 16,
+        learning_rate = 3e-4,
+        max_grad_norm = None,
+        num_train_steps = 10_000,
+        weight_decay = 0.,
+        accelerate_kwargs: dict = dict(),
+        optim_kwargs: dict = dict(),
+        cpu = False,
+    ):
+        super().__init__()
+
+        self.accelerator = Accelerator(
+            cpu = cpu,
+            **accelerate_kwargs
+        )
+
+        self.model = model
+
+        optim_kwargs = dict(
+            lr = learning_rate,
+            weight_decay = weight_decay
+        )
+
+        self.policy_head_optim = AdamW(model.policy_head_parameters(), **optim_kwargs)
+        self.value_head_optim = AdamW(model.value_head_parameters(), **optim_kwargs)
+
+        self.max_grad_norm = max_grad_norm
+
+        self.num_train_steps = num_train_steps
+        self.batch_size = batch_size
+        self.generate_timesteps = generate_timesteps
+
+        self.unwrapped_model = self.model
+
+        (
+            self.model,
+            self.policy_head_optim,
+            self.value_head_optim,
+        ) = self.accelerator.prepare(
+            self.model,
+            self.policy_head_optim,
+            self.value_head_optim
+        )
+
+    @property
+    def device(self):
+        return self.accelerator.device
+
+    @property
+    def unwrapped_model(self):
+        return self.accelerator.unwrap_model(self.model)
+
+    def print(self, *args, **kwargs):
+        return self.accelerator.print(*args, **kwargs)
+
+    def forward(
+        self
+    ):
+
+        for _ in range(self.num_train_steps):
+
+            dreams = self.unwrapped_model.generate(
+                self.generate_timesteps,
+                batch_size = self.batch_size,
+                return_rewards_per_frame = True,
+                return_agent_actions = True,
+                return_log_probs_and_values = True
+            )
+
+            policy_head_loss, value_head_loss = self.model.learn_from_experience(dreams)
+
+            self.print(f'policy head loss: {policy_head_loss.item():.3f} | value head loss: {value_head_loss.item():.3f}')
+
+            # update policy head
+
+            self.accelerator.backward(policy_head_loss)
+
+            if exists(self.max_grad_norm):
+                self.accelerator.clip_grad_norm_(self.model.policy_head_parameters()(), self.max_grad_norm)
+
+            self.policy_head_optim.step()
+            self.policy_head_optim.zero_grad()
+
+            # update value head
+
+            self.accelerator.backward(value_head_loss)
+
+            if exists(self.max_grad_norm):
+                self.accelerator.clip_grad_norm_(self.model.value_head_parameters(), self.max_grad_norm)
+
+            self.value_head_optim.step()
+            self.value_head_optim.zero_grad()
 
         self.print('training complete')

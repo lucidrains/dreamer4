@@ -518,7 +518,7 @@ def test_bc_trainer(
         num_latent_tokens = 1
     )
 
-    model = DynamicsWorldModel(
+    world_model = DynamicsWorldModel(
         video_tokenizer = tokenizer,
         dim = 16,
         dim_latent = 16,
@@ -536,7 +536,7 @@ def test_bc_trainer(
     )
 
     trainer = BehaviorCloneTrainer(
-        model,
+        world_model,
         dataset = dataset,
         batch_size = 1,
         num_train_steps = 1,
@@ -544,6 +544,38 @@ def test_bc_trainer(
     )
 
     trainer()
+
+def test_dream_trainer():
+    from dreamer4.dreamer4 import DynamicsWorldModel
+
+    world_model = DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 16,
+        max_steps = 64,
+        num_tasks = 4,
+        num_latent_tokens = 1,
+        depth = 1,
+        time_block_every = 1,
+        num_spatial_tokens = 1,
+        pred_orig_latent = True,
+        num_discrete_actions = 4,
+        attn_dim_head = 16,
+        prob_no_shortcut_train = 0.1,
+        num_residual_streams = 1
+    )
+
+    # training from self-generations (dreams)
+
+    from dreamer4.trainers import DreamTrainer
+
+    dream_trainer = DreamTrainer(
+        world_model,
+        batch_size = 2,
+        num_train_steps = 1,
+        cpu = True,
+    )
+
+    dream_trainer()
 
 def test_cache_generate():
     from dreamer4.dreamer4 import DynamicsWorldModel

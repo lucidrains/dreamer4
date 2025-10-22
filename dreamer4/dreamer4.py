@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from math import ceil, log2
 from random import random
+from contextlib import nullcontext
 from collections import namedtuple
 from functools import partial
 from dataclasses import dataclass
@@ -485,7 +486,7 @@ class ActionEmbedder(Module):
         return set([*self.discrete_action_embed.parameters(), *self.continuous_action_embed.parameters()])
 
     def unembed_parameters(self):
-        return set([*self.discrete_action_unembed.parameters(), *self.continuous_action_unembed.parameters()])
+        return set([self.discrete_action_unembed, self.continuous_action_unembed])
 
     @property
     def device(self):
@@ -1927,8 +1928,29 @@ class DynamicsWorldModel(Module):
     def device(self):
         return self.zero.device
 
+    # types of parameters
+
     def muon_parameters(self):
         return self.transformer.muon_parameters()
+
+    def policy_head_parameters(self):
+        return [
+            *self.policy_head.parameters(),
+            *self.action_embedder.unembed_parameters() # includes the unembed from the action-embedder
+        ]
+
+    def value_head_parameters(self):
+        return self.value_head.parameters()
+
+    def parameter(self):
+        params = super().parameters()
+
+        if not exists(self.video_tokenizer):
+            return params
+
+        return list(set(params) - set(self.video_tokenizer.parameters()))
+
+    # helpers for shortcut flow matching
 
     def get_times_from_signal_level(
         self,
@@ -1942,19 +1964,14 @@ class DynamicsWorldModel(Module):
 
         return align_dims_left(times, align_dims_left_to)
 
-    def parameter(self):
-        params = super().parameters()
-
-        if not exists(self.video_tokenizer):
-            return params
-
-        return list(set(params) - set(self.video_tokenizer.parameters()))
+    # ppo
 
     def learn_from_experience(
         self,
         experience: Experience,
         policy_optim: Optimizer | None = None,
-        value_optim: Optimizer | None = None
+        value_optim: Optimizer | None = None,
+        only_learn_policy_value_heads = True # in the paper, they do not finetune the entire dynamics model, they just learn the heads
     ):
         assert experience.is_batched
 
@@ -1971,6 +1988,10 @@ class DynamicsWorldModel(Module):
 
         returns = calc_gae(rewards, old_values, gamma = self.gae_discount_factor, lam = self.gae_lambda, use_accelerated = self.gae_use_accelerated)
 
+        # determine whether to finetune entire transformer or just learn the heads
+
+        world_model_forward_context = torch.no_grad if only_learn_policy_value_heads else nullcontext
+
         # apparently they just use the sign of the advantage
         # https://arxiv.org/abs/2410.04166v1
 
@@ -1980,19 +2001,25 @@ class DynamicsWorldModel(Module):
 
         discrete_actions, continuous_actions = actions
 
-        _, (agent_embed, _) = self.forward(
-            latents = latents,
-            signal_levels = self.max_steps - 1,
-            step_sizes = step_size,
-            rewards = rewards,
-            discrete_actions = discrete_actions,
-            continuous_actions = continuous_actions,
-            latent_is_noised = True,
-            return_pred_only = True,
-            return_intermediates = True
-        )
+        with world_model_forward_context():
+            _, (agent_embed, _) = self.forward(
+                latents = latents,
+                signal_levels = self.max_steps - 1,
+                step_sizes = step_size,
+                rewards = rewards,
+                discrete_actions = discrete_actions,
+                continuous_actions = continuous_actions,
+                latent_is_noised = True,
+                return_pred_only = True,
+                return_intermediates = True
+            )
 
         agent_embed = agent_embed[..., agent_index, :]
+
+        # maybe detach agent embed
+
+        if only_learn_policy_value_heads:
+            agent_embed = agent_embed.detach()
 
         # ppo
 
