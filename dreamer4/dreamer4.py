@@ -1973,13 +1973,25 @@ class DynamicsWorldModel(Module):
         agent_index = 0,
         step_size = 4,
         max_timesteps = 16,
+        env_is_vectorized = False,
         use_time_kv_cache = True
     ):
         assert exists(self.video_tokenizer)
 
         init_frame = env.reset()
 
-        video = rearrange(init_frame, 'c vh vw -> 1 c 1 vh vw')
+        # determine batch size (1 if not vectorized else use the first dimension of the returned frame)
+
+        batch_size = 1
+        if env_is_vectorized:
+            batch_size = init_frame.shape[0]
+
+        # frame to video
+
+        if env_is_vectorized:
+            video = rearrange(init_frame, 'b c vh vw -> b c 1 vh vw')
+        else:
+            video = rearrange(init_frame, 'c vh vw -> 1 c 1 vh vw')
 
         # accumulate
 
@@ -2053,8 +2065,12 @@ class DynamicsWorldModel(Module):
 
             # batch and time dimension
 
-            next_frame = rearrange(next_frame, 'c vh vw -> 1 c 1 vh vw')
-            reward = rearrange(reward, ' -> 1 1')
+            if env_is_vectorized:
+                next_frame = rearrange(next_frame, 'b c vh vw -> b c 1 vh vw')
+                reward = rearrange(reward, 'b -> b 1')
+            else:
+                next_frame = rearrange(next_frame, 'c vh vw -> 1 c 1 vh vw')
+                reward = rearrange(reward, ' -> 1 1')
 
             # concat
 
