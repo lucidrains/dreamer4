@@ -23,6 +23,8 @@ class MockEnv(Module):
 
         self.num_envs = num_envs
         self.vectorized = vectorized
+        assert not (vectorized and num_envs == 1)
+
         self.register_buffer('_step', tensor(0))
 
     def get_random_state(self):
@@ -33,7 +35,12 @@ class MockEnv(Module):
         seed = None
     ):
         self._step.zero_()
-        return self.get_random_state()
+        state = self.get_random_state()
+
+        if self.vectorized:
+            state = repeat(state, '... -> b ...', b = self.num_envs)
+
+        return state
 
     def step(
         self,
@@ -46,9 +53,10 @@ class MockEnv(Module):
         if not self.vectorized:
             return state, reward
 
-        assert actions.shape[0] == self.num_envs
+        discrete, continuous = actions
+        assert discrete.shape[0] == self.num_envs, f'expected batch of actions for {self.num_envs} environments'
 
         state = repeat(state, '... -> b ...', b = self.num_envs)
         reward = repeat(reward, ' -> b', b = self.num_envs)
 
-        return state, rewards
+        return state, reward

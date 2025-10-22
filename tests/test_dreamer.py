@@ -600,7 +600,8 @@ def test_cache_generate():
     generated, time_kv_cache = dynamics.generate(1, time_kv_cache = time_kv_cache, return_time_kv_cache = True)
     generated, time_kv_cache = dynamics.generate(1, time_kv_cache = time_kv_cache, return_time_kv_cache = True)
 
-def test_online_rl():
+@param('vectorized', (False, True))
+def test_online_rl(vectorized):
     from dreamer4.dreamer4 import DynamicsWorldModel, VideoTokenizer
 
     tokenizer = VideoTokenizer(
@@ -632,9 +633,9 @@ def test_online_rl():
     )
 
     from dreamer4.mocks import MockEnv
-    mock_env = MockEnv((256, 256), vectorized = False, num_envs = 4)
+    mock_env = MockEnv((256, 256), vectorized = vectorized, num_envs = 4)
 
-    one_experience = world_model_and_policy.interact_with_env(mock_env, max_timesteps = 16)
+    one_experience = world_model_and_policy.interact_with_env(mock_env, max_timesteps = 16, env_is_vectorized = vectorized)
 
     actor_loss, critic_loss = world_model_and_policy.learn_from_experience(one_experience)
 
