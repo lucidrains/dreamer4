@@ -2,7 +2,7 @@ from __future__ import annotations
 from random import choice
 
 import torch
-from torch import tensor, randn, randint
+from torch import tensor, empty, randn, randint
 from torch.nn import Module
 
 from einops import repeat
@@ -13,7 +13,7 @@ class MockEnv(Module):
     def __init__(
         self,
         image_shape,
-        reward_range = (-100., 100.),
+        reward_range = (-100, 100),
         num_envs = 1,
         vectorized = False
     ):
@@ -40,7 +40,8 @@ class MockEnv(Module):
         actions,
     ):
         state = self.get_random_state()
-        reward = randint(*self.reward_range, ()).float()
+
+        reward = empty(()).uniform_(*self.reward_range)
 
         if not self.vectorized:
             return state, reward
