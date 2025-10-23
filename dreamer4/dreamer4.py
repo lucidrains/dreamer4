@@ -2094,7 +2094,9 @@ class DynamicsWorldModel(Module):
         experience: Experience,
         policy_optim: Optimizer | None = None,
         value_optim: Optimizer | None = None,
-        only_learn_policy_value_heads = True # in the paper, they do not finetune the entire dynamics model, they just learn the heads
+        only_learn_policy_value_heads = True, # in the paper, they do not finetune the entire dynamics model, they just learn the heads
+        use_signed_advantage = True,
+        eps = 1e-6
     ):
 
         latents = experience.latents
@@ -2117,7 +2119,12 @@ class DynamicsWorldModel(Module):
         # apparently they just use the sign of the advantage
         # https://arxiv.org/abs/2410.04166v1
 
-        advantage = (returns - old_values).sign()
+        advantage = returns - old_values
+
+        if use_signed_advantage:
+            advantage = advantage.sign()
+        else:
+            advantage = F.layer_norm(advantage, advantage.shape, eps = eps)
 
         # replay for the action logits and values
 

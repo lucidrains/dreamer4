@@ -601,7 +601,11 @@ def test_cache_generate():
     generated, time_kv_cache = dynamics.generate(1, time_kv_cache = time_kv_cache, return_time_kv_cache = True)
 
 @param('vectorized', (False, True))
-def test_online_rl(vectorized):
+@param('use_signed_advantage', (False, True))
+def test_online_rl(
+    vectorized,
+    use_signed_advantage
+):
     from dreamer4.dreamer4 import DynamicsWorldModel, VideoTokenizer
 
     tokenizer = VideoTokenizer(
@@ -637,7 +641,7 @@ def test_online_rl(vectorized):
 
     one_experience = world_model_and_policy.interact_with_env(mock_env, max_timesteps = 16, env_is_vectorized = vectorized)
 
-    actor_loss, critic_loss = world_model_and_policy.learn_from_experience(one_experience)
+    actor_loss, critic_loss = world_model_and_policy.learn_from_experience(one_experience, use_signed_advantage = use_signed_advantage)
 
     actor_loss.backward()
     critic_loss.backward()
