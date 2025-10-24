@@ -641,6 +641,8 @@ def test_online_rl(
 
     mock_env = MockEnv((256, 256), vectorized = vectorized, num_envs = 4)
 
+    # manually
+
     one_experience = world_model_and_policy.interact_with_env(mock_env, max_timesteps = 16, env_is_vectorized = vectorized)
     another_experience = world_model_and_policy.interact_with_env(mock_env, max_timesteps = 16, env_is_vectorized = vectorized)
 
@@ -650,3 +652,15 @@ def test_online_rl(
 
     actor_loss.backward()
     critic_loss.backward()
+
+    # with trainer
+
+    from dreamer4.trainers import SimTrainer
+
+    trainer = SimTrainer(
+        world_model_and_policy,
+        batch_size = 4,
+        cpu = True
+    )
+
+    trainer(mock_env, num_episodes = 2, env_is_vectorized = vectorized)
