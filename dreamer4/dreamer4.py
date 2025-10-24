@@ -6,7 +6,7 @@ from random import random
 from contextlib import nullcontext
 from collections import namedtuple
 from functools import partial
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 
 import torch
 import torch.nn.functional as F
@@ -14,6 +14,7 @@ from torch.nested import nested_tensor
 from torch.distributions import Normal
 from torch.nn import Module, ModuleList, Embedding, Parameter, Sequential, Linear, RMSNorm, Identity
 from torch import nn, cat, stack, arange, tensor, Tensor, is_tensor, zeros, ones, randint, rand, randn, randn_like, empty, full, linspace, arange
+from torch.utils._pytree import tree_flatten, tree_unflatten
 
 import torchvision
 from torchvision.models import VGG16_Weights
@@ -81,6 +82,42 @@ class Experience:
     step_size: int | None = None
     agent_index: int = 0
     is_from_world_model: bool = True
+
+def combine_experiences(
+    exps: list[Experiences]
+) -> Experience:
+
+    assert len(exps) > 0
+    exps_dict = [asdict(exp) for exp in exps]
+
+    values, tree_specs = zip(*[tree_flatten(exp_dict) for exp_dict in exps_dict])
+
+    tree_spec = first(tree_specs)
+
+    all_field_values = list(zip(*values))
+
+    # an assert to make sure all fields are either all tensors, or a single matching value (for step size, agent index etc) - can change this later
+
+    assert all([
+        all([is_tensor(v) for v in field_values]) or len(set(field_values)) == 1
+        for field_values in all_field_values
+    ])
+
+    concatted = []
+
+    for field_values in all_field_values:
+        if is_tensor(first(field_values)):
+            new_field_value = cat(field_values)
+        else:
+            new_field_value = first(list(set(field_values)))
+
+        concatted.append(new_field_value)
+
+    # return experience
+
+    concat_exp_dict = tree_unflatten(concatted, tree_spec)
+
+    return Experience(**concat_exp_dict)
 
 # helpers
 

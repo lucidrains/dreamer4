@@ -637,11 +637,16 @@ def test_online_rl(
     )
 
     from dreamer4.mocks import MockEnv
+    from dreamer4.dreamer4 import combine_experiences
+
     mock_env = MockEnv((256, 256), vectorized = vectorized, num_envs = 4)
 
     one_experience = world_model_and_policy.interact_with_env(mock_env, max_timesteps = 16, env_is_vectorized = vectorized)
+    another_experience = world_model_and_policy.interact_with_env(mock_env, max_timesteps = 16, env_is_vectorized = vectorized)
 
-    actor_loss, critic_loss = world_model_and_policy.learn_from_experience(one_experience, use_signed_advantage = use_signed_advantage)
+    combined_experience = combine_experiences([one_experience, another_experience])
+
+    actor_loss, critic_loss = world_model_and_policy.learn_from_experience(combined_experience, use_signed_advantage = use_signed_advantage)
 
     actor_loss.backward()
     critic_loss.backward()
