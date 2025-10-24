@@ -2,6 +2,9 @@ import pytest
 param = pytest.mark.parametrize
 import torch
 
+def exists(v):
+    return v is not None
+
 @param('pred_orig_latent', (False, True))
 @param('grouped_query_attn', (False, True))
 @param('dynamics_with_video_input', (False, True))
@@ -664,3 +667,55 @@ def test_online_rl(
     )
 
     trainer(mock_env, num_episodes = 2, env_is_vectorized = vectorized)
+
+def test_proprioception():
+    from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
+
+    tokenizer = VideoTokenizer(
+        512,
+        dim_latent = 32,
+        patch_size = 32,
+        encoder_depth = 2,
+        decoder_depth = 2,
+        time_block_every = 2,
+        attn_heads = 8,
+        image_height = 256,
+        image_width = 256,
+        attn_kwargs = dict(
+            query_heads = 16
+        )
+    )
+
+    dynamics = DynamicsWorldModel(
+        512,
+        num_agents = 1,
+        video_tokenizer = tokenizer,
+        dim_latent = 32,
+        dim_proprio = 21,
+        num_tasks = 4,
+        num_discrete_actions = 4,
+        num_residual_streams = 1
+    )
+
+    video = torch.randn(2, 3, 10, 256, 256)
+    rewards = torch.randn(2, 10)
+    proprio = torch.randn(2, 10, 21)
+    discrete_actions = torch.randint(0, 4, (2, 10, 1))
+    tasks = torch.randint(0, 4, (2,))
+
+    loss = dynamics(
+        video = video,
+        rewards = rewards,
+        tasks = tasks,
+        proprio = proprio,
+        discrete_actions = discrete_actions
+    )
+
+    loss.backward()
+
+    generations = dynamics.generate(
+        4,
+        batch_size = 2,
+    )
+
+    assert exists(generations.proprio)
