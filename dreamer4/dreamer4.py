@@ -2870,6 +2870,13 @@ class DynamicsWorldModel(Module):
 
             space_tokens = self.latents_to_spatial_tokens(noised_latents)
 
+            # maybe add view embedding
+
+            if self.video_has_multi_view:
+                space_tokens = add('b t v ... d, v d', space_tokens, self.view_emb)
+
+            # merge spatial tokens
+
             space_tokens, inverse_pack_space_per_latent = pack_one(space_tokens, 'b t * d')
 
             num_spatial_tokens = space_tokens.shape[-2]
