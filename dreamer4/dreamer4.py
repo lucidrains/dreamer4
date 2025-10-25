@@ -91,6 +91,18 @@ def combine_experiences(
 ) -> Experience:
 
     assert len(exps) > 0
+
+    # set lens if not there
+
+    for exp in exps:
+        latents = exp.latents
+        batch, time, device = *latents.shape[:2], latents.device
+
+        if not exists(exp.lens):
+            exp.lens = torch.full((batch,), time, device = device)
+
+    # convert to dictionary
+
     exps_dict = [asdict(exp) for exp in exps]
 
     values, tree_specs = zip(*[tree_flatten(exp_dict) for exp_dict in exps_dict])
@@ -109,7 +121,11 @@ def combine_experiences(
     concatted = []
 
     for field_values in all_field_values:
+
         if is_tensor(first(field_values)):
+
+            field_values = pad_tensors_at_dim_to_max_len(field_values, dims = (1, 2))
+
             new_field_value = cat(field_values)
         else:
             new_field_value = first(list(set(field_values)))
@@ -222,6 +238,27 @@ def pad_at_dim(
     dims_from_right = (- dim - 1) if dim < 0 else (t.ndim - dim - 1)
     zeros = ((0, 0) * dims_from_right)
     return F.pad(t, (*zeros, *pad), value = value)
+
+def pad_to_len(t, target_len, *, dim):
+    curr_len = t.shape[dim]
+
+    if curr_len >= target_len:
+        return t
+
+    return pad_at_dim(t, (0, target_len - curr_len), dim = dim)
+
+def pad_tensors_at_dim_to_max_len(
+    tensors: list[Tensor],
+    dims: tuple[int, ...]
+):
+    for dim in dims:
+        if dim >= first(tensors).ndim:
+            continue
+
+        max_time = max([t.shape[dim] for t in tensors])
+        tensors = [pad_to_len(t, max_time, dim = dim) for t in tensors]
+
+    return tensors
 
 def align_dims_left(t, aligned_to):
     shape = t.shape

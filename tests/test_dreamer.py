@@ -653,7 +653,7 @@ def test_online_rl(
 
     # manually
 
-    one_experience = world_model_and_policy.interact_with_env(mock_env, max_timesteps = 16, env_is_vectorized = vectorized)
+    one_experience = world_model_and_policy.interact_with_env(mock_env, max_timesteps = 8, env_is_vectorized = vectorized)
     another_experience = world_model_and_policy.interact_with_env(mock_env, max_timesteps = 16, env_is_vectorized = vectorized)
 
     combined_experience = combine_experiences([one_experience, another_experience])
