@@ -668,7 +668,10 @@ def test_online_rl(
 
     trainer(mock_env, num_episodes = 2, env_is_vectorized = vectorized)
 
-def test_proprioception():
+@param('num_video_views', (1, 2))
+def test_proprioception(
+    num_video_views
+):
     from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
 
     tokenizer = VideoTokenizer(
@@ -693,11 +696,16 @@ def test_proprioception():
         dim_latent = 32,
         dim_proprio = 21,
         num_tasks = 4,
+        num_video_views = num_video_views,
         num_discrete_actions = 4,
         num_residual_streams = 1
     )
 
-    video = torch.randn(2, 3, 10, 256, 256)
+    if num_video_views > 1:
+        video = torch.randn(2, num_video_views, 3, 10, 256, 256)
+    else:
+        video = torch.randn(2, 3, 10, 256, 256)
+
     rewards = torch.randn(2, 10)
     proprio = torch.randn(2, 10, 21)
     discrete_actions = torch.randint(0, 4, (2, 10, 1))
