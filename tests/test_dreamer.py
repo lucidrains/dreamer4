@@ -407,14 +407,14 @@ def test_mtp():
 
     reward_targets, mask = create_multi_token_prediction_targets(rewards, 3) # say three token lookahead
 
-    assert reward_targets.shape == (3, 15, 3)
-    assert mask.shape == (3, 15, 3)
+    assert reward_targets.shape == (3, 16, 3)
+    assert mask.shape == (3, 16, 3)
 
     actions = torch.randint(0, 10, (3, 16, 2))
     action_targets, mask = create_multi_token_prediction_targets(actions, 3)
 
-    assert action_targets.shape == (3, 15, 3, 2)
-    assert mask.shape == (3, 15, 3)
+    assert action_targets.shape == (3, 16, 3, 2)
+    assert mask.shape == (3, 16, 3)
 
     from dreamer4.dreamer4 import ActionEmbedder
 

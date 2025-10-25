@@ -284,7 +284,7 @@ def create_multi_token_prediction_targets(
     batch, seq_len, device = *t.shape[:2], t.device
 
     batch_arange = arange(batch, device = device)
-    seq_arange = arange(seq_len, device = device)[1:]
+    seq_arange = arange(seq_len, device = device)
     steps_arange = arange(steps_future, device = device)
 
     indices = add('t, steps -> t steps', seq_arange, steps_arange)
@@ -3100,7 +3100,7 @@ class DynamicsWorldModel(Module):
 
             reward_pred = rearrange(reward_pred, 'mtp b t l -> b l t mtp')
 
-            reward_targets, reward_loss_mask = create_multi_token_prediction_targets(two_hot_encoding, self.multi_token_pred_len)
+            reward_targets, reward_loss_mask = create_multi_token_prediction_targets(two_hot_encoding[:, :-1], self.multi_token_pred_len)
 
             reward_targets = rearrange(reward_targets, 'b t mtp l -> b l t mtp')
 
@@ -3125,6 +3125,15 @@ class DynamicsWorldModel(Module):
             (exists(discrete_actions) or exists(continuous_actions))
         ):
             assert self.action_embedder.has_actions
+
+            # handle actions having time vs time - 1 length
+            # remove the first action if it is equal to time (as it would come from some agent token in the past)
+
+            if exists(discrete_actions) and discrete_actions.shape[1] == time:
+                discrete_actions = discrete_actions[:, 1:]
+
+            if exists(continuous_actions) and continuous_actions.shape[1] == time:
+                continuous_actions = continuous_actions[:, 1:]
 
             # only for 1 agent
 
