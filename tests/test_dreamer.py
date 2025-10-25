@@ -16,6 +16,7 @@ def exists(v):
 @param('num_residual_streams', (1, 4))
 @param('add_reward_embed_to_agent_token', (False, True))
 @param('use_time_kv_cache', (False, True))
+@param('var_len', (False, True))
 def test_e2e(
     pred_orig_latent,
     grouped_query_attn,
@@ -27,7 +28,8 @@ def test_e2e(
     condition_on_actions,
     num_residual_streams,
     add_reward_embed_to_agent_token,
-    use_time_kv_cache
+    use_time_kv_cache,
+    var_len
 ):
     from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
 
@@ -95,8 +97,13 @@ def test_e2e(
     if condition_on_actions:
         actions = torch.randint(0, 4, (2, 3, 1))
 
+    lens = None
+    if var_len:
+        lens = torch.randint(1, 4, (2,))
+
     flow_loss = dynamics(
         **dynamics_input,
+        lens = lens,
         tasks = tasks,
         signal_levels = signal_levels,
         step_sizes_log2 = step_sizes_log2,

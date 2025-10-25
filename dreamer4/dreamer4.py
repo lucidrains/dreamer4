@@ -155,6 +155,15 @@ def is_power_two(num):
 def is_empty(t):
     return t.numel() == 0
 
+def lens_to_mask(t, max_len = None):
+    if not exists(max_len):
+        max_len = t.amax().item()
+
+    device = t.device
+    seq = torch.arange(max_len, device = device)
+
+    return einx.less('j, i -> i j', seq, t)
+
 def log(t, eps = 1e-20):
     return t.clamp(min = eps).log()
 
@@ -2581,6 +2590,7 @@ class DynamicsWorldModel(Module):
         *,
         video = None,                    # (b v? c t vh vw)
         latents = None,                  # (b t v? n d) | (b t v? d)
+        lens = None,                     # (b)
         signal_levels = None,            # () | (b) | (b t)
         step_sizes = None,               # () | (b)
         step_sizes_log2 = None,          # () | (b)
@@ -3014,7 +3024,19 @@ class DynamicsWorldModel(Module):
 
             flow_losses = flow_losses * loss_weight
 
-        flow_loss = flow_losses.mean()
+        # handle variable lengths if needed
+
+        is_var_len = exists(lens)
+
+        if is_var_len:
+
+            loss_mask = lens_to_mask(lens, time)
+            loss_mask_without_last = loss_mask[:, :-1]
+
+            flow_loss = flow_losses[loss_mask].mean()
+
+        else:
+            flow_loss = flow_losses.mean()
 
         # now take care of the agent token losses
 
@@ -3037,7 +3059,10 @@ class DynamicsWorldModel(Module):
 
             reward_losses = reward_losses.masked_fill(reward_loss_mask, 0.)
 
-            reward_loss = reduce(reward_losses, '... mtp -> mtp', 'mean') # they sum across the prediction steps (mtp dimension) - eq(9)
+            if is_var_len:
+                reward_loss = reward_losses[loss_mask_without_last].mean(dim = 0)
+            else:
+                reward_loss = reduce(reward_losses, '... mtp -> mtp', 'mean') # they sum across the prediction steps (mtp dimension) - eq(9)
 
         # maybe autoregressive action loss
 
@@ -3080,12 +3105,20 @@ class DynamicsWorldModel(Module):
             if exists(discrete_log_probs):
                 discrete_log_probs = discrete_log_probs.masked_fill(~discrete_mask[..., None], 0.)
 
-                discrete_action_loss = reduce(-discrete_log_probs, 'mtp b t na -> mtp', 'mean')
+                if is_var_len:
+                    discrete_action_losses = rearrange(-discrete_log_probs, 'mtp b t na -> b t na mtp')
+                    discrete_action_loss = reduce(discrete_action_losses[loss_mask_without_last], '... mtp -> mtp', 'mean')
+                else:
+                    discrete_action_loss = reduce(-discrete_log_probs, 'mtp b t na -> mtp', 'mean')
 
             if exists(continuous_log_probs):
                 continuous_log_probs = continuous_log_probs.masked_fill(~continuous_mask[..., None], 0.)
 
-                continuous_action_loss = reduce(-continuous_log_probs, 'mtp b t na -> mtp', 'mean')
+                if is_var_len:
+                    continuous_action_losses = rearrange(-continuous_log_probs, 'mtp b t na -> b t na mtp')
+                    continuous_action_loss = reduce(continuous_action_losses[loss_mask_without_last], '... mtp -> mtp', 'mean')
+                else:
+                    continuous_action_loss = reduce(-continuous_log_probs, 'mtp b t na -> mtp', 'mean')
 
         # handle loss normalization
 
