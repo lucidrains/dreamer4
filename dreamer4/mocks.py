@@ -7,6 +7,11 @@ from torch.nn import Module
 
 from einops import repeat
 
+# helpers
+
+def exists(v):
+    return v is not None
+
 # mock env
 
 class MockEnv(Module):
@@ -15,7 +20,9 @@ class MockEnv(Module):
         image_shape,
         reward_range = (-100, 100),
         num_envs = 1,
-        vectorized = False
+        vectorized = False,
+        terminate_after_step = None,
+        rand_terminate_prob = 0.05
     ):
         super().__init__()
         self.image_shape = image_shape
@@ -24,6 +31,12 @@ class MockEnv(Module):
         self.num_envs = num_envs
         self.vectorized = vectorized
         assert not (vectorized and num_envs == 1)
+
+        # mocking termination
+
+        self.can_terminate = exists(terminate_after_step)
+        self.terminate_after_step = terminate_after_step
+        self.rand_terminate_prob = rand_terminate_prob
 
         self.register_buffer('_step', tensor(0))
 
@@ -50,13 +63,23 @@ class MockEnv(Module):
 
         reward = empty(()).uniform_(*self.reward_range)
 
-        if not self.vectorized:
-            return state, reward
+        if self.vectorized:
+            discrete, continuous = actions
+            assert discrete.shape[0] == self.num_envs, f'expected batch of actions for {self.num_envs} environments'
 
-        discrete, continuous = actions
-        assert discrete.shape[0] == self.num_envs, f'expected batch of actions for {self.num_envs} environments'
+            state = repeat(state, '... -> b ...', b = self.num_envs)
+            reward = repeat(reward, ' -> b', b = self.num_envs)
 
-        state = repeat(state, '... -> b ...', b = self.num_envs)
-        reward = repeat(reward, ' -> b', b = self.num_envs)
+        out = (state, reward)
 
-        return state, reward
+        if self.can_terminate:
+            terminate = (
+                (torch.rand((self.num_envs)) < self.rand_terminate_prob) &
+                (self._step > self.terminate_after_step)
+            )
+
+            out = (*out, terminate)
+
+        self._step.add_(1)
+
+        return out

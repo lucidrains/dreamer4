@@ -2118,6 +2118,8 @@ class DynamicsWorldModel(Module):
         else:
             video = rearrange(init_frame, 'c vh vw -> 1 c 1 vh vw')
 
+        batch, device = video.shape[0], video.device
+
         # accumulate
 
         rewards = None
@@ -2127,6 +2129,11 @@ class DynamicsWorldModel(Module):
         continuous_log_probs = None
         values = None
         latents = None
+
+        # keep track of termination, for setting the `is_truncated` field on Experience and for early stopping interaction with env
+
+        is_terminated = full((batch,), False, device = device)
+        episode_lens = full((batch,), 0, device = device)
 
         # maybe time kv cache
 
@@ -2190,7 +2197,22 @@ class DynamicsWorldModel(Module):
 
             # pass the sampled action to the environment and get back next state and reward
 
-            next_frame, reward = env.step((sampled_discrete_actions, sampled_continuous_actions))
+            env_step_out = env.step((sampled_discrete_actions, sampled_continuous_actions))
+
+            if len(env_step_out) == 2:
+                next_frame, reward = env_step_out
+                terminate = full((batch,), False)
+
+            elif len(env_step_out) == 3:
+                next_frame, reward, terminate = env_step_out
+
+            # update episode lens
+
+            episode_lens = torch.where(is_terminated, episode_lens, episode_lens + 1)
+
+            # update `is_terminated`
+
+            is_terminated |= terminate
 
             # batch and time dimension
 
@@ -2206,6 +2228,11 @@ class DynamicsWorldModel(Module):
             video = cat((video, next_frame), dim = 2)
             rewards = safe_cat((rewards, reward), dim = 1)
 
+            # early break out if all terminated
+
+            if is_terminated.all():
+                break
+
         # package up one experience for learning
 
         batch, device = latents.shape[0], latents.device
@@ -2219,7 +2246,8 @@ class DynamicsWorldModel(Module):
             values = values,
             step_size = step_size,
             agent_index = agent_index,
-            lens = full((batch,), max_timesteps + 1, device = device),
+            is_truncated = ~is_terminated,
+            lens = episode_lens,
             is_from_world_model = False
         )
 
