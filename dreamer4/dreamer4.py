@@ -2244,10 +2244,11 @@ class DynamicsWorldModel(Module):
         if not exists(experience.is_truncated):
             experience.is_truncated = full((batch,), True, device = latents.device)
 
-        mask_for_gae = lens_to_mask(experience.lens, time)
+        if exists(experience.lens):
+            mask_for_gae = lens_to_mask(experience.lens, time)
 
-        rewards = rewards.masked_fill(mask_for_gae, 0.)
-        old_values = old_values.masked_fill(mask_for_gae, 0.)
+            rewards = rewards.masked_fill(mask_for_gae, 0.)
+            old_values = old_values.masked_fill(mask_for_gae, 0.)
 
         # calculate returns
 
