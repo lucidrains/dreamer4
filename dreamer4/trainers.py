@@ -287,7 +287,7 @@ class DreamTrainer(Module):
         for _ in range(self.num_train_steps):
 
             dreams = self.unwrapped_model.generate(
-                self.generate_timesteps,
+                self.generate_timesteps + 1, # plus one for bootstrap value
                 batch_size = self.batch_size,
                 return_rewards_per_frame = True,
                 return_agent_actions = True,
