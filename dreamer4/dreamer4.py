@@ -77,6 +77,7 @@ class Experience:
     latents: Tensor
     video: Tensor | None = None
     proprio: Tensor | None = None
+    agent_embed: Tensor | None = None,
     rewards: Tensor | None = None
     actions: tuple[Tensor, Tensor] | None = None
     log_probs: tuple[Tensor, Tensor] | None = None
@@ -2105,7 +2106,8 @@ class DynamicsWorldModel(Module):
         step_size = 4,
         max_timesteps = 16,
         env_is_vectorized = False,
-        use_time_kv_cache = True
+        use_time_kv_cache = True,
+        store_agent_embed = True
     ):
         assert exists(self.video_tokenizer)
 
@@ -2129,6 +2131,8 @@ class DynamicsWorldModel(Module):
         continuous_log_probs = None
         values = None
         latents = None
+
+        acc_agent_embed = None
 
         # keep track of termination, for setting the `is_truncated` field on Experience and for early stopping interaction with env
 
@@ -2251,6 +2255,8 @@ class DynamicsWorldModel(Module):
             video = cat((video, next_frame), dim = 2)
             rewards = safe_cat((rewards, reward), dim = 1)
 
+            acc_agent_embed = safe_cat((acc_agent_embed, agent_embed), dim = 1)
+
         # package up one experience for learning
 
         batch, device = latents.shape[0], latents.device
@@ -2262,6 +2268,7 @@ class DynamicsWorldModel(Module):
             actions = (discrete_actions, continuous_actions),
             log_probs = (discrete_log_probs, continuous_log_probs),
             values = values,
+            agent_embed = acc_agent_embed if store_agent_embed else None,
             step_size = step_size,
             agent_index = agent_index,
             is_truncated = is_truncated,
@@ -2491,6 +2498,7 @@ class DynamicsWorldModel(Module):
         return_agent_actions = False,
         return_log_probs_and_values = False,
         return_time_kv_cache = False,
+        store_agent_embed = False
 
     ): # (b t n d) | (b c t h w)
 
@@ -2542,6 +2550,10 @@ class DynamicsWorldModel(Module):
         decoded_discrete_log_probs = None
         decoded_continuous_log_probs = None
         decoded_values = None
+
+        # maybe store agent embed
+
+        acc_agent_embed = None
 
         # maybe return rewards
 
@@ -2651,6 +2663,10 @@ class DynamicsWorldModel(Module):
 
                 decoded_rewards = cat((decoded_rewards, pred_reward), dim = 1)
 
+            # maybe store agent embed
+
+            acc_agent_embed = safe_cat((acc_agent_embed, agent_embed), dim = 1)
+
             # decode the agent actions if needed
 
             if return_agent_actions:
@@ -2747,6 +2763,7 @@ class DynamicsWorldModel(Module):
             latents = latents,
             video = video,
             proprio = proprio if has_proprio else None,
+            agent_embed = acc_agent_embed if store_agent_embed else None,
             step_size = step_size,
             agent_index = agent_index,
             lens = experience_lens,
