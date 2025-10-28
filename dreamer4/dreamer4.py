@@ -2255,7 +2255,7 @@ class DynamicsWorldModel(Module):
             video = cat((video, next_frame), dim = 2)
             rewards = safe_cat((rewards, reward), dim = 1)
 
-            acc_agent_embed = safe_cat((acc_agent_embed, agent_embed), dim = 1)
+            acc_agent_embed = safe_cat((acc_agent_embed, one_agent_embed), dim = 1)
 
         # package up one experience for learning
 
@@ -2397,7 +2397,7 @@ class DynamicsWorldModel(Module):
                     return_intermediates = True
                 )
 
-        agent_embeds = agent_embeds[..., agent_index, :]
+            agent_embeds = agent_embeds[..., agent_index, :]
 
         # maybe detach agent embed
 
@@ -2672,7 +2672,9 @@ class DynamicsWorldModel(Module):
 
             # maybe store agent embed
 
-            acc_agent_embed = safe_cat((acc_agent_embed, agent_embed), dim = 1)
+            if store_agent_embed:
+                one_agent_embed = agent_embed[:, -1:, agent_index]
+                acc_agent_embed = safe_cat((acc_agent_embed, one_agent_embed), dim = 1)
 
             # decode the agent actions if needed
 
