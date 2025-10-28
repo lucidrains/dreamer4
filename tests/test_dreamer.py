@@ -614,11 +614,13 @@ def test_cache_generate():
 @param('use_signed_advantage', (False, True))
 @param('env_can_terminate', (False, True))
 @param('env_can_truncate', (False, True))
+@param('store_agent_embed', (False, True))
 def test_online_rl(
     vectorized,
     use_signed_advantage,
     env_can_terminate,
-    env_can_truncate
+    env_can_truncate,
+    store_agent_embed
 ):
     from dreamer4.dreamer4 import DynamicsWorldModel, VideoTokenizer
 
@@ -664,10 +666,13 @@ def test_online_rl(
 
     # manually
 
-    one_experience = world_model_and_policy.interact_with_env(mock_env, max_timesteps = 8, env_is_vectorized = vectorized)
-    another_experience = world_model_and_policy.interact_with_env(mock_env, max_timesteps = 16, env_is_vectorized = vectorized)
+    one_experience = world_model_and_policy.interact_with_env(mock_env, max_timesteps = 8, env_is_vectorized = vectorized, store_agent_embed = store_agent_embed)
+    another_experience = world_model_and_policy.interact_with_env(mock_env, max_timesteps = 16, env_is_vectorized = vectorized, store_agent_embed = store_agent_embed)
 
     combined_experience = combine_experiences([one_experience, another_experience])
+
+    if store_agent_embed:
+        assert exists(combined_experience.agent_embed)
 
     actor_loss, critic_loss = world_model_and_policy.learn_from_experience(combined_experience, use_signed_advantage = use_signed_advantage)
 
