@@ -753,3 +753,36 @@ def test_proprioception(
 
     assert exists(generations.proprio)
     assert generations.video.shape == video_shape
+
+def test_epo():
+    from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
+
+    tokenizer = VideoTokenizer(
+        512,
+        dim_latent = 32,
+        patch_size = 32,
+        encoder_depth = 2,
+        decoder_depth = 2,
+        time_block_every = 2,
+        attn_heads = 8,
+        image_height = 256,
+        image_width = 256,
+        attn_kwargs = dict(
+            query_heads = 16
+        )
+    )
+
+    dynamics = DynamicsWorldModel(
+        512,
+        num_agents = 1,
+        video_tokenizer = tokenizer,
+        dim_latent = 32,
+        dim_proprio = 21,
+        num_tasks = 4,
+        num_latent_genes = 16,
+        num_discrete_actions = 4,
+        num_residual_streams = 1
+    )
+
+    fitness = torch.randn(16,)
+    dynamics.evolve_(fitness)

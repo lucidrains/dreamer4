@@ -1942,6 +1942,7 @@ class DynamicsWorldModel(Module):
         # learned set of latent genes
 
         self.agent_has_genes = num_latent_genes > 0
+        self.num_latent_genes = num_latent_genes
         self.latent_genes = Parameter(randn(num_latent_genes, dim) * 1e-2)
 
         # policy head
@@ -2094,6 +2095,53 @@ class DynamicsWorldModel(Module):
             return times
 
         return align_dims_left(times, align_dims_left_to)
+
+    # evolutionary policy optimization - https://web3.arxiv.org/abs/2503.19037
+
+    @torch.no_grad()
+    def evolve_(
+        self,
+        fitness,
+        select_frac = 0.5,
+        tournament_frac = 0.5
+    ):
+        assert fitness.numel() == self.num_latent_genes
+
+        pop = self.latent_genes
+
+        pop_size = self.num_latent_genes
+        num_selected = ceil(pop_size * select_frac)
+        num_children = pop_size - num_selected
+
+        dim_gene = pop.shape[-1]
+
+        # natural selection just a sort and slice
+
+        selected_fitness, selected_indices = fitness.topk(num_selected, dim = -1)
+        selected = pop[selected_indices]
+
+        # use tournament - one tournament per child
+
+        tournament_size = max(2, ceil(num_selected * tournament_frac))
+
+        tournaments = torch.randn((num_children, num_selected), device = self.device).argsort(dim = -1)[:, :tournament_size]
+
+        parent_ids = selected_fitness[tournaments].topk(2, dim = -1).indices # get top 2 winners as parents
+
+        parents = selected[parent_ids]
+
+        # crossover by random interpolation from parent1 to parent2
+
+        random_uniform_mix = torch.randn((num_children, dim_gene), device = self.device).sigmoid()
+
+        parent1, parent2 = parents.unbind(dim = 1)
+        children = parent1.lerp(parent2, random_uniform_mix)
+
+        # store next population
+
+        next_pop = cat((selected, children))
+
+        self.latent_genes.copy_(next_pop)
 
     # interacting with env for experience
 
