@@ -22,7 +22,9 @@ class MockEnv(Module):
         num_envs = 1,
         vectorized = False,
         terminate_after_step = None,
-        rand_terminate_prob = 0.05
+        rand_terminate_prob = 0.05,
+        can_truncate = False,
+        rand_truncate_prob = 0.05,
     ):
         super().__init__()
         self.image_shape = image_shape
@@ -32,11 +34,14 @@ class MockEnv(Module):
         self.vectorized = vectorized
         assert not (vectorized and num_envs == 1)
 
-        # mocking termination
+        # mocking termination and truncation
 
         self.can_terminate = exists(terminate_after_step)
         self.terminate_after_step = terminate_after_step
         self.rand_terminate_prob = rand_terminate_prob
+
+        self.can_truncate = can_truncate
+        self.rand_truncate_prob = rand_truncate_prob
 
         self.register_buffer('_step', tensor(0))
 
@@ -72,15 +77,20 @@ class MockEnv(Module):
 
         out = (state, reward)
 
+
         if self.can_terminate:
             shape = (self.num_envs,) if self.vectorized else (1,)
+            valid_step = self._step > self.terminate_after_step
 
-            terminate = (
-                (torch.rand(shape) < self.rand_terminate_prob) &
-                (self._step > self.terminate_after_step)
-            )
+            terminate = (torch.rand(shape) < self.rand_terminate_prob) & valid_step
 
             out = (*out, terminate)
+
+            # maybe truncation
+
+            if self.can_truncate:
+                truncate = (torch.rand(shape) < self.rand_truncate_prob) & valid_step & ~terminate
+                out = (*out, truncate)
 
         self._step.add_(1)
 

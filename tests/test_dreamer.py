@@ -613,10 +613,12 @@ def test_cache_generate():
 @param('vectorized', (False, True))
 @param('use_signed_advantage', (False, True))
 @param('env_can_terminate', (False, True))
+@param('env_can_truncate', (False, True))
 def test_online_rl(
     vectorized,
     use_signed_advantage,
-    env_can_terminate
+    env_can_terminate,
+    env_can_truncate
 ):
     from dreamer4.dreamer4 import DynamicsWorldModel, VideoTokenizer
 
@@ -656,6 +658,7 @@ def test_online_rl(
         vectorized = vectorized,
         num_envs = 4,
         terminate_after_step = 2 if env_can_terminate else None,
+        can_truncate = env_can_truncate,
         rand_terminate_prob = 0.1
     )
 

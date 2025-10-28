@@ -2133,13 +2133,18 @@ class DynamicsWorldModel(Module):
         # keep track of termination, for setting the `is_truncated` field on Experience and for early stopping interaction with env
 
         is_terminated = full((batch,), False, device = device)
+        is_truncated = full((batch,), False, device = device)
+
         episode_lens = full((batch,), 0, device = device)
 
         # maybe time kv cache
 
         time_kv_cache = None
 
-        for i in range(max_timesteps + 1):
+        step_index = 0
+
+        while not is_terminated.all():
+            step_index += 1
 
             latents = self.video_tokenizer(video, return_latents = True)
 
@@ -2201,10 +2206,15 @@ class DynamicsWorldModel(Module):
 
             if len(env_step_out) == 2:
                 next_frame, reward = env_step_out
-                terminate = full((batch,), False)
+                terminated = full((batch,), False)
+                truncated = full((batch,), False)
 
             elif len(env_step_out) == 3:
-                next_frame, reward, terminate = env_step_out
+                next_frame, reward, terminated = env_step_out
+                truncated = full((batch,), False)
+
+            elif len(env_step_out) == 4:
+                next_frame, reward, terminated, truncated = env_step_out
 
             # update episode lens
 
@@ -2212,7 +2222,20 @@ class DynamicsWorldModel(Module):
 
             # update `is_terminated`
 
-            is_terminated |= terminate
+            # (1) - environment says it is terminated
+            # (2) - previous step is truncated (this step is for bootstrap value)
+
+            is_terminated |= (terminated | is_truncated)
+
+            # update `is_truncated`
+
+            if step_index <= max_timesteps:
+                is_truncated |= truncated
+
+            if step_index == max_timesteps:
+                # if the step index is at the max time step allowed, set the truncated flag, if not already terminated
+
+                is_truncated |= ~is_terminated
 
             # batch and time dimension
 
@@ -2228,11 +2251,6 @@ class DynamicsWorldModel(Module):
             video = cat((video, next_frame), dim = 2)
             rewards = safe_cat((rewards, reward), dim = 1)
 
-            # early break out if all terminated
-
-            if is_terminated.all():
-                break
-
         # package up one experience for learning
 
         batch, device = latents.shape[0], latents.device
@@ -2246,7 +2264,7 @@ class DynamicsWorldModel(Module):
             values = values,
             step_size = step_size,
             agent_index = agent_index,
-            is_truncated = ~is_terminated,
+            is_truncated = is_truncated,
             lens = episode_lens,
             is_from_world_model = False
         )
