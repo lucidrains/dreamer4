@@ -346,6 +346,15 @@ def test_action_embedder():
     assert discrete_logits.shape == (2, 3, 8)
     assert continuous_mean_log_var.shape == (2, 3, 2, 2)
 
+    # test kl div
+
+    discrete_logits_tgt, continuous_mean_log_var_tgt = embedder.unembed(action_embed)
+
+    discrete_kl_div, continuous_kl_div = embedder.kl_div((discrete_logits, continuous_mean_log_var), (discrete_logits_tgt, continuous_mean_log_var_tgt))
+
+    assert discrete_kl_div.shape == (2, 3, 2)
+    assert continuous_kl_div.shape == (2, 3, 2)
+
     # return discrete split by number of actions
 
     discrete_logits, continuous_mean_log_var = embedder.unembed(action_embed, return_split_discrete = True)
