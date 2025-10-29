@@ -72,20 +72,22 @@ TokenizerLosses = namedtuple('TokenizerLosses', ('recon', 'lpips'))
 
 WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'rewards', 'discrete_actions', 'continuous_actions'))
 
+MaybeTensor = Tensor | None
+
 @dataclass
 class Experience:
     latents: Tensor
-    video: Tensor | None = None
-    proprio: Tensor | None = None
-    agent_embed: Tensor | None = None
+    video: MaybeTensor = None
+    proprio: MaybeTensor = None
+    agent_embed: MaybeTensor = None
     rewards: Tensor | None = None
-    actions: tuple[Tensor, Tensor] | None = None
-    log_probs: tuple[Tensor, Tensor] | None = None
-    old_action_unembeds: tuple[Tensor, Tensor] | None = None
-    values: Tensor | None = None
+    actions: tuple[MaybeTensor, MaybeTensor] | None = None
+    log_probs: tuple[MaybeTensor, MaybeTensor] | None = None
+    old_action_unembeds: tuple[MaybeTensor, MaybeTensor] | None = None
+    values: MaybeTensor = None
     step_size: int | None = None
-    lens: Tensor | None = None
-    is_truncated: Tensor | None = None
+    lens: MaybeTensor = None
+    is_truncated: MaybeTensor = None
     agent_index: int = 0
     is_from_world_model: bool = True
 
@@ -850,9 +852,10 @@ class ActionEmbedder(Module):
 
     def kl_div(
         self,
-        src: tuple[Tensor | None, Tensor | None],
-        tgt: tuple[Tensor | None, Tensor | None]
-    ) -> tuple[Tensor | None, Tensor | None]:
+        src: tuple[MaybeTensor, MaybeTensor],
+        tgt: tuple[MaybeTensor, MaybeTensor],
+        reduce_across_num_actions = True
+    ) -> tuple[MaybeTensor, MaybeTensor]:
 
         src_discrete, src_continuous = src
         tgt_discrete, tgt_continuous = tgt
@@ -893,6 +896,15 @@ class ActionEmbedder(Module):
             tgt_normal = mean_log_var_to_distr(tgt_continuous)
 
             continuous_kl_div = kl.kl_divergence(src_normal, tgt_normal)
+
+        # maybe reduce
+
+        if reduce_across_num_actions:
+            if exists(discrete_kl_div):
+                discrete_kl_div = discrete_kl_div.sum(dim = -1)
+
+            if exists(continuous_kl_div):
+                continuous_kl_div = continuous_kl_div.sum(dim = -1)
 
         return discrete_kl_div, continuous_kl_div
 
