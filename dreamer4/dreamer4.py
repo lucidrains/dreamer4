@@ -1900,7 +1900,7 @@ class DynamicsWorldModel(Module):
         gae_lambda = 0.95,
         ppo_eps_clip = 0.2,
         pmpo_pos_to_neg_weight = 0.5, # pos and neg equal weight
-        pmpo_kl_div_loss_weight = 1.,
+        pmpo_kl_div_loss_weight = .3,
         value_clip = 0.4,
         policy_entropy_weight = .01,
         gae_use_accelerated = False
