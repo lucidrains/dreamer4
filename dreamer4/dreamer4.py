@@ -2580,7 +2580,7 @@ class DynamicsWorldModel(Module):
             if self.pmpo_kl_div_loss_weight > 0.:
                 new_unembedded_actions = self.action_embedder.unembed(policy_embed, pred_head_index = 0)
 
-                discrete_kl_div, continuous_kl_div = self.action_embedder.kl_div(new_unembedded_actions, old_action_unembeds)
+                discrete_kl_div, continuous_kl_div = self.action_embedder.kl_div(old_action_unembeds, new_unembedded_actions)
 
                 # accumulate discrete and continuous kl div
 
