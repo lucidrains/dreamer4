@@ -2870,7 +2870,7 @@ class DynamicsWorldModel(Module):
                 # maybe store old actions
 
                 if store_old_action_unembeds:
-                    acc_policy_embed = safe_cat((acc_policy_embed, policy_embed))
+                    acc_policy_embed = safe_cat((acc_policy_embed, policy_embed), dim = 1)
 
                 # sample actions
 
