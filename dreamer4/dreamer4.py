@@ -1902,6 +1902,7 @@ class DynamicsWorldModel(Module):
         pmpo_pos_to_neg_weight = 0.5, # pos and neg equal weight
         pmpo_reverse_kl = True,
         pmpo_kl_div_loss_weight = .3,
+        normalize_advantages = None,
         value_clip = 0.4,
         policy_entropy_weight = .01,
         gae_use_accelerated = False
@@ -2425,6 +2426,7 @@ class DynamicsWorldModel(Module):
         value_optim: Optimizer | None = None,
         only_learn_policy_value_heads = True, # in the paper, they do not finetune the entire dynamics model, they just learn the heads
         use_pmpo = True,
+        normalize_advantages = None,
         eps = 1e-6
     ):
 
@@ -2507,15 +2509,18 @@ class DynamicsWorldModel(Module):
         else:
             advantage = returns - old_values
 
-        # apparently they just use the sign of the advantage
+        # if using pmpo, do not normalize advantages, but can be overridden
+
+        normalize_advantages = default(normalize_advantages, not use_pmpo)
+
+        if normalize_advantages:
+            advantage = F.layer_norm(advantage, advantage.shape, eps = eps)
+
         # https://arxiv.org/abs/2410.04166v1
 
         if use_pmpo:
             pos_advantage_mask = advantage >= 0.
             neg_advantage_mask = ~pos_advantage_mask
-
-        else:
-            advantage = F.layer_norm(advantage, advantage.shape, eps = eps)
 
         # replay for the action logits and values
         # but only do so if fine tuning the entire world model for RL
