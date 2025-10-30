@@ -1900,6 +1900,7 @@ class DynamicsWorldModel(Module):
         gae_lambda = 0.95,
         ppo_eps_clip = 0.2,
         pmpo_pos_to_neg_weight = 0.5, # pos and neg equal weight
+        pmpo_reverse_kl = True,
         pmpo_kl_div_loss_weight = .3,
         value_clip = 0.4,
         policy_entropy_weight = .01,
@@ -2108,6 +2109,7 @@ class DynamicsWorldModel(Module):
 
         self.pmpo_pos_to_neg_weight = pmpo_pos_to_neg_weight
         self.pmpo_kl_div_loss_weight = pmpo_kl_div_loss_weight
+        self.pmpo_reverse_kl = pmpo_reverse_kl
 
         # rewards related
 
@@ -2578,11 +2580,18 @@ class DynamicsWorldModel(Module):
             # take care of kl
 
             if self.pmpo_kl_div_loss_weight > 0.:
+
                 new_unembedded_actions = self.action_embedder.unembed(policy_embed, pred_head_index = 0)
 
-                # mentioned that the "reverse direction for the prior KL" was used
+                kl_div_inputs, kl_div_targets = new_unembedded_actions, old_action_unembeds
 
-                discrete_kl_div, continuous_kl_div = self.action_embedder.kl_div(old_action_unembeds, new_unembedded_actions)
+                # mentioned that the "reverse direction for the prior KL" was used
+                # make optional, as observed instability in toy task
+
+                if self.pmpo_reverse_kl:
+                    kl_div_inputs, kl_div_targets = kl_div_targets, kl_div_inputs
+
+                discrete_kl_div, continuous_kl_div = self.action_embedder.kl_div(kl_div_inputs, kl_div_targets)
 
                 # accumulate discrete and continuous kl div
 
