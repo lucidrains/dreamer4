@@ -6,6 +6,10 @@ Implementation of Danijar's [latest iteration](https://arxiv.org/abs/2509.24527v
 
 [Discord channel](https://discord.gg/ab4BEk3W) for collaborating with other researchers interested in this work
 
+## Appreciation
+
+- [@dirkmcpherson](https://github.com/dirkmcpherson) for fixes to typo errors and unpassed arguments!
+
 ## Install
 
 ```bash
