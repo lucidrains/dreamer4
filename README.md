@@ -37,7 +37,7 @@ video = torch.randn(2, 3, 10, 256, 256)
 # learn the tokenizer
 
 loss = tokenizer(video)
-loss.backward() # ler
+loss.backward()
 
 # dynamics world model
 
