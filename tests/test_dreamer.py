@@ -680,6 +680,12 @@ def test_online_rl(
 
     combined_experience = combine_experiences([one_experience, another_experience])
 
+    # quick test moving the experience to different devices
+
+    if torch.cuda.is_available():
+        combined_experience = combined_experience.to(torch.device('cuda'))
+        combined_experience = combined_experience.to(world_model_and_policy.device)
+
     if store_agent_embed:
         assert exists(combined_experience.agent_embed)
 

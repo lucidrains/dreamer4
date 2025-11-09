@@ -14,7 +14,7 @@ from torch.nested import nested_tensor
 from torch.distributions import Normal, kl
 from torch.nn import Module, ModuleList, Embedding, Parameter, Sequential, Linear, RMSNorm, Identity
 from torch import nn, cat, stack, arange, tensor, Tensor, is_tensor, full, zeros, ones, randint, rand, randn, randn_like, empty, full, linspace, arange
-from torch.utils._pytree import tree_flatten, tree_unflatten
+from torch.utils._pytree import tree_map, tree_flatten, tree_unflatten
 
 import torchvision
 from torchvision.models import VGG16_Weights
@@ -90,6 +90,14 @@ class Experience:
     is_truncated: MaybeTensor = None
     agent_index: int = 0
     is_from_world_model: bool = True
+
+    def cpu(self):
+        return self.to(torch.device('cpu'))
+
+    def to(self, device):
+        experience_dict = asdict(self)
+        experience_dict = tree_map(lambda t: t.to(device) if is_tensor(t) else t, experience_dict)
+        return Experience(**experience_dict)
 
 def combine_experiences(
     exps: list[Experiences]
@@ -2434,6 +2442,8 @@ class DynamicsWorldModel(Module):
         eps = 1e-6
     ):
         assert isinstance(experience, Experience)
+
+        experience = experience.to(self.device)
 
         latents = experience.latents
         actions = experience.actions

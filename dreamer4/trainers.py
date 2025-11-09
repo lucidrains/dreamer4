@@ -528,7 +528,7 @@ class SimTrainer(Module):
 
                 total_experience += num_experience
 
-                experiences.append(experience)
+                experiences.append(experience.cpu())
 
             combined_experiences = combine_experiences(experiences)
 
