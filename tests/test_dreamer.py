@@ -41,7 +41,9 @@ def test_e2e(
         patch_size = 32,
         attn_dim_head = 16,
         num_latent_tokens = 4,
-        num_residual_streams = num_residual_streams
+        num_residual_streams = num_residual_streams,
+        encoder_add_decor_aux_loss = True,
+        decorr_sample_frac = 1.
     )
 
     video = torch.randn(2, 3, 4, 256, 256)
