@@ -1736,7 +1736,7 @@ class VideoTokenizer(Module):
         self.encoder_add_decor_aux_loss = encoder_add_decor_aux_loss
         self.decorr_aux_loss_weight = decor_auxx_loss_weight
 
-        self.decorr_loss = DecorrelationLoss(decorr_sample_frac) if encoder_add_decor_aux_loss else None
+        self.decorr_loss = DecorrelationLoss(decorr_sample_frac, soft_validate_num_sampled = True) if encoder_add_decor_aux_loss else None
 
     @property
     def device(self):
