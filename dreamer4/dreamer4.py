@@ -1873,6 +1873,8 @@ class VideoTokenizer(Module):
         if self.has_lpips_loss:
             lpips_loss = self.lpips(video, recon_video)
 
+        decorr_loss = self.zero
+
         if self.encoder_add_decor_aux_loss:
             decorr_loss = self.decorr_loss(time_attn_normed_inputs)
 
