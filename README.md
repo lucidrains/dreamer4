@@ -4,7 +4,7 @@
 
 Implementation of Danijar's [latest iteration](https://arxiv.org/abs/2509.24527v1) for his [Dreamer](https://danijar.com/project/dreamer4/) line of work
 
-[Discord channel](https://discord.gg/ab4BEk3W) for collaborating with other researchers interested in this work
+[Discord channel](https://discord.gg/PmGR7KRwxq) for collaborating with other researchers interested in this work
 
 ## Appreciation
 
