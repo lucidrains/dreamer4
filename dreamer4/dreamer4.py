@@ -2229,6 +2229,7 @@ class DynamicsWorldModel(Module):
             num_special_spatial_tokens = num_agents,
             time_block_every = time_block_every,
             final_norm = False,
+            rnn_time = False,
             **transformer_kwargs
         )
 
