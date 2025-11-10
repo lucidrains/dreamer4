@@ -71,8 +71,8 @@ def test_e2e(
         pred_orig_latent = pred_orig_latent,
         num_discrete_actions = 4,
         attn_dim_head = 16,
+        attn_heads = heads,
         attn_kwargs = dict(
-            heads = heads,
             query_heads = query_heads,
         ),
         prob_no_shortcut_train = prob_no_shortcut_train,
