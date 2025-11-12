@@ -15,7 +15,7 @@ def exists(v):
 @param('condition_on_actions', (False, True))
 @param('num_residual_streams', (1, 4))
 @param('add_reward_embed_to_agent_token', (False, True))
-@param('use_time_kv_cache', (False, True))
+@param('use_time_cache', (False, True))
 @param('var_len', (False, True))
 def test_e2e(
     pred_orig_latent,
@@ -28,7 +28,7 @@ def test_e2e(
     condition_on_actions,
     num_residual_streams,
     add_reward_embed_to_agent_token,
-    use_time_kv_cache,
+    use_time_cache,
     var_len
 ):
     from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
@@ -123,7 +123,7 @@ def test_e2e(
         image_width = 128,
         batch_size = 2,
         return_rewards_per_frame = True,
-        use_time_kv_cache = use_time_kv_cache
+        use_time_cache = use_time_cache
     )
 
     assert generations.video.shape == (2, 3, 10, 128, 128)
@@ -617,9 +617,9 @@ def test_cache_generate():
         num_residual_streams = 1
     )
 
-    generated, time_kv_cache = dynamics.generate(1, return_time_kv_cache = True)
-    generated, time_kv_cache = dynamics.generate(1, time_kv_cache = time_kv_cache, return_time_kv_cache = True)
-    generated, time_kv_cache = dynamics.generate(1, time_kv_cache = time_kv_cache, return_time_kv_cache = True)
+    generated, time_cache = dynamics.generate(1, return_time_cache = True)
+    generated, time_cache = dynamics.generate(1, time_cache = time_cache, return_time_cache = True)
+    generated, time_cache = dynamics.generate(1, time_cache = time_cache, return_time_cache = True)
 
 @param('vectorized', (False, True))
 @param('use_pmpo', (False, True))
