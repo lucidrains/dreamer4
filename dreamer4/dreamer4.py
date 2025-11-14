@@ -96,7 +96,7 @@ class Experience:
     lens: MaybeTensor = None
     is_truncated: MaybeTensor = None
     agent_index: int = 0
-    is_from_world_model: bool = True
+    is_from_world_model: bool | Tensor = True
 
     def cpu(self):
         return self.to(torch.device('cpu'))
@@ -124,6 +124,9 @@ def combine_experiences(
         if not exists(exp.is_truncated):
             exp.is_truncated = full((batch,), True, device = device)
 
+        if isinstance(exp.is_from_world_model, bool):
+            exp.is_from_world_model = tensor(exp.is_from_world_model)
+
     # convert to dictionary
 
     exps_dict = [asdict(exp) for exp in exps]
@@ -145,11 +148,15 @@ def combine_experiences(
 
     for field_values in all_field_values:
 
-        if is_tensor(first(field_values)):
+        first_value = first(field_values)
+
+        if is_tensor(first_value):
 
             field_values = pad_tensors_at_dim_to_max_len(field_values, dims = (1, 2))
 
-            new_field_value = cat(field_values)
+            cat_or_stack = cat if first_value.ndim > 0 else stack
+
+            new_field_value = cat_or_stack(field_values)
         else:
             new_field_value = first(list(set(field_values)))
 
@@ -2408,7 +2415,7 @@ class DynamicsWorldModel(Module):
         env,
         seed = None,
         agent_index = 0,
-        step_size = 4,
+        num_steps = 4,
         max_timesteps = 16,
         env_is_vectorized = False,
         use_time_cache = True,
@@ -2447,6 +2454,11 @@ class DynamicsWorldModel(Module):
         is_truncated = full((batch,), False, device = device)
 
         episode_lens = full((batch,), 0, device = device)
+
+        # derive step size
+
+        assert divisible_by(self.max_steps, num_steps)
+        step_size = self.max_steps // num_steps
 
         # maybe time kv cache
 

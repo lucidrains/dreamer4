@@ -643,7 +643,9 @@ def test_online_rl(
         dim_latent = 16,
         patch_size = 32,
         attn_dim_head = 16,
-        num_latent_tokens = 1
+        num_latent_tokens = 1,
+        image_height = 256,
+        image_width = 256,
     )
 
     world_model_and_policy = DynamicsWorldModel(
@@ -677,10 +679,12 @@ def test_online_rl(
 
     # manually
 
+    dream_experience = world_model_and_policy.generate(10, batch_size = 1, store_agent_embed = store_agent_embed, return_for_policy_optimization = True)
+
     one_experience = world_model_and_policy.interact_with_env(mock_env, max_timesteps = 8, env_is_vectorized = vectorized, store_agent_embed = store_agent_embed)
     another_experience = world_model_and_policy.interact_with_env(mock_env, max_timesteps = 16, env_is_vectorized = vectorized, store_agent_embed = store_agent_embed)
 
-    combined_experience = combine_experiences([one_experience, another_experience])
+    combined_experience = combine_experiences([dream_experience, one_experience, another_experience])
 
     # quick test moving the experience to different devices
 
