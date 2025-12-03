@@ -15,6 +15,7 @@ def exists(v):
 @param('condition_on_actions', (False, True))
 @param('num_residual_streams', (1, 4))
 @param('add_reward_embed_to_agent_token', (False, True))
+@param('add_state_pred_head', (False, True))
 @param('use_time_cache', (False, True))
 @param('var_len', (False, True))
 def test_e2e(
@@ -28,6 +29,7 @@ def test_e2e(
     condition_on_actions,
     num_residual_streams,
     add_reward_embed_to_agent_token,
+    add_state_pred_head,
     use_time_cache,
     var_len
 ):
@@ -77,6 +79,7 @@ def test_e2e(
         ),
         prob_no_shortcut_train = prob_no_shortcut_train,
         add_reward_embed_to_agent_token = add_reward_embed_to_agent_token,
+        add_state_pred_head = add_state_pred_head,
         num_residual_streams = num_residual_streams
     )
 
