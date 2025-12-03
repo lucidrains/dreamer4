@@ -2762,7 +2762,7 @@ class DynamicsWorldModel(Module):
         ):
 
             with world_model_forward_context():
-                _, (agent_embeds, _) = self.forward(
+                _, (embeds, _) = self.forward(
                     latents = latents,
                     signal_levels = self.max_steps - 1,
                     step_sizes = step_size,
@@ -2774,7 +2774,7 @@ class DynamicsWorldModel(Module):
                     return_intermediates = True
                 )
 
-            agent_embeds = agent_embeds[..., agent_index, :]
+            agent_embeds = embeds.agent[..., agent_index, :]
 
         # maybe detach agent embed
 
