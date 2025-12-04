@@ -810,3 +810,22 @@ def test_epo():
 
     fitness = torch.randn(16,)
     dynamics.evolve_(fitness)
+
+def test_images_to_video_tokenizer():
+    import torch
+    from dreamer4 import VideoTokenizer, DynamicsWorldModel, AxialSpaceTimeTransformer
+
+    tokenizer = VideoTokenizer(
+        dim = 512,
+        dim_latent = 32,
+        patch_size = 32,
+        image_height = 256,
+        image_width = 256,
+        encoder_add_decor_aux_loss = True
+    )
+
+    images = torch.randn(2, 3, 256, 256)
+    loss, (losses, recon_images) = tokenizer(images, return_intermediates = True)
+    loss.backward()
+
+    assert images.shape == recon_images.shape
