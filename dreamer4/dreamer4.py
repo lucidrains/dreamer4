@@ -26,7 +26,7 @@ from adam_atan2_pytorch import MuonAdamAtan2
 from x_mlps_pytorch.ensemble import Ensemble
 from x_mlps_pytorch.normed_mlp import create_mlp
 
-from hyper_connections import get_init_and_expand_reduce_stream_functions
+from hyper_connections import mc_get_init_and_expand_reduce_stream_functions
 
 from vit_pytorch.vit_with_decorr import DecorrelationLoss
 
@@ -1515,7 +1515,7 @@ class AxialSpaceTimeTransformer(Module):
 
         # hyper connections
 
-        hyper_conn, self.expand_streams, self.reduce_streams = get_init_and_expand_reduce_stream_functions(num_residual_streams, dim = dim)
+        hyper_conn, self.expand_streams, self.reduce_streams = mc_get_init_and_expand_reduce_stream_functions(num_residual_streams, dim = dim)
 
         # attention
 
@@ -1784,7 +1784,7 @@ class VideoTokenizer(Module):
 
         # hyper connections
 
-        hyper_conn, self.expand_streams, self.reduce_streams = get_init_and_expand_reduce_stream_functions(num_residual_streams, dim = dim)
+        hyper_conn, self.expand_streams, self.reduce_streams = mc_get_init_and_expand_reduce_stream_functions(num_residual_streams, dim = dim)
 
         # mae masking - Kaiming He paper from long ago
 
