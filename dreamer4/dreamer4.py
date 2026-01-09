@@ -32,6 +32,8 @@ from vit_pytorch.vit_with_decorr import DecorrelationLoss
 
 from assoc_scan import AssocScan
 
+from discrete_continuous_embed_readout import MultiCategorical
+
 # ein related
 
 # b - batch
@@ -748,6 +750,7 @@ class ActionEmbedder(Module):
         continuous_temperature = 1.,
         inverse_norm_continuous = None,
         pred_head_index: int | Tensor | None = None,
+        parallel_discrete_calc = True,
         squeeze = True,
         **kwargs
     ):
@@ -758,12 +761,8 @@ class ActionEmbedder(Module):
         sampled_discrete = sampled_continuous = None
 
         if exists(discrete_logits):
-            sampled_discrete = []
-
-            for one_discrete_logits in discrete_logits:
-                sampled_discrete.append(gumbel_sample(one_discrete_logits, temperature = discrete_temperature, keepdim = True))
-
-            sampled_discrete = cat(sampled_discrete, dim = -1)
+            dist = MultiCategorical(discrete_logits, use_parallel_multi_discrete = parallel_discrete_calc)
+            sampled_discrete = dist.sample(temperature = discrete_temperature)
 
         if exists(continuous_mean_log_var):
             mean, log_var = continuous_mean_log_var.unbind(dim = -1)
@@ -790,9 +789,13 @@ class ActionEmbedder(Module):
         parallel_discrete_calc = None,
         return_entropies = False
     ):
-        parallel_discrete_calc = default(parallel_discrete_calc, exists(discrete_targets) and discrete_targets.shape[-1] > 1)
-
-        discrete_action_logits, continuous_action_mean_log_var = self.unembed(embeds, pred_head_index = pred_head_index, discrete_action_types = discrete_action_types, continuous_action_types = continuous_action_types, return_split_discrete = True)
+        discrete_action_logits, continuous_action_mean_log_var = self.unembed(
+            embeds,
+            pred_head_index = pred_head_index,
+            discrete_action_types = discrete_action_types,
+            continuous_action_types = continuous_action_types,
+            return_split_discrete = True
+        )
 
         # discrete
 
@@ -800,77 +803,16 @@ class ActionEmbedder(Module):
         discrete_entropies = None
 
         if exists(discrete_targets):
+            if not exists(pred_head_index) and self.num_unembed_preds > 1:
+                # if multiple heads and no index, broadcast targets to mtp dim
+                if discrete_targets.ndim == (discrete_action_logits[0].ndim - 1):
+                    discrete_targets = rearrange(discrete_targets, '... -> 1 ...')
 
-            if parallel_discrete_calc:
-                # use nested tensors
+            dist = MultiCategorical(discrete_action_logits, use_parallel_multi_discrete = parallel_discrete_calc)
+            discrete_log_probs = dist.log_prob(discrete_targets)
 
-                jagged_dims = tuple(t.shape[-1] for t in discrete_action_logits)
-
-                discrete_action_logits = cat(discrete_action_logits, dim = -1)
-
-                discrete_action_logits, inverse_pack_lead_dims = pack_one(discrete_action_logits, '* l')
-                batch = discrete_action_logits.shape[0]
-
-                discrete_action_logits = rearrange(discrete_action_logits, 'b l -> (b l)')
-
-                # to nested tensor
-
-                nested_logits = nested_tensor(discrete_action_logits.split(jagged_dims * batch), layout = torch.jagged, device = self.device, requires_grad = True)
-
-                prob = nested_logits.softmax(dim = -1)
-
-                log_probs = log(prob)
-
-                # maybe entropy
-
-                if return_entropies:
-                    discrete_entropies = (-prob * log_probs).sum(dim = -1, keepdim = True)
-                    discrete_entropies = cat(discrete_entropies.unbind())
-                    discrete_entropies = rearrange(discrete_entropies, '(b na) -> b na', b = batch)
-
-                    discrete_entropies = inverse_pack_lead_dims(discrete_entropies, '* na')
-
-                # back to regular tensor
-
-                log_probs = cat(log_probs.unbind())
-                log_probs = rearrange(log_probs, '(b l) -> b l', b = batch)
-
-                log_probs = inverse_pack_lead_dims(log_probs)
-
-                # get indices to gather
-
-                discrete_action_types = default(discrete_action_types, self.default_discrete_action_types)
-
-                num_discrete_actions = self.num_discrete_actions[discrete_action_types]
-
-                offset = F.pad(num_discrete_actions.cumsum(dim = -1), (1, -1), value = 0)
-                log_prob_indices = discrete_targets + offset
-
-                # gather
-
-                discrete_log_probs = log_probs.gather(-1, log_prob_indices)
-
-            else:
-                discrete_log_probs = []
-                discrete_entropies = []
-
-                for one_discrete_action_logit, one_discrete_target in zip(discrete_action_logits, discrete_targets.unbind(dim = -1)):
-
-                    one_discrete_probs = one_discrete_action_logit.softmax(dim = -1)
-                    one_discrete_log_probs = log(one_discrete_probs)
-                    one_discrete_target = rearrange(one_discrete_target, '... -> ... 1')
-
-                    log_prob = one_discrete_log_probs.gather(-1, one_discrete_target)
-                    discrete_log_probs.append(log_prob)
-
-                    if return_entropies:
-                        entropy = (-one_discrete_probs * one_discrete_log_probs).sum(dim = -1)
-                        discrete_entropies.append(entropy)
-
-                discrete_log_probs = cat(discrete_log_probs, dim = -1)
-
-                if return_entropies:
-                    discrete_entropies = stack(discrete_entropies, dim = -1)
+            if return_entropies:
+                discrete_entropies = dist.entropy()
 
         # continuous
 
@@ -878,6 +820,11 @@ class ActionEmbedder(Module):
         continuous_entropies = None
 
         if exists(continuous_targets):
+            if not exists(pred_head_index) and self.num_unembed_preds > 1:
+                # if multiple heads and no index, broadcast targets to mtp dim
+                if continuous_targets.ndim == (continuous_action_mean_log_var.ndim - 1):
+                    continuous_targets = rearrange(continuous_targets, '... -> 1 ...')
+
             distr = mean_log_var_to_distr(continuous_action_mean_log_var)
             continuous_log_probs = distr.log_prob(continuous_targets)
 
@@ -900,56 +847,36 @@ class ActionEmbedder(Module):
         reduce_across_num_actions = True
     ) -> tuple[MaybeTensor, MaybeTensor]:
 
-        src_discrete, src_continuous = src
-        tgt_discrete, tgt_continuous = tgt
+        src_logits, src_params = src
+        tgt_logits, tgt_params = tgt
 
-        discrete_kl_div = None
+        # discrete kl
 
-        # split discrete if it is not already (multiple discrete actions)
+        discrete_kl = None
 
-        if exists(src_discrete):
+        if exists(src_logits) and exists(tgt_logits):
+            src_dist = MultiCategorical(src_logits, use_parallel_multi_discrete = True)
+            tgt_dist = MultiCategorical(tgt_logits, use_parallel_multi_discrete = True)
 
-            discrete_split = self.num_discrete_actions.tolist()
+            discrete_kl = src_dist.kl_div(tgt_dist)
 
-            if is_tensor(src_discrete):
-                src_discrete = src_discrete.split(discrete_split, dim = -1)
+            if reduce_across_num_actions:
+                discrete_kl = discrete_kl.sum(dim = -1)
 
-            if is_tensor(tgt_discrete):
-                tgt_discrete = tgt_discrete.split(discrete_split, dim = -1)
+        # continuous kl
 
-            discrete_kl_divs = []
+        continuous_kl = None
 
-            for src_logit, tgt_logit in zip(src_discrete, tgt_discrete):
+        if exists(src_params) and exists(tgt_params):
+            src_distr = mean_log_var_to_distr(src_params)
+            tgt_distr = mean_log_var_to_distr(tgt_params)
 
-                src_log_probs = src_logit.log_softmax(dim = -1)
-                tgt_prob = tgt_logit.softmax(dim = -1)
+            continuous_kl = kl.kl_divergence(src_distr, tgt_distr)
 
-                one_discrete_kl_div = F.kl_div(src_log_probs, tgt_prob, reduction = 'none')
+            if reduce_across_num_actions:
+                continuous_kl = continuous_kl.sum(dim = -1)
 
-                discrete_kl_divs.append(one_discrete_kl_div.sum(dim = -1))
-
-            discrete_kl_div = stack(discrete_kl_divs, dim = -1)
-
-        # calculate kl divergence for continuous
-
-        continuous_kl_div = None
-
-        if exists(src_continuous):
-            src_normal = mean_log_var_to_distr(src_continuous)
-            tgt_normal = mean_log_var_to_distr(tgt_continuous)
-
-            continuous_kl_div = kl.kl_divergence(src_normal, tgt_normal)
-
-        # maybe reduce
-
-        if reduce_across_num_actions:
-            if exists(discrete_kl_div):
-                discrete_kl_div = discrete_kl_div.sum(dim = -1)
-
-            if exists(continuous_kl_div):
-                continuous_kl_div = continuous_kl_div.sum(dim = -1)
-
-        return discrete_kl_div, continuous_kl_div
+        return discrete_kl, continuous_kl
 
     def forward(
         self,
