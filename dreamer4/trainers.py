@@ -420,7 +420,7 @@ class SimTrainer(Module):
         continuous_log_probs = default(continuous_log_probs, empty_tensor)
 
         discrete_old_action_unembeds = default(discrete_old_action_unembeds, empty_tensor)
-        continuous_old_action_unembeds = default(discrete_old_action_unembeds, empty_tensor)
+        continuous_old_action_unembeds = default(continuous_old_action_unembeds, empty_tensor)
 
         # create the dataset and dataloader
 
