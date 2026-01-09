@@ -10,6 +10,8 @@ Implementation of Danijar's [latest iteration](https://arxiv.org/abs/2509.24527v
 
 - [@dirkmcpherson](https://github.com/dirkmcpherson) for fixes to typo errors and unpassed arguments!
 
+- [@witherhoard99](https://github.com/@witherhoard99) for finding and submitting a pull request for a small bug in the trainer
+
 ## Install
 
 ```bash
