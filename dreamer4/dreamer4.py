@@ -34,6 +34,15 @@ from assoc_scan import AssocScan
 
 from discrete_continuous_embed_readout import MultiCategorical
 
+from torch_einops_utils import (
+    maybe,
+    align_dims_left,
+    pad_at_dim,
+    pad_right_at_dim_to,
+    lens_to_mask,
+    masked_mean
+)
+
 # ein related
 
 # b - batch
@@ -205,35 +214,10 @@ def sample_prob(prob):
 def is_power_two(num):
     return log2(num).is_integer()
 
-def maybe(fn):
-    def inner(t, *args, **kwargs):
-        if not exists(t) or not exists(fn):
-            return None
-        return fn(t)
-    return inner
-
 # tensor helpers
 
 def is_empty(t):
     return t.numel() == 0
-
-def lens_to_mask(t, max_len = None):
-    if not exists(max_len):
-        max_len = t.amax().item()
-
-    device = t.device
-    seq = torch.arange(max_len, device = device)
-
-    return einx.less('j, i -> i j', seq, t)
-
-def masked_mean(t, mask = None):
-    if not exists(mask):
-        return t.mean()
-
-    if not mask.any():
-        return t[mask].sum()
-
-    return t[mask].mean()
 
 def log(t, eps = 1e-20):
     return t.clamp(min = eps).log()
@@ -296,27 +280,6 @@ def pack_one(t, pattern):
 
     return packed, inverse
 
-def pad_at_dim(
-    t,
-    pad: tuple[int, int],
-    dim = -1,
-    value = 0.
-):
-    if pad == (0, 0):
-        return t
-
-    dims_from_right = (- dim - 1) if dim < 0 else (t.ndim - dim - 1)
-    zeros = ((0, 0) * dims_from_right)
-    return F.pad(t, (*zeros, *pad), value = value)
-
-def pad_to_len(t, target_len, *, dim):
-    curr_len = t.shape[dim]
-
-    if curr_len >= target_len:
-        return t
-
-    return pad_at_dim(t, (0, target_len - curr_len), dim = dim)
-
 def pad_tensors_at_dim_to_max_len(
     tensors: list[Tensor],
     dims: tuple[int, ...]
@@ -326,18 +289,9 @@ def pad_tensors_at_dim_to_max_len(
             continue
 
         max_time = max([t.shape[dim] for t in tensors])
-        tensors = [pad_to_len(t, max_time, dim = dim) for t in tensors]
+        tensors = [pad_right_at_dim_to(t, max_time, dim = dim) for t in tensors]
 
     return tensors
-
-def align_dims_left(t, aligned_to):
-    shape = t.shape
-    num_right_dims = aligned_to.ndim - t.ndim
-
-    if num_right_dims < 0:
-        return
-
-    return t.reshape(*shape, *((1,) * num_right_dims))
 
 def l2norm(t):
     return F.normalize(t, dim = -1, p = 2)
@@ -2335,7 +2289,8 @@ class DynamicsWorldModel(Module):
         if not exists(align_dims_left_to):
             return times
 
-        return align_dims_left(times, align_dims_left_to)
+        aligned_times, _ = align_dims_left((times, align_dims_left_to))
+        return aligned_times
 
     # evolutionary policy optimization - https://web3.arxiv.org/abs/2503.19037
 
@@ -3049,7 +3004,7 @@ class DynamicsWorldModel(Module):
                 def denoise_step(pred, noised, signal_levels):
                     if self.pred_orig_latent:
                         times = self.get_times_from_signal_level(signal_levels)
-                        aligned_times = align_dims_left(times, noised)
+                        aligned_times, _ = align_dims_left((times, noised))
 
                         flow = (pred - noised) / (1. - aligned_times)
                     else:
@@ -3352,7 +3307,7 @@ class DynamicsWorldModel(Module):
             # get the noise
 
             noise = randn_like(latents)
-            aligned_times = align_dims_left(times, latents)
+            aligned_times, _ = align_dims_left((times, latents))
 
             # noise from 0 as noise to 1 as data
 
@@ -3420,7 +3375,7 @@ class DynamicsWorldModel(Module):
                 # get the noise
 
                 proprio_noise = randn_like(proprio)
-                aligned_times = align_dims_left(times, proprio)
+                aligned_times, _ = align_dims_left((times, proprio))
 
                 # noise from 0 as noise to 1 as data
 
@@ -3647,7 +3602,7 @@ class DynamicsWorldModel(Module):
 
             # take a half step
 
-            half_step_size_align_left = align_dims_left(half_step_size, noised)
+            half_step_size_align_left, _ = align_dims_left((half_step_size, noised))
 
             denoised = noised + first_step_pred_flow * (half_step_size_align_left / self.max_steps)
 
@@ -3682,7 +3637,7 @@ class DynamicsWorldModel(Module):
 
         if exists(self.loss_weight_fn):
             loss_weight = self.loss_weight_fn(times)
-            loss_weight = align_dims_left(loss_weight, flow_losses)
+            loss_weight, _ = align_dims_left((loss_weight, flow_losses))
 
             flow_losses = flow_losses * loss_weight
 
