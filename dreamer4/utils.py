@@ -464,6 +464,12 @@ def safe_stack(tensors, dim = 0):
     return stack(tensors, dim = dim)
 
 
+def safe_rearrange(x, pattern):
+    if exists(x):
+        return rearrange(x, pattern)
+    return None
+
+
 def sample_prob(prob):
     return random() < prob
 

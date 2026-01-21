@@ -2,11 +2,9 @@ from __future__ import annotations
 from typing import Callable
 
 import torch
-import torch.nn.functional as F
 from torch.nn import Module, Linear, Parameter, Sequential, RMSNorm, Identity
 from torch import nn, cat, stack, arange, zeros, ones
 
-import math
 from math import ceil
 from functools import partial
 

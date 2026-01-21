@@ -475,14 +475,22 @@ class DynamicsWorldModel(Module):
     ):
         assert exists(self.video_tokenizer)
 
-        init_frame = env.reset()
+        init_obs = env.reset()
+
+        assert 'image' in init_obs
+        if self.has_proprio:
+            assert 'proprio' in init_obs
+
+        proprio = init_obs.get('proprio')
 
         # frame to video
 
         if env_is_vectorized:
-            video = rearrange(init_frame, 'b c vh vw -> b c 1 vh vw')
+            video = rearrange(init_obs['image'], 'b c vh vw -> b c 1 vh vw')
+            accumulated_proprio = safe_rearrange(proprio, 'b d -> b 1 d')
         else:
-            video = rearrange(init_frame, 'c vh vw -> 1 c 1 vh vw')
+            video = rearrange(init_obs['image'], 'c vh vw -> 1 c 1 vh vw')
+            accumulated_proprio = safe_rearrange(proprio, 'd -> 1 1 d')
 
         batch, device = video.shape[0], video.device
 
@@ -529,6 +537,7 @@ class DynamicsWorldModel(Module):
                 rewards = rewards,
                 discrete_actions = discrete_actions,
                 continuous_actions = continuous_actions,
+                proprio = accumulated_proprio,
                 time_cache = time_cache,
                 latent_is_noised = True,
                 return_pred_only = True,
@@ -583,20 +592,26 @@ class DynamicsWorldModel(Module):
 
             env_step_out = env.step((sampled_discrete_actions, sampled_continuous_actions))
 
+            assert len(env_step_out) in [2, 3, 4, 5]
+
             if len(env_step_out) == 2:
-                next_frame, reward = env_step_out
+                obs, reward = env_step_out
                 terminated = full((batch,), False)
                 truncated = full((batch,), False)
 
             elif len(env_step_out) == 3:
-                next_frame, reward, terminated = env_step_out
+                obs, reward, terminated = env_step_out
                 truncated = full((batch,), False)
 
             elif len(env_step_out) == 4:
-                next_frame, reward, terminated, truncated = env_step_out
+                obs, reward, terminated, truncated = env_step_out
 
             elif len(env_step_out) == 5:
-                next_frame, reward, terminated, truncated, info = env_step_out
+                obs, reward, terminated, truncated, info = env_step_out
+
+            assert 'image' in obs
+            if self.has_proprio:
+                assert 'proprio' in obs
 
             # maybe add state entropy bonus
 
@@ -632,17 +647,21 @@ class DynamicsWorldModel(Module):
 
             # batch and time dimension
 
+            proprio = obs.get('proprio')
             if env_is_vectorized:
-                next_frame = rearrange(next_frame, 'b c vh vw -> b c 1 vh vw')
+                next_frame = rearrange(obs['image'], 'b c vh vw -> b c 1 vh vw')
+                proprio = safe_rearrange(proprio, 'b d -> b 1 d')
                 reward = rearrange(reward, 'b -> b 1')
             else:
-                next_frame = rearrange(next_frame, 'c vh vw -> 1 c 1 vh vw')
+                next_frame = rearrange(obs['image'], 'c vh vw -> 1 c 1 vh vw')
+                proprio = safe_rearrange(proprio, 'd -> 1 1 d')
                 reward = rearrange(reward, ' -> 1 1')
 
             # concat
-
             video = cat((video, next_frame), dim = 2)
             rewards = safe_cat((rewards, reward), dim = 1)
+
+            accumulated_proprio = safe_cat((accumulated_proprio, proprio), dim = 1)
 
             acc_agent_embed = safe_cat((acc_agent_embed, one_agent_embed), dim = 1)
 
@@ -653,6 +672,7 @@ class DynamicsWorldModel(Module):
         one_experience = Experience(
             latents = latents,
             video = video[:, :, :-1],
+            proprio = accumulated_proprio[:, :-1],
             rewards = rewards,
             actions = (discrete_actions, continuous_actions),
             log_probs = (discrete_log_probs, continuous_log_probs),
@@ -686,6 +706,7 @@ class DynamicsWorldModel(Module):
 
         latents = experience.latents
         actions = experience.actions
+        proprio = experience.proprio
         old_log_probs = experience.log_probs
         old_values = experience.values
         rewards = experience.rewards
@@ -794,6 +815,7 @@ class DynamicsWorldModel(Module):
                     rewards = rewards,
                     discrete_actions = discrete_actions,
                     continuous_actions = continuous_actions,
+                    proprio = proprio,
                     latent_is_noised = True,
                     return_pred_only = True,
                     return_intermediates = True
@@ -1060,7 +1082,7 @@ class DynamicsWorldModel(Module):
                 is_last_step = (step + 1) == num_steps
 
                 signal_levels = full((batch_size, 1), step * step_size, dtype = torch.long, device = self.device)
- 
+
                 # noising past latent context
 
                 noised_context = latents.lerp(past_latents_context_noise, context_signal_noise) # the paragraph after eq (8)
