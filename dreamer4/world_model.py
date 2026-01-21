@@ -42,6 +42,7 @@ from .utils import (
     safe_cat,
     sample_prob,
     xnor,
+    safe_rearrange,
 )
 from .experience import Experience
 from .losses import LossNormalizer
@@ -477,6 +478,12 @@ class DynamicsWorldModel(Module):
 
         init_obs = env.reset()
 
+        # if we are not a dict, we must be a raw image tensor
+
+        if not isinstance(init_obs, dict):
+            assert isinstance(init_obs, torch.Tensor)
+            init_obs = {"image": init_obs}
+
         assert 'image' in init_obs
         if self.has_proprio:
             assert 'proprio' in init_obs
@@ -609,6 +616,13 @@ class DynamicsWorldModel(Module):
             elif len(env_step_out) == 5:
                 obs, reward, terminated, truncated, info = env_step_out
 
+
+            # if we are not a dict, we must be a raw image tensor
+
+            if not isinstance(init_obs, dict):
+                assert isinstance(init_obs, torch.Tensor)
+                init_obs = {"image": init_obs}
+
             assert 'image' in obs
             if self.has_proprio:
                 assert 'proprio' in obs
@@ -666,8 +680,6 @@ class DynamicsWorldModel(Module):
             acc_agent_embed = safe_cat((acc_agent_embed, one_agent_embed), dim = 1)
 
         # package up one experience for learning
-
-        batch, device = latents.shape[0], latents.device
 
         one_experience = Experience(
             latents = latents,
