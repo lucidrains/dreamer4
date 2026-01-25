@@ -20,7 +20,7 @@ from .utils import (
 
 class LossNormalizer(Module):
 
-    # the authors mentioned the need for loss normalization in the dynamics transformer
+    # the authors mentioned the need for loss normalization in the dynamics transformer and video tokenizer
 
     def __init__(
         self,
@@ -113,8 +113,4 @@ class LPIPSLoss(Module):
 def ramp_weight(times, slope = 0.9, intercept = 0.1):
     # equation (8) paper, their "ramp" loss weighting
     return slope * times + intercept
-
-# reinforcement learning related
-
-# rewards
 

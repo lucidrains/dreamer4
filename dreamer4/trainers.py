@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import os
+import random
+import warnings
+
 import torch
 from torch import is_tensor
 from torch.nn import Module
 from torch.optim import AdamW
 from torch.utils.data import Dataset, TensorDataset, DataLoader
+from torch.utils.tensorboard import SummaryWriter
 
 from accelerate import Accelerator
 
@@ -48,6 +53,8 @@ class VideoTokenizerTrainer(Module):
         accelerate_kwargs: dict = dict(),
         optim_kwargs: dict = dict(),
         cpu = False,
+        log_dir: str | None = None,
+        log_video_dir: str | None = None,
     ):
         super().__init__()
         batch_size = min(batch_size, len(dataset))
@@ -56,6 +63,15 @@ class VideoTokenizerTrainer(Module):
             cpu = cpu,
             **accelerate_kwargs
         )
+
+        if self.accelerator.is_main_process and exists(log_dir):
+            self.writer = SummaryWriter(log_dir)
+            self.log_dir = log_dir
+            self.log_video_dir = default(log_video_dir, log_dir)
+        else:
+            self.writer = None
+            self.log_dir = None
+            self.log_video_dir = None
 
         self.model = model
         self.dataset = dataset
@@ -106,11 +122,15 @@ class VideoTokenizerTrainer(Module):
         self
     ):
         iter_train_dl = cycle(self.train_dataloader)
+        iter_test_dl = cycle(self.train_dataloader)
 
-        for _ in range(self.num_train_steps):
+        for step in range(self.num_train_steps):
+            self.model.train()
+
             video = next(iter_train_dl)
 
             loss = self.model(video)
+
             self.accelerator.backward(loss)
 
             if exists(self.max_grad_norm):
@@ -118,6 +138,12 @@ class VideoTokenizerTrainer(Module):
 
             self.optim.step()
             self.optim.zero_grad()
+
+            if exists(self.writer):
+                self.writer.add_scalar('video_tokenizer_loss', loss.item(), step)
+
+        if exists(self.writer):
+            self.writer.close()
 
         self.print('training complete')
 
@@ -137,6 +163,7 @@ class BehaviorCloneTrainer(Module):
         accelerate_kwargs: dict = dict(),
         optim_kwargs: dict = dict(),
         cpu = False,
+        log_dir = None
     ):
         super().__init__()
         batch_size = min(batch_size, len(dataset))
@@ -145,6 +172,11 @@ class BehaviorCloneTrainer(Module):
             cpu = cpu,
             **accelerate_kwargs
         )
+
+        if self.accelerator.is_main_process and exists(log_dir):
+            self.writer = SummaryWriter(log_dir)
+        else:
+            self.writer = None
 
         self.model = model
         self.dataset = dataset
@@ -196,7 +228,7 @@ class BehaviorCloneTrainer(Module):
     ):
         iter_train_dl = cycle(self.train_dataloader)
 
-        for _ in range(self.num_train_steps):
+        for step in range(self.num_train_steps):
             batch_data = next(iter_train_dl)
 
             # just assume raw video dynamics training if batch_data is a tensor
@@ -214,6 +246,12 @@ class BehaviorCloneTrainer(Module):
 
             self.optim.step()
             self.optim.zero_grad()
+
+            if exists(self.writer):
+                self.writer.add_scalar('behavior_clone_trainer_loss', loss.item(), step)
+
+        if exists(self.writer):
+            self.writer.close()
 
         self.print('training complete')
 
@@ -233,6 +271,7 @@ class DreamTrainer(Module):
         accelerate_kwargs: dict = dict(),
         optim_kwargs: dict = dict(),
         cpu = False,
+        log_dir = None
     ):
         super().__init__()
 
@@ -240,6 +279,11 @@ class DreamTrainer(Module):
             cpu = cpu,
             **accelerate_kwargs
         )
+
+        if self.accelerator.is_main_process and exists(log_dir):
+            self.writer = SummaryWriter(log_dir)
+        else:
+            self.writer = None
 
         self.model = model
 
@@ -284,7 +328,7 @@ class DreamTrainer(Module):
         self
     ):
 
-        for _ in range(self.num_train_steps):
+        for step in range(self.num_train_steps):
 
             dreams = self.unwrapped_model.generate(
                 self.generate_timesteps + 1, # plus one for bootstrap value
@@ -296,7 +340,11 @@ class DreamTrainer(Module):
 
             policy_head_loss, value_head_loss = self.model.learn_from_experience(dreams)
 
-            self.print(f'policy head loss: {policy_head_loss.item():.3f} | value head loss: {value_head_loss.item():.3f}')
+            # self.print(f'policy head loss: {policy_head_loss.item():.3f} | value head loss: {value_head_loss.item():.3f}')
+
+            if exists(self.writer):
+                self.writer.add_scalar('dream_policy_head_loss', policy_head_loss.item(), step)
+                self.writer.add_scalar('dream_value_head_loss', value_head_loss.item(), step)
 
             # update policy head
 
@@ -318,6 +366,9 @@ class DreamTrainer(Module):
             self.value_head_optim.step()
             self.value_head_optim.zero_grad()
 
+        if exists(self.writer):
+            self.writer.close()
+
         self.print('training complete')
 
 # training from sim
@@ -336,6 +387,7 @@ class SimTrainer(Module):
         accelerate_kwargs: dict = dict(),
         optim_kwargs: dict = dict(),
         cpu = False,
+        log_dir = None
     ):
         super().__init__()
 
@@ -343,6 +395,11 @@ class SimTrainer(Module):
             cpu = cpu,
             **accelerate_kwargs
         )
+
+        if self.accelerator.is_main_process and exists(log_dir):
+            self.writer = SummaryWriter(log_dir)
+        else:
+            self.writer = None
 
         self.model = model
 
@@ -360,6 +417,8 @@ class SimTrainer(Module):
         self.batch_size = batch_size
 
         self.generate_timesteps = generate_timesteps
+
+        self.step = 0
 
         self.unwrapped_model = self.model
 
@@ -395,6 +454,7 @@ class SimTrainer(Module):
         latents = experience.latents
         old_values = experience.values
         rewards = experience.rewards
+        proprio = experience.proprio
 
         has_agent_embed = exists(experience.agent_embed)
         agent_embed = experience.agent_embed
@@ -413,8 +473,12 @@ class SimTrainer(Module):
         has_discrete = exists(discrete_actions)
         has_continuous = exists(continuous_actions)
 
+        has_proprio = exists(proprio)
+
         discrete_actions = default(discrete_actions, empty_tensor)
         continuous_actions = default(continuous_actions, empty_tensor)
+
+        proprio = default(proprio, empty_tensor)
 
         discrete_log_probs = default(discrete_log_probs, empty_tensor)
         continuous_log_probs = default(continuous_log_probs, empty_tensor)
@@ -428,6 +492,7 @@ class SimTrainer(Module):
             latents,
             discrete_actions,
             continuous_actions,
+            proprio,
             discrete_log_probs,
             continuous_log_probs,
             agent_embed,
@@ -445,6 +510,7 @@ class SimTrainer(Module):
                 latents,
                 discrete_actions,
                 continuous_actions,
+                proprio,
                 discrete_log_probs,
                 continuous_log_probs,
                 agent_embed,
@@ -472,6 +538,7 @@ class SimTrainer(Module):
                 batch_experience = Experience(
                     latents = latents,
                     actions = actions,
+                    proprio = proprio if has_proprio else None,
                     log_probs = log_probs,
                     agent_embed = agent_embed if has_agent_embed else None,
                     old_action_unembeds = old_action_unembeds,
@@ -484,6 +551,12 @@ class SimTrainer(Module):
                 policy_head_loss, value_head_loss = self.model.learn_from_experience(batch_experience)
 
                 self.print(f'policy head loss: {policy_head_loss.item():.3f} | value head loss: {value_head_loss.item():.3f}')
+
+                if exists(self.writer):
+                    self.writer.add_scalar('policy_head_loss', policy_head_loss.item(), self.step)
+                    self.writer.add_scalar('value_head_loss', value_head_loss.item(), self.step)
+
+                self.step += 1
 
                 # update policy head
 
@@ -522,7 +595,11 @@ class SimTrainer(Module):
 
             while total_experience < max_experiences_before_learn:
 
-                experience = self.unwrapped_model.interact_with_env(env, env_is_vectorized = env_is_vectorized)
+                experience = self.unwrapped_model.interact_with_env(
+                    env,
+                    env_is_vectorized = env_is_vectorized,
+                    max_timesteps=self.generate_timesteps
+                )
 
                 num_experience = experience.video.shape[0]
 
@@ -535,5 +612,8 @@ class SimTrainer(Module):
             self.learn(combined_experiences)
 
             experiences.clear()
+
+        if exists(self.writer):
+            self.writer.close()
 
         self.print('training complete')

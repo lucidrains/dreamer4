@@ -107,8 +107,3 @@ class SymExpTwoHot(Module):
         encoded.scatter_(-1, right_indices, right_logit_value)
 
         return inverse_pack(encoded, '* l')
-
-# action related
-
-ActionEmbeds = namedtuple('ActionEmbed', ('discrete', 'continuous'))
-

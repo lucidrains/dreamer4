@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import namedtuple
+
 import torch
 import torch.nn.functional as F
 from torch.nn import Module, Parameter, Embedding
@@ -16,16 +18,14 @@ from discrete_continuous_embed_readout import MultiCategorical
 
 # Local imports
 from .utils import (
-    calc_gae,
     default,
     ensure_tuple,
     exists,
-    gumbel_sample,
-    log,
     mean_log_var_to_distr,
-    pack_one,
     safe_squeeze_first,
 )
+
+ActionEmbeds = namedtuple('ActionEmbed', ('discrete', 'continuous'))
 
 class ActionEmbedder(Module):
     def __init__(
@@ -45,12 +45,17 @@ class ActionEmbedder(Module):
 
         # handle discrete actions
 
-        num_discrete_actions = tensor(ensure_tuple(num_discrete_actions))
+        if isinstance(num_discrete_actions, int):
+            has_discrete_actions = num_discrete_actions > 0
+        else:
+            has_discrete_actions = num_discrete_actions != (0,)
+
+        num_discrete_actions = tensor(ensure_tuple(num_discrete_actions)) if has_discrete_actions else torch.eye(0)
         total_discrete_actions = num_discrete_actions.sum().item()
 
         self.num_discrete_action_types = len(num_discrete_actions)
-        self.discrete_action_embed = Embedding(total_discrete_actions, dim)
 
+        self.discrete_action_embed = Embedding(total_discrete_actions, dim) if has_discrete_actions else None
         self.register_buffer('num_discrete_actions', num_discrete_actions, persistent = False)
 
         # continuous actions
@@ -65,12 +70,18 @@ class ActionEmbedder(Module):
 
         # defaults
 
-        self.register_buffer('default_discrete_action_types', arange(self.num_discrete_action_types), persistent = False)
+        if has_discrete_actions:
+            self.register_buffer('default_discrete_action_types', arange(self.num_discrete_action_types), persistent = False)
+
         self.register_buffer('default_continuous_action_types', arange(self.num_continuous_action_types), persistent = False)
 
         # calculate offsets
 
-        offsets = F.pad(num_discrete_actions.cumsum(dim = -1), (1, -1), value = 0)
+        if has_discrete_actions:
+            offsets = F.pad(num_discrete_actions.cumsum(dim = -1), (1, -1), value = 0)
+        else:
+            offsets = torch.eye(0)
+
         self.register_buffer('discrete_action_offsets', offsets, persistent = False)
 
         # unembedding
@@ -84,19 +95,23 @@ class ActionEmbedder(Module):
             return
 
         unembed_dim = default(unembed_dim, dim)
-        self.discrete_action_unembed = Parameter(torch.randn(total_discrete_actions, num_unembed_preds, unembed_dim) * 1e-2)
 
-        discrete_action_index = arange(total_discrete_actions)
+        self.discrete_action_unembed = Parameter(torch.eye(0))
 
-        padded_num_discrete_actions = F.pad(num_discrete_actions, (1, 0), value = 0)
-        exclusive_cumsum = padded_num_discrete_actions.cumsum(dim = -1)
+        if has_discrete_actions:
+            self.discrete_action_unembed = Parameter(torch.randn(total_discrete_actions, num_unembed_preds, unembed_dim) * 1e-2)
 
-        discrete_action_mask = (
-            einx.greater_equal('j, i -> i j', discrete_action_index, exclusive_cumsum[:-1]) &
-            einx.less('j, i -> i j', discrete_action_index, exclusive_cumsum[1:])
-        )
+            discrete_action_index = arange(total_discrete_actions)
 
-        self.register_buffer('discrete_action_mask', discrete_action_mask, persistent = False)
+            padded_num_discrete_actions = F.pad(num_discrete_actions, (1, 0), value = 0)
+            exclusive_cumsum = padded_num_discrete_actions.cumsum(dim = -1)
+
+            discrete_action_mask = (
+                einx.greater_equal('j, i -> i j', discrete_action_index, exclusive_cumsum[:-1]) &
+                einx.less('j, i -> i j', discrete_action_index, exclusive_cumsum[1:])
+            )
+
+            self.register_buffer('discrete_action_mask', discrete_action_mask, persistent = False)
 
         self.continuous_action_unembed = Parameter(torch.randn(num_continuous_actions, num_unembed_preds, unembed_dim, 2) * 1e-2)
 
@@ -430,6 +445,4 @@ def calc_gae(
     returns = gae + values
 
     return returns
-
-# rotary embeddings for time
 

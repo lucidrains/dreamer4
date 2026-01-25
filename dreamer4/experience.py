@@ -44,7 +44,7 @@ class Experience:
         return Experience(**experience_dict)
 
 def combine_experiences(
-    exps: list[Experiences]
+    exps: list[Experience]
 ) -> Experience:
 
     assert len(exps) > 0

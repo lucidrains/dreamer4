@@ -16,17 +16,8 @@ from vit_pytorch.vit_with_decorr import DecorrelationLoss
 
 from collections import namedtuple
 
-# flex attention - optional
-flex_attention = None
-try:
-    from torch.nn.attention.flex_attention import flex_attention, create_block_mask
-    # Note: Not using torch.compile due to recompilation issues with dynamic shapes
-    # Using native flex_attention instead (will use unfused implementation)
-    # Original: flex_attention = torch.compile(flex_attention, dynamic=True)
-except ImportError:
-    pass
+from .attention import flex_attention
 
-# Local imports
 from .utils import (
     default,
     divisible_by,
@@ -50,7 +41,7 @@ class VideoTokenizer(Module):
         patch_size,
         image_height = None,
         image_width = None,
-        num_latent_tokens = 4,
+        num_latent_tokens = 64,
         encoder_depth = 4,
         decoder_depth = 4,
         time_block_every = 4,
@@ -161,11 +152,7 @@ class VideoTokenizer(Module):
         self.lpips_loss_weight = lpips_loss_weight
 
         if self.has_lpips_loss:
-            # TRYINGTOFIXPATCHYNESS: Increased sampled_frames from default 1 to 8
-            # Previously LPIPS only evaluated 1 random frame per 16-frame chunk, leaving 15 frames
-            # with only MSE loss. This caused poor perceptual quality and spatial patchiness.
-            # Now evaluating 8 frames (half the chunk) for better perceptual loss coverage.
-            self.lpips = LPIPSLoss(lpips_loss_network, sampled_frames=8)
+            self.lpips = LPIPSLoss(lpips_loss_network)
 
         # decorr aux loss
         # https://arxiv.org/abs/2510.14657
@@ -175,13 +162,7 @@ class VideoTokenizer(Module):
 
         self.decorr_loss = DecorrelationLoss(decorr_sample_frac, soft_validate_num_sampled = True) if encoder_add_decor_aux_loss else None
 
-        # PAPER: Loss normalization by running RMS estimates (Dreamer v4 section 3, line 157)
-        # "To train a single dynamics transformer with multiple modalities and output heads,
-        # we normalize all loss terms by running estimates of their root-mean-square (RMS)."
-        self.use_loss_normalization = use_loss_normalization
-        if use_loss_normalization:
-            # 2 losses: recon_loss, lpips_loss (decorr losses are auxiliary, not main reconstruction losses)
-            self.loss_normalizer = LossNormalizer(num_losses=2, beta=0.95)
+        self.loss_normalizer = LossNormalizer(num_losses=2)
 
     @property
     def device(self):
@@ -339,36 +320,23 @@ class VideoTokenizer(Module):
             if exists(space_attn_normed_inputs):
                 space_decorr_loss = self.decorr_loss(space_attn_normed_inputs)
 
-        # PAPER: Apply RMS loss normalization before weighting (Dreamer v4 section 3)
-        # This prevents one loss from dominating gradients
-        if self.use_loss_normalization:
-            # Stack losses for normalization: [recon_loss, lpips_loss]
-            losses_to_normalize = torch.stack([recon_loss, lpips_loss])
-            normalized_losses = self.loss_normalizer(losses_to_normalize)
-            recon_loss_norm, lpips_loss_norm = normalized_losses[0], normalized_losses[1]
 
-            # Apply weights AFTER normalization
-            total_loss = (
-                recon_loss_norm +
-                lpips_loss_norm * self.lpips_loss_weight +
-                time_decorr_loss * self.decorr_aux_loss_weight +
-                space_decorr_loss * self.decorr_aux_loss_weight
-            )
-        else:
-            # Original behavior (without normalization)
-            total_loss = (
-                recon_loss +
-                lpips_loss * self.lpips_loss_weight +
-                time_decorr_loss * self.decorr_aux_loss_weight +
-                space_decorr_loss * self.decorr_aux_loss_weight
-            )
+        # Apply loss normalization before multiplying loss weights
+
+        losses_to_normalize = torch.stack([recon_loss, lpips_loss])
+        recon_loss_norm, lpips_loss_norm = self.loss_normalizer(losses_to_normalize)
+
+        total_loss = (
+            recon_loss_norm +
+            lpips_loss_norm * self.lpips_loss_weight +
+            time_decorr_loss * self.decorr_aux_loss_weight +
+            space_decorr_loss * self.decorr_aux_loss_weight
+        )
 
         if not return_intermediates:
             return total_loss
 
         losses = TokenizerLosses(recon_loss, lpips_loss, time_decorr_loss, space_decorr_loss)
-
-        out = losses
 
         # handle returning of reconstructed, and image pretraining
 
@@ -378,6 +346,4 @@ class VideoTokenizer(Module):
         out = (losses, recon_video)
 
         return total_loss, out
-
-# dynamics model, axial space-time transformer
 

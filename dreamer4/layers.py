@@ -59,6 +59,3 @@ class GRULayer(Module):
         x, hiddens = self.gru(x, prev_hiddens)
 
         return x, hiddens
-
-# axial space time transformer
-

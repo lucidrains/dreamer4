@@ -291,5 +291,3 @@ class AxialSpaceTimeTransformer(Module):
 
         return out, intermediates
 
-# video tokenizer
-

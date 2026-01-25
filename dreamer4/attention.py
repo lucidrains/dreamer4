@@ -16,12 +16,13 @@ from einx import multiply
 from collections import namedtuple
 
 # flex attention - optional
+# There are sometimes issues with flex_attention, and these will have to be fixed later
 flex_attention = None
 try:
     from torch.nn.attention.flex_attention import flex_attention, create_block_mask
-    # Note: Not using torch.compile due to recompilation issues with dynamic shapes
-    # Using native flex_attention instead (will use unfused implementation)
-    # Original: flex_attention = torch.compile(flex_attention, dynamic=True)
+
+    if torch.cuda.is_available():
+        flex_attention = torch.compile(flex_attention, dynamic=True)
 except ImportError:
     pass
 
@@ -440,5 +441,4 @@ class Attention(Module):
 
         return out, AttentionIntermediates(stack((k, v)), tokens)
 
-# feedforward
 

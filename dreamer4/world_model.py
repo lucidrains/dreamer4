@@ -409,7 +409,7 @@ class DynamicsWorldModel(Module):
         if not exists(align_dims_left_to):
             return times
 
-        aligned_times, _ = align_dims_left((times,), align_dims_left_to)
+        aligned_times, _ = align_dims_left((times, align_dims_left_to))
         return aligned_times
 
     # evolutionary policy optimization - https://web3.arxiv.org/abs/2503.19037
@@ -494,10 +494,12 @@ class DynamicsWorldModel(Module):
 
         if env_is_vectorized:
             video = rearrange(init_obs['image'], 'b c vh vw -> b c 1 vh vw')
-            accumulated_proprio = safe_rearrange(proprio, 'b d -> b 1 d')
+            accumulated_proprio = safe_rearrange(proprio, 'b d -> b 1 d').to(self.device) if self.has_proprio else None
         else:
             video = rearrange(init_obs['image'], 'c vh vw -> 1 c 1 vh vw')
-            accumulated_proprio = safe_rearrange(proprio, 'd -> 1 1 d')
+            accumulated_proprio = safe_rearrange(proprio, 'd -> 1 1 d').to(self.device) if self.has_proprio else None
+
+        video = video.to(self.device)
 
         batch, device = video.shape[0], video.device
 
@@ -601,6 +603,9 @@ class DynamicsWorldModel(Module):
 
             assert len(env_step_out) in [2, 3, 4, 5]
 
+            terminated = None
+            truncated = None
+
             if len(env_step_out) == 2:
                 obs, reward = env_step_out
                 terminated = full((batch,), False)
@@ -616,16 +621,18 @@ class DynamicsWorldModel(Module):
             elif len(env_step_out) == 5:
                 obs, reward, terminated, truncated, info = env_step_out
 
-
             # if we are not a dict, we must be a raw image tensor
 
-            if not isinstance(init_obs, dict):
-                assert isinstance(init_obs, torch.Tensor)
-                init_obs = {"image": init_obs}
+            if not isinstance(obs, dict):
+                assert isinstance(obs, torch.Tensor)
+                obs = {"image": obs}
 
             assert 'image' in obs
             if self.has_proprio:
                 assert 'proprio' in obs
+
+            obs['image'] = obs['image'].to(self.device)
+            obs['proprio'] = obs['proprio'].to(self.device) if self.has_proprio else None
 
             # maybe add state entropy bonus
 
@@ -672,19 +679,23 @@ class DynamicsWorldModel(Module):
                 reward = rearrange(reward, ' -> 1 1')
 
             # concat
-            video = cat((video, next_frame), dim = 2)
+            video = cat((video, next_frame.to(self.device)), dim = 2)
             rewards = safe_cat((rewards, reward), dim = 1)
 
-            accumulated_proprio = safe_cat((accumulated_proprio, proprio), dim = 1)
+            accumulated_proprio = safe_cat((accumulated_proprio, proprio.to(self.device) if exists(proprio) else proprio), dim = 1)
+            if exists(accumulated_proprio):
+                accumulated_proprio = accumulated_proprio.to(self.device)
 
             acc_agent_embed = safe_cat((acc_agent_embed, one_agent_embed), dim = 1)
+
+            video.to(self.device)
 
         # package up one experience for learning
 
         one_experience = Experience(
             latents = latents,
             video = video[:, :, :-1],
-            proprio = accumulated_proprio[:, :-1],
+            proprio = accumulated_proprio[:, :-1] if exists(accumulated_proprio) else None,
             rewards = rewards,
             actions = (discrete_actions, continuous_actions),
             log_probs = (discrete_log_probs, continuous_log_probs),
@@ -1157,7 +1168,7 @@ class DynamicsWorldModel(Module):
                 def denoise_step(pred, noised, signal_levels):
                     if self.pred_orig_latent:
                         times = self.get_times_from_signal_level(signal_levels)
-                        aligned_times, _ = align_dims_left((times,), noised)
+                        aligned_times, _ = align_dims_left((times, noised))
 
                         flow = (pred - noised) / (1. - aligned_times)
                     else:
@@ -1460,7 +1471,7 @@ class DynamicsWorldModel(Module):
             # get the noise
 
             noise = randn_like(latents)
-            aligned_times, _ = align_dims_left((times,), latents)
+            aligned_times, _ = align_dims_left((times, latents))
 
             # noise from 0 as noise to 1 as data
 
@@ -1528,7 +1539,7 @@ class DynamicsWorldModel(Module):
                 # get the noise
 
                 proprio_noise = randn_like(proprio)
-                aligned_times, _ = align_dims_left((times,), proprio)
+                aligned_times, _ = align_dims_left((times, proprio))
 
                 # noise from 0 as noise to 1 as data
 
@@ -1755,7 +1766,7 @@ class DynamicsWorldModel(Module):
 
             # take a half step
 
-            half_step_size_align_left, _ = align_dims_left((half_step_size,), noised)
+            half_step_size_align_left, _ = align_dims_left((half_step_size, noised))
 
             denoised = noised + first_step_pred_flow * (half_step_size_align_left / self.max_steps)
 
@@ -1790,7 +1801,7 @@ class DynamicsWorldModel(Module):
 
         if exists(self.loss_weight_fn):
             loss_weight = self.loss_weight_fn(times)
-            loss_weight, _ = align_dims_left((loss_weight,), flow_losses)
+            loss_weight, _ = align_dims_left((loss_weight, flow_losses))
 
             flow_losses = flow_losses * loss_weight
 
