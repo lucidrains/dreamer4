@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import torch
-from torch import is_tensor
+from torch import is_tensor, tensor
 from torch.nn import Module
 from torch.optim import AdamW
 from torch.utils.data import Dataset, TensorDataset, DataLoader
@@ -48,14 +48,23 @@ class VideoTokenizerTrainer(Module):
         accelerate_kwargs: dict = dict(),
         optim_kwargs: dict = dict(),
         cpu = False,
+        use_tensorboard_logger = False,
+        log_dir: str | None = None,
+        project_name = 'dreamer4'
     ):
         super().__init__()
         batch_size = min(batch_size, len(dataset))
+
+        if use_tensorboard_logger:
+            accelerate_kwargs.update(log_with = 'tensorboard', project_dir = log_dir)
 
         self.accelerator = Accelerator(
             cpu = cpu,
             **accelerate_kwargs
         )
+
+        if use_tensorboard_logger:
+            self.accelerator.init_trackers(project_name)
 
         self.model = model
         self.dataset = dataset
@@ -85,6 +94,8 @@ class VideoTokenizerTrainer(Module):
         self.num_train_steps = num_train_steps
         self.batch_size = batch_size
 
+        self.register_buffer('step', tensor(0))
+
         (
             self.model,
             self.train_dataloader,
@@ -102,6 +113,9 @@ class VideoTokenizerTrainer(Module):
     def print(self, *args, **kwargs):
         return self.accelerator.print(*args, **kwargs)
 
+    def log(self, **data):
+        self.accelerator.log(data, step = self.step.item())
+
     def forward(
         self
     ):
@@ -110,7 +124,12 @@ class VideoTokenizerTrainer(Module):
         for _ in range(self.num_train_steps):
             video = next(iter_train_dl)
 
-            loss = self.model(video)
+            loss, (losses, _) = self.model(
+                video,
+                update_loss_ema = True,
+                return_intermediates = True
+            )
+
             self.accelerator.backward(loss)
 
             if exists(self.max_grad_norm):
@@ -118,6 +137,18 @@ class VideoTokenizerTrainer(Module):
 
             self.optim.step()
             self.optim.zero_grad()
+
+            self.log(
+                loss = loss.item(),
+                recon_loss = losses.recon.item(),
+                lpips_loss = losses.lpips.item(),
+                time_decorr_loss = losses.time_decorr.item(),
+                space_decorr_loss = losses.space_decorr.item()
+            )
+
+            self.step += 1
+
+        self.accelerator.end_training()
 
         self.print('training complete')
 
@@ -137,14 +168,23 @@ class BehaviorCloneTrainer(Module):
         accelerate_kwargs: dict = dict(),
         optim_kwargs: dict = dict(),
         cpu = False,
+        use_tensorboard_logger = False,
+        log_dir: str | None = None,
+        project_name = 'dreamer4'
     ):
         super().__init__()
         batch_size = min(batch_size, len(dataset))
+
+        if use_tensorboard_logger:
+            accelerate_kwargs.update(log_with = 'tensorboard', project_dir = log_dir)
 
         self.accelerator = Accelerator(
             cpu = cpu,
             **accelerate_kwargs
         )
+
+        if use_tensorboard_logger:
+            self.accelerator.init_trackers(project_name)
 
         self.model = model
         self.dataset = dataset
@@ -174,6 +214,8 @@ class BehaviorCloneTrainer(Module):
         self.num_train_steps = num_train_steps
         self.batch_size = batch_size
 
+        self.register_buffer('step', tensor(0))
+
         (
             self.model,
             self.train_dataloader,
@@ -190,6 +232,9 @@ class BehaviorCloneTrainer(Module):
 
     def print(self, *args, **kwargs):
         return self.accelerator.print(*args, **kwargs)
+
+    def log(self, **data):
+        self.accelerator.log(data, step = self.step.item())
 
     def forward(
         self
@@ -215,6 +260,12 @@ class BehaviorCloneTrainer(Module):
             self.optim.step()
             self.optim.zero_grad()
 
+            self.log(loss = loss.item())
+
+            self.step += 1
+
+        self.accelerator.end_training()
+
         self.print('training complete')
 
 # training from dreams
@@ -233,13 +284,22 @@ class DreamTrainer(Module):
         accelerate_kwargs: dict = dict(),
         optim_kwargs: dict = dict(),
         cpu = False,
+        use_tensorboard_logger = False,
+        log_dir: str | None = None,
+        project_name = 'dreamer4'
     ):
         super().__init__()
+
+        if use_tensorboard_logger:
+            accelerate_kwargs.update(log_with = 'tensorboard', project_dir = log_dir)
 
         self.accelerator = Accelerator(
             cpu = cpu,
             **accelerate_kwargs
         )
+
+        if use_tensorboard_logger:
+            self.accelerator.init_trackers(project_name)
 
         self.model = model
 
@@ -248,14 +308,16 @@ class DreamTrainer(Module):
             weight_decay = weight_decay
         )
 
-        self.policy_head_optim = AdamW(model.policy_head_parameters(), **optim_kwargs)
-        self.value_head_optim = AdamW(model.value_head_parameters(), **optim_kwargs)
+        self.policy_head_optim = optim_klass(model.policy_head_parameters(), **optim_kwargs)
+        self.value_head_optim = optim_klass(model.value_head_parameters(), **optim_kwargs)
 
         self.max_grad_norm = max_grad_norm
 
         self.num_train_steps = num_train_steps
         self.batch_size = batch_size
         self.generate_timesteps = generate_timesteps
+
+        self.register_buffer('step', tensor(0))
 
         self.unwrapped_model = self.model
 
@@ -279,6 +341,9 @@ class DreamTrainer(Module):
 
     def print(self, *args, **kwargs):
         return self.accelerator.print(*args, **kwargs)
+
+    def log(self, **data):
+        self.accelerator.log(data, step = self.step.item())
 
     def forward(
         self
@@ -318,6 +383,15 @@ class DreamTrainer(Module):
             self.value_head_optim.step()
             self.value_head_optim.zero_grad()
 
+            self.log(
+                policy_head_loss = policy_head_loss.item(),
+                value_head_loss = value_head_loss.item()
+            )
+
+            self.step += 1
+
+        self.accelerator.end_training()
+
         self.print('training complete')
 
 # training from sim
@@ -336,13 +410,22 @@ class SimTrainer(Module):
         accelerate_kwargs: dict = dict(),
         optim_kwargs: dict = dict(),
         cpu = False,
+        use_tensorboard_logger = False,
+        log_dir = None,
+        project_name = 'dreamer4'
     ):
         super().__init__()
+
+        if use_tensorboard_logger:
+            accelerate_kwargs.update(log_with = 'tensorboard', project_dir = log_dir)
 
         self.accelerator = Accelerator(
             cpu = cpu,
             **accelerate_kwargs
         )
+
+        if use_tensorboard_logger:
+            self.accelerator.init_trackers(project_name)
 
         self.model = model
 
@@ -351,8 +434,8 @@ class SimTrainer(Module):
             weight_decay = weight_decay
         )
 
-        self.policy_head_optim = AdamW(model.policy_head_parameters(), **optim_kwargs)
-        self.value_head_optim = AdamW(model.value_head_parameters(), **optim_kwargs)
+        self.policy_head_optim = optim_klass(model.policy_head_parameters(), **optim_kwargs)
+        self.value_head_optim = optim_klass(model.value_head_parameters(), **optim_kwargs)
 
         self.max_grad_norm = max_grad_norm
 
@@ -360,6 +443,8 @@ class SimTrainer(Module):
         self.batch_size = batch_size
 
         self.generate_timesteps = generate_timesteps
+
+        self.register_buffer('step', torch.tensor(0))
 
         self.unwrapped_model = self.model
 
@@ -381,6 +466,9 @@ class SimTrainer(Module):
     def unwrapped_model(self):
         return self.accelerator.unwrap_model(self.model)
 
+    def log(self, **data):
+        self.accelerator.log(data, step = self.step.item())
+
     def print(self, *args, **kwargs):
         return self.accelerator.print(*args, **kwargs)
 
@@ -396,6 +484,9 @@ class SimTrainer(Module):
         old_values = experience.values
         rewards = experience.rewards
 
+        has_proprio = exists(experience.proprio)
+        proprio = experience.proprio
+
         has_agent_embed = exists(experience.agent_embed)
         agent_embed = experience.agent_embed
 
@@ -409,6 +500,7 @@ class SimTrainer(Module):
         empty_tensor = torch.empty_like(rewards)
 
         agent_embed = default(agent_embed, empty_tensor)
+        proprio = default(proprio, empty_tensor)
 
         has_discrete = exists(discrete_actions)
         has_continuous = exists(continuous_actions)
@@ -431,6 +523,7 @@ class SimTrainer(Module):
             discrete_log_probs,
             continuous_log_probs,
             agent_embed,
+            proprio,
             discrete_old_action_unembeds,
             continuous_old_action_unembeds,
             old_values,
@@ -448,6 +541,7 @@ class SimTrainer(Module):
                 discrete_log_probs,
                 continuous_log_probs,
                 agent_embed,
+                proprio,
                 discrete_old_action_unembeds,
                 continuous_old_action_unembeds,
                 old_values,
@@ -474,6 +568,7 @@ class SimTrainer(Module):
                     actions = actions,
                     log_probs = log_probs,
                     agent_embed = agent_embed if has_agent_embed else None,
+                    proprio = proprio if has_proprio else None,
                     old_action_unembeds = old_action_unembeds,
                     values = old_values,
                     rewards = rewards,
@@ -484,6 +579,13 @@ class SimTrainer(Module):
                 policy_head_loss, value_head_loss = self.model.learn_from_experience(batch_experience)
 
                 self.print(f'policy head loss: {policy_head_loss.item():.3f} | value head loss: {value_head_loss.item():.3f}')
+
+                self.log(
+                    policy_head_loss = policy_head_loss.item(),
+                    value_head_loss = value_head_loss.item()
+                )
+
+                self.step += 1
 
                 # update policy head
 
@@ -504,6 +606,8 @@ class SimTrainer(Module):
 
                 self.value_head_optim.step()
                 self.value_head_optim.zero_grad()
+
+        self.accelerator.end_training()
 
         self.print('training complete')
 

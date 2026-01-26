@@ -414,6 +414,30 @@ def test_action_embedder():
 
     assert torch.allclose(discrete_log_probs, parallel_discrete_log_probs, atol = 1e-5)
 
+    # 0 discrete actions
+
+    embedder = ActionEmbedder(
+        512,
+        num_discrete_actions = 0,
+        num_continuous_actions = 2,
+        can_unembed = True
+    )
+
+    continuous_actions = torch.randn(2, 3, 2)
+    action_embed = embedder(continuous_actions = continuous_actions)
+
+    assert action_embed.shape == (2, 3, 512)
+
+    discrete_logits, continuous_mean_log_var = embedder.unembed(action_embed)
+
+    assert discrete_logits is None
+    assert continuous_mean_log_var.shape == (2, 3, 2, 2)
+
+    sampled_discrete, sampled_continuous = embedder.sample(action_embed)
+
+    assert sampled_discrete is None
+    assert sampled_continuous.shape == (2, 3, 2)
+
 def test_mtp():
     from dreamer4.dreamer4 import create_multi_token_prediction_targets
 

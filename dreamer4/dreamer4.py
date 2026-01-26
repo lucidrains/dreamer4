@@ -197,7 +197,7 @@ def first(arr):
     return arr[0]
 
 def xnor(x, y):
-    return not (x ^ y)
+    return x == y
 
 def has_at_least_one(*bools):
     return sum([*map(int, bools)]) > 0
@@ -331,7 +331,7 @@ class LossNormalizer(Module):
 
     def __init__(
         self,
-        num_losses: int,
+        num_losses = 1,
         beta = 0.95,
         eps = 1e-6
     ):
@@ -537,12 +537,17 @@ class ActionEmbedder(Module):
     ):
         super().__init__()
 
+        self.register_buffer('dummy', tensor(0), persistent = False)
+
         # handle discrete actions
 
-        num_discrete_actions = tensor(ensure_tuple(num_discrete_actions))
-        total_discrete_actions = num_discrete_actions.sum().item()
+        num_discrete_actions = tensor(ensure_tuple(num_discrete_actions), dtype = torch.long)
+        num_discrete_actions = num_discrete_actions[num_discrete_actions > 0]
 
-        self.num_discrete_action_types = len(num_discrete_actions)
+        self.num_discrete_action_types = num_discrete_actions.numel()
+        has_discrete = self.num_discrete_action_types > 0
+        total_discrete_actions = num_discrete_actions.sum().item() if has_discrete else 0
+
         self.discrete_action_embed = Embedding(total_discrete_actions, dim)
 
         self.register_buffer('num_discrete_actions', num_discrete_actions, persistent = False)
@@ -564,7 +569,11 @@ class ActionEmbedder(Module):
 
         # calculate offsets
 
-        offsets = F.pad(num_discrete_actions.cumsum(dim = -1), (1, -1), value = 0)
+        offsets = None
+
+        if self.has_discrete_actions:
+            offsets = F.pad(num_discrete_actions.cumsum(dim = -1), (1, -1), value = 0)
+
         self.register_buffer('discrete_action_offsets', offsets, persistent = False)
 
         # unembedding
@@ -578,19 +587,26 @@ class ActionEmbedder(Module):
             return
 
         unembed_dim = default(unembed_dim, dim)
+
+        # discrete action unembed
+
         self.discrete_action_unembed = Parameter(torch.randn(total_discrete_actions, num_unembed_preds, unembed_dim) * 1e-2)
 
-        discrete_action_index = arange(total_discrete_actions)
+        if self.has_discrete_actions:
 
-        padded_num_discrete_actions = F.pad(num_discrete_actions, (1, 0), value = 0)
-        exclusive_cumsum = padded_num_discrete_actions.cumsum(dim = -1)
+            discrete_action_index = arange(total_discrete_actions)
 
-        discrete_action_mask = (
-            einx.greater_equal('j, i -> i j', discrete_action_index, exclusive_cumsum[:-1]) &
-            einx.less('j, i -> i j', discrete_action_index, exclusive_cumsum[1:])
-        )
+            padded_num_discrete_actions = F.pad(num_discrete_actions, (1, 0), value = 0)
+            exclusive_cumsum = padded_num_discrete_actions.cumsum(dim = -1)
 
-        self.register_buffer('discrete_action_mask', discrete_action_mask, persistent = False)
+            discrete_action_mask = (
+                einx.greater_equal('j, i -> i j', discrete_action_index, exclusive_cumsum[:-1]) &
+                einx.less('j, i -> i j', discrete_action_index, exclusive_cumsum[1:])
+            )
+
+            self.register_buffer('discrete_action_mask', discrete_action_mask, persistent = False)
+
+        # continuous action unembed
 
         self.continuous_action_unembed = Parameter(torch.randn(num_continuous_actions, num_unembed_preds, unembed_dim, 2) * 1e-2)
 
@@ -601,8 +617,12 @@ class ActionEmbedder(Module):
         return set([self.discrete_action_unembed, self.continuous_action_unembed])
 
     @property
+    def has_discrete_actions(self):
+        return self.num_discrete_action_types > 0
+
+    @property
     def device(self):
-        return self.discrete_action_offsets.device
+        return self.dummy.device
 
     @property
     def has_actions(self):
@@ -1635,7 +1655,7 @@ class VideoTokenizer(Module):
         patch_size,
         image_height = None,
         image_width = None,
-        num_latent_tokens = 4,
+        num_latent_tokens = 64,
         encoder_depth = 4,
         decoder_depth = 4,
         time_block_every = 4,
@@ -1653,6 +1673,7 @@ class VideoTokenizer(Module):
         decor_auxx_loss_weight = 0.1,
         decorr_sample_frac = 0.25,
         num_residual_streams = 1,
+        use_loss_normalization = True
     ):
         super().__init__()
 
@@ -1755,6 +1776,16 @@ class VideoTokenizer(Module):
 
         self.decorr_loss = DecorrelationLoss(decorr_sample_frac, soft_validate_num_sampled = True) if encoder_add_decor_aux_loss else None
 
+        # loss normalizer
+
+        self.use_loss_normalization = use_loss_normalization
+
+        if use_loss_normalization:
+            self.recon_loss_normalizer = LossNormalizer()
+            self.lpips_loss_normalizer = LossNormalizer() if self.has_lpips_loss else None
+            self.time_decorr_loss_normalizer = LossNormalizer() if encoder_add_decor_aux_loss else None
+            self.space_decorr_loss_normalizer = LossNormalizer() if encoder_add_decor_aux_loss else None
+
     @property
     def device(self):
         return self.zero.device
@@ -1828,6 +1859,7 @@ class VideoTokenizer(Module):
         return_latents = False,
         mask_patches = None,
         return_intermediates = False,
+        update_loss_ema = None
     ):
 
         # handle image pretraining
@@ -1910,6 +1942,18 @@ class VideoTokenizer(Module):
 
             if exists(space_attn_normed_inputs):
                 space_decorr_loss = self.decorr_loss(space_attn_normed_inputs)
+
+        # losses
+
+        if self.use_loss_normalization:
+            recon_loss = self.recon_loss_normalizer(recon_loss, update_ema = update_loss_ema)
+
+            if self.has_lpips_loss:
+                lpips_loss = self.lpips_loss_normalizer(lpips_loss, update_ema = update_loss_ema)
+
+            if self.encoder_add_decor_aux_loss:
+                time_decorr_loss = self.time_decorr_loss_normalizer(time_decorr_loss, update_ema = update_loss_ema)
+                space_decorr_loss = self.space_decorr_loss_normalizer(space_decorr_loss, update_ema = update_loss_ema)
 
         # losses
 
@@ -2234,7 +2278,7 @@ class DynamicsWorldModel(Module):
 
         # loss related
 
-        self.flow_loss_normalizer = LossNormalizer(1)
+        self.flow_loss_normalizer = LossNormalizer()
         self.reward_loss_normalizer = LossNormalizer(multi_token_pred_len)
         self.discrete_actions_loss_normalizer = LossNormalizer(multi_token_pred_len) if num_discrete_actions > 0 else None
         self.continuous_actions_loss_normalizer = LossNormalizer(multi_token_pred_len) if num_continuous_actions > 0 else None
