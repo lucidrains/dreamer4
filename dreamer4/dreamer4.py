@@ -323,6 +323,11 @@ def create_multi_token_prediction_targets(
 
     return out, mask
 
+def safe_rearrange(x, pattern):
+    if exists(x):
+        return rearrange(x, pattern)
+    return None
+
 # loss related
 
 class LossNormalizer(Module):
@@ -2400,14 +2405,28 @@ class DynamicsWorldModel(Module):
     ):
         assert exists(self.video_tokenizer)
 
-        init_frame = env.reset()
+        init_obs = env.reset()
 
-        # frame to video
+        # if we are not a observation dict, we must be a raw image tensor
+
+        if not isinstance(init_obs, dict):
+            assert isinstance(init_obs, torch.Tensor)
+            init_obs = {"image": init_obs}
+
+        assert 'image' in init_obs
+        if self.has_proprio:
+            assert 'proprio' in init_obs
+
+        proprio = init_obs.get('proprio')
+
+        # setup accumulation of frames to video and proprio
 
         if env_is_vectorized:
-            video = rearrange(init_frame, 'b c vh vw -> b c 1 vh vw')
+            video = rearrange(init_obs['image'], 'b c vh vw -> b c 1 vh vw')
+            accumulated_proprio = safe_rearrange(proprio, 'b d -> b 1 d')
         else:
-            video = rearrange(init_frame, 'c vh vw -> 1 c 1 vh vw')
+            video = rearrange(init_obs['image'], 'c vh vw -> 1 c 1 vh vw')
+            accumulated_proprio = safe_rearrange(proprio, 'd -> 1 1 d')
 
         batch, device = video.shape[0], video.device
 
@@ -2454,6 +2473,7 @@ class DynamicsWorldModel(Module):
                 rewards = rewards,
                 discrete_actions = discrete_actions,
                 continuous_actions = continuous_actions,
+                proprio=accumulated_proprio,
                 time_cache = time_cache,
                 latent_is_noised = True,
                 return_pred_only = True,
@@ -2509,19 +2529,29 @@ class DynamicsWorldModel(Module):
             env_step_out = env.step((sampled_discrete_actions, sampled_continuous_actions))
 
             if len(env_step_out) == 2:
-                next_frame, reward = env_step_out
+                obs, reward = env_step_out
                 terminated = full((batch,), False)
                 truncated = full((batch,), False)
 
             elif len(env_step_out) == 3:
-                next_frame, reward, terminated = env_step_out
+                obs, reward, terminated = env_step_out
                 truncated = full((batch,), False)
 
             elif len(env_step_out) == 4:
-                next_frame, reward, terminated, truncated = env_step_out
+                obs, reward, terminated, truncated = env_step_out
 
             elif len(env_step_out) == 5:
-                next_frame, reward, terminated, truncated, info = env_step_out
+                obs, reward, terminated, truncated, info = env_step_out
+
+            # if we are not a observation dict, we must be a raw image tensor
+
+            if not isinstance(obs, dict):
+                assert isinstance(obs, torch.Tensor)
+                obs = {"image": obs}
+
+            assert 'image' in obs
+            if self.has_proprio:
+                assert 'proprio' in obs
 
             # maybe add state entropy bonus
 
@@ -2555,19 +2585,24 @@ class DynamicsWorldModel(Module):
 
                 is_truncated |= ~is_terminated
 
-            # batch and time dimension
+            proprio = obs.get('proprio')
 
+            # batch and time dimension
             if env_is_vectorized:
-                next_frame = rearrange(next_frame, 'b c vh vw -> b c 1 vh vw')
+                next_frame = rearrange(obs['image'], 'b c vh vw -> b c 1 vh vw')
+                proprio = safe_rearrange(proprio, 'b d -> b 1 d')
                 reward = rearrange(reward, 'b -> b 1')
             else:
-                next_frame = rearrange(next_frame, 'c vh vw -> 1 c 1 vh vw')
+                next_frame = rearrange(obs['image'], 'c vh vw -> 1 c 1 vh vw')
+                proprio = safe_rearrange(proprio, 'd -> 1 1 d')
                 reward = rearrange(reward, ' -> 1 1')
 
             # concat
 
             video = cat((video, next_frame), dim = 2)
             rewards = safe_cat((rewards, reward), dim = 1)
+
+            accumulated_proprio = safe_cat((accumulated_proprio, proprio), dim=1)
 
             acc_agent_embed = safe_cat((acc_agent_embed, one_agent_embed), dim = 1)
 
@@ -2579,6 +2614,7 @@ class DynamicsWorldModel(Module):
             latents = latents,
             video = video[:, :, :-1],
             rewards = rewards,
+            proprio=accumulated_proprio[:, :-1] if exists(accumulated_proprio) else None,
             actions = (discrete_actions, continuous_actions),
             log_probs = (discrete_log_probs, continuous_log_probs),
             values = values,
@@ -2611,6 +2647,7 @@ class DynamicsWorldModel(Module):
 
         latents = experience.latents
         actions = experience.actions
+        proprio = experience.proprio
         old_log_probs = experience.log_probs
         old_values = experience.values
         rewards = experience.rewards
@@ -2719,6 +2756,7 @@ class DynamicsWorldModel(Module):
                     rewards = rewards,
                     discrete_actions = discrete_actions,
                     continuous_actions = continuous_actions,
+                    proprio=proprio,
                     latent_is_noised = True,
                     return_pred_only = True,
                     return_intermediates = True
