@@ -1974,8 +1974,6 @@ class VideoTokenizer(Module):
 
         losses = TokenizerLosses(recon_loss, lpips_loss, time_decorr_loss, space_decorr_loss)
 
-        out = losses
-
         # handle returning of reconstructed, and image pretraining
 
         if is_image:

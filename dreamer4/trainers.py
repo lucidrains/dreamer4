@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+from einops import rearrange
 from torch import is_tensor, tensor
 from torch.nn import Module
 from torch.optim import AdamW
@@ -50,7 +51,10 @@ class VideoTokenizerTrainer(Module):
         cpu = False,
         use_tensorboard_logger = False,
         log_dir: str | None = None,
-        project_name = 'dreamer4'
+        project_name = 'dreamer4',
+        log_video = False,
+        video_fps = -1,
+        log_video_every = 1000,
     ):
         super().__init__()
         batch_size = min(batch_size, len(dataset))
@@ -65,6 +69,20 @@ class VideoTokenizerTrainer(Module):
 
         if use_tensorboard_logger:
             self.accelerator.init_trackers(project_name)
+
+        if log_video:
+            assert video_fps > 0, "Video fps must be passed in and positive when log_video=True"
+
+            self.fps = video_fps
+            self.log_video_every = log_video_every
+            self.video_logger = self.accelerator.get_tracker("tensorboard").writer.add_video
+
+            # Modern python versions have deprecated "\d" which moviepy 1.0.3 uses
+            # We can mute those warnings here
+            import warnings
+            warnings.filterwarnings("ignore", category=SyntaxWarning, module="moviepy")
+
+        self.log_video_flag = log_video
 
         self.model = model
         self.dataset = dataset
@@ -116,6 +134,14 @@ class VideoTokenizerTrainer(Module):
     def log(self, **data):
         self.accelerator.log(data, step = self.step.item())
 
+    def log_video(self, video, tag: str):
+        self.video_logger(
+            tag,
+            rearrange(video, 'b c t h w -> b t c h w'),
+            self.step.item(),
+            self.fps
+        )
+
     def forward(
         self
     ):
@@ -124,7 +150,7 @@ class VideoTokenizerTrainer(Module):
         for _ in range(self.num_train_steps):
             video = next(iter_train_dl)
 
-            loss, (losses, _) = self.model(
+            loss, (losses, recon_video) = self.model(
                 video,
                 update_loss_ema = True,
                 return_intermediates = True
@@ -145,6 +171,10 @@ class VideoTokenizerTrainer(Module):
                 time_decorr_loss = losses.time_decorr.item(),
                 space_decorr_loss = losses.space_decorr.item()
             )
+
+            if self.log_video_flag and (self.step % self.log_video_every == 0):
+                self.log_video(video, "original_video")
+                self.log_video(recon_video, "reconstructed_video")
 
             self.step += 1
 
