@@ -10,7 +10,7 @@ Implementation of Danijar's [latest iteration](https://arxiv.org/abs/2509.24527v
 
 - [@dirkmcpherson](https://github.com/dirkmcpherson) for fixes to typo errors and unpassed arguments!
 
-- [@witherhoard99](https://github.com/witherhoard99) and [Vish](https://github.com/humboldt123) for contributing improvements to video tokenizer convergence, identifying a bug with no discrete actions, and tensorboard logging in [PR #10](https://github.com/lucidrains/dreamer4/pull/10)!
+- [@witherhoard99](https://github.com/witherhoard99) and [Vish](https://github.com/humboldt123) for [contributing](https://github.com/lucidrains/dreamer4/pull/10) improvements to video tokenizer convergence, proprioception handling, identifying a bug with no discrete actions, and tensorboard logging!
 
 ## Install
 
