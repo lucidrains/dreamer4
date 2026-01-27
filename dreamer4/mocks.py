@@ -95,3 +95,52 @@ class MockEnv(Module):
         self._step.add_(1)
 
         return out
+
+class MockDictEnv(Module):
+    def __init__(
+        self,
+        image_shape,
+        dim_proprio,
+        num_envs = 1,
+        vectorized = False,
+        terminate_after_step = None,
+    ):
+        super().__init__()
+        self.image_shape = image_shape
+        self.dim_proprio = dim_proprio
+        self.num_envs = num_envs
+        self.vectorized = vectorized
+        self.terminate_after_step = terminate_after_step
+
+        self.register_buffer('_step', tensor(0))
+
+    def reset(self):
+        self._step.zero_()
+
+        image_shape = (self.num_envs, 3, *self.image_shape) if self.vectorized else (3, *self.image_shape)
+        proprio_shape = (self.num_envs, self.dim_proprio) if self.vectorized else (self.dim_proprio,)
+
+        return {
+            'image': randn(image_shape),
+            'proprio': randn(proprio_shape)
+        }
+
+    def step(self, actions):
+        self._step.add_(1)
+
+        image_shape = (self.num_envs, 3, *self.image_shape) if self.vectorized else (3, *self.image_shape)
+        proprio_shape = (self.num_envs, self.dim_proprio) if self.vectorized else (self.dim_proprio,)
+
+        obs = {
+            'image': randn(image_shape),
+            'proprio': randn(proprio_shape)
+        }
+
+        reward = randn(self.num_envs) if self.vectorized else randn(())
+
+        terminated = torch.full((self.num_envs,), False) if self.vectorized else torch.tensor(False)
+
+        if exists(self.terminate_after_step) and self._step >= self.terminate_after_step:
+            terminated = ~terminated
+
+        return obs, reward, terminated
