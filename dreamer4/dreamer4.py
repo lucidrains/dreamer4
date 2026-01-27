@@ -126,7 +126,7 @@ class Experience:
         return Experience(**experience_dict)
 
 def combine_experiences(
-    exps: list[Experiences]
+    exps: list[Experience]
 ) -> Experience:
 
     assert len(exps) > 0
@@ -307,11 +307,16 @@ def create_multi_token_prediction_targets(
 
     return out, mask
 
+def maybe_cast(tensor, dtype, condition=True):
+    if exists(tensor) and condition:
+        return tensor.to(dtype)
+    return tensor
+
 # loss related
 
 class LossNormalizer(Module):
 
-    # the authors mentioned the need for loss normalization in the dynamics transformer
+    # the authors mentioned the need for loss normalization
 
     def __init__(
         self,
@@ -341,7 +346,7 @@ class LossNormalizer(Module):
 
             # update the ema
 
-            exp_avg_sq.lerp_(losses.detach().square(), decay)
+            exp_avg_sq.lerp_(losses.to(torch.float32).detach().square(), decay)
 
         # then normalize
 
@@ -1009,7 +1014,7 @@ class MultiHeadRMSNorm(Module):
     ):
         normed = l2norm(x)
         scale = (self.gamma + 1.) * self.scale
-        return multiply('... h n d, h d', normed, scale)
+        return maybe_cast(multiply('... h n d, h d', normed, scale), x.dtype)
 
 # naive attend
 
@@ -3371,7 +3376,7 @@ class DynamicsWorldModel(Module):
 
             # noise from 0 as noise to 1 as data
 
-            noised_latents = noise.lerp(latents, aligned_times)
+            noised_latents = noise.lerp(latents, maybe_cast(aligned_times, latents.dtype))
 
         else:
             noised_latents = latents

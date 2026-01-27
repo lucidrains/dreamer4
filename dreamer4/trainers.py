@@ -15,7 +15,8 @@ from dreamer4.dreamer4 import (
     VideoTokenizer,
     DynamicsWorldModel,
     Experience,
-    combine_experiences
+    combine_experiences,
+    maybe_cast
 )
 
 from ema_pytorch import EMA
@@ -45,6 +46,8 @@ class VideoTokenizerTrainer(Module):
         learning_rate = 3e-4,
         max_grad_norm = None,
         num_train_steps = 10_000,
+        use_autocast=False,
+        autocast_dtype=torch.bfloat16,
         weight_decay = 0.,
         accelerate_kwargs: dict = dict(),
         optim_kwargs: dict = dict(),
@@ -54,7 +57,7 @@ class VideoTokenizerTrainer(Module):
         project_name = 'dreamer4',
         log_video = False,
         video_fps = -1,
-        log_video_every = 1000,
+        log_video_every = 1000
     ):
         super().__init__()
         batch_size = min(batch_size, len(dataset))
@@ -83,6 +86,9 @@ class VideoTokenizerTrainer(Module):
             warnings.filterwarnings("ignore", category=SyntaxWarning, module="moviepy")
 
         self.log_video_flag = log_video
+
+        self.use_autocast = use_autocast
+        self.autocast_dtype = autocast_dtype
 
         self.model = model
         self.dataset = dataset
@@ -149,12 +155,14 @@ class VideoTokenizerTrainer(Module):
 
         for _ in range(self.num_train_steps):
             video = next(iter_train_dl)
+            maybe_cast(video, self.autocast_dtype, self.use_autocast)
 
-            loss, (losses, recon_video) = self.model(
-                video,
-                update_loss_ema = True,
-                return_intermediates = True
-            )
+            with torch.autocast(enabled=self.use_autocast, dtype=self.autocast_dtype, device_type=self.device.type):
+                loss, (losses, recon_video) = self.model(
+                    video,
+                    update_loss_ema = True,
+                    return_intermediates = True
+                )
 
             self.accelerator.backward(loss)
 
@@ -194,6 +202,8 @@ class BehaviorCloneTrainer(Module):
         learning_rate = 3e-4,
         max_grad_norm = None,
         num_train_steps = 10_000,
+        use_autocast=False,
+        autocast_dtype=torch.bfloat16,
         weight_decay = 0.,
         accelerate_kwargs: dict = dict(),
         optim_kwargs: dict = dict(),
@@ -215,6 +225,9 @@ class BehaviorCloneTrainer(Module):
 
         if use_tensorboard_logger:
             self.accelerator.init_trackers(project_name)
+
+        self.use_autocast = use_autocast
+        self.autocast_dtype = autocast_dtype
 
         self.model = model
         self.dataset = dataset
@@ -278,9 +291,16 @@ class BehaviorCloneTrainer(Module):
             # else kwargs for video, actions, rewards
 
             if is_tensor(batch_data):
-                loss = self.model(batch_data)
+                maybe_cast(batch_data, self.autocast_dtype, self.use_autocast)
+
+                with torch.autocast(enabled=self.use_autocast, dtype=self.autocast_dtype, device_type=self.device.type):
+                    loss = self.model(batch_data)
             else:
-                loss = self.model(**batch_data)
+                for v in batch_data.values():
+                    maybe_cast(v, self.autocast_dtype, self.use_autocast)
+
+                with torch.autocast(enabled=self.use_autocast, dtype=self.autocast_dtype, device_type=self.device.type):
+                    loss = self.model(**batch_data)
 
             self.accelerator.backward(loss)
 
@@ -310,6 +330,8 @@ class DreamTrainer(Module):
         learning_rate = 3e-4,
         max_grad_norm = None,
         num_train_steps = 10_000,
+        use_autocast=False,
+        autocast_dtype=torch.bfloat16,
         weight_decay = 0.,
         accelerate_kwargs: dict = dict(),
         optim_kwargs: dict = dict(),
@@ -330,6 +352,9 @@ class DreamTrainer(Module):
 
         if use_tensorboard_logger:
             self.accelerator.init_trackers(project_name)
+
+        self.use_autocast = use_autocast
+        self.autocast_dtype = autocast_dtype
 
         self.model = model
 
@@ -381,15 +406,19 @@ class DreamTrainer(Module):
 
         for _ in range(self.num_train_steps):
 
-            dreams = self.unwrapped_model.generate(
-                self.generate_timesteps + 1, # plus one for bootstrap value
-                batch_size = self.batch_size,
-                return_rewards_per_frame = True,
-                return_agent_actions = True,
-                return_log_probs_and_values = True
-            )
+            with torch.autocast(enabled=self.use_autocast, dtype=self.autocast_dtype, device_type=self.device.type):
+                dreams = self.unwrapped_model.generate(
+                    self.generate_timesteps + 1, # plus one for bootstrap value
+                    batch_size = self.batch_size,
+                    return_rewards_per_frame = True,
+                    return_agent_actions = True,
+                    return_log_probs_and_values = True
+                )
 
-            policy_head_loss, value_head_loss = self.model.learn_from_experience(dreams)
+            maybe_cast(dreams, self.autocast_dtype, self.use_autocast)
+
+            with torch.autocast(enabled=self.use_autocast, dtype=self.autocast_dtype, device_type=self.device.type):
+                policy_head_loss, value_head_loss = self.model.learn_from_experience(dreams)
 
             self.print(f'policy head loss: {policy_head_loss.item():.3f} | value head loss: {value_head_loss.item():.3f}')
 
@@ -436,6 +465,8 @@ class SimTrainer(Module):
         learning_rate = 3e-4,
         max_grad_norm = None,
         epochs = 2,
+        use_autocast=False,
+        autocast_dtype=torch.bfloat16,
         weight_decay = 0.,
         accelerate_kwargs: dict = dict(),
         optim_kwargs: dict = dict(),
@@ -456,6 +487,9 @@ class SimTrainer(Module):
 
         if use_tensorboard_logger:
             self.accelerator.init_trackers(project_name)
+
+        self.use_autocast = use_autocast
+        self.autocast_dtype = autocast_dtype
 
         self.model = model
 
@@ -606,7 +640,10 @@ class SimTrainer(Module):
                     agent_index = agent_index
                 )
 
-                policy_head_loss, value_head_loss = self.model.learn_from_experience(batch_experience)
+                maybe_cast(batch_experience, self.autocast_dtype, self.use_autocast)
+
+                with torch.autocast(enabled=self.use_autocast, dtype=self.autocast_dtype, device_type=self.device.type):
+                    policy_head_loss, value_head_loss = self.model.learn_from_experience(batch_experience)
 
                 self.print(f'policy head loss: {policy_head_loss.item():.3f} | value head loss: {value_head_loss.item():.3f}')
 

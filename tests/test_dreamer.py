@@ -489,7 +489,8 @@ def test_loss_normalizer():
 
     assert (normed_losses == 1.).all()
 
-def test_tokenizer_trainer():
+@param('use_autocast', (True, False))
+def test_tokenizer_trainer(use_autocast):
     from dreamer4.trainers import VideoTokenizerTrainer
     from dreamer4.dreamer4 import VideoTokenizer
     from torch.utils.data import Dataset
@@ -520,16 +521,19 @@ def test_tokenizer_trainer():
         num_train_steps = 1,
         batch_size = 1,
         cpu = True,
-        max_grad_norm = 0.5
+        max_grad_norm = 0.5,
+        use_autocast=use_autocast
     )
 
     trainer()
 
 @param('with_actions', (True, False))
 @param('with_rewards', (True, False))
+@param('use_autocast', (True, False))
 def test_bc_trainer(
     with_actions,
-    with_rewards
+    with_rewards,
+    use_autocast
 ):
     from dreamer4.trainers import BehaviorCloneTrainer
     from dreamer4.dreamer4 import DynamicsWorldModel, VideoTokenizer
@@ -588,12 +592,14 @@ def test_bc_trainer(
         dataset = dataset,
         batch_size = 1,
         num_train_steps = 1,
-        cpu = True
+        cpu = True,
+        use_autocast=use_autocast
     )
 
     trainer()
 
-def test_dream_trainer():
+@param('use_autocast', (True, False))
+def test_dream_trainer(use_autocast):
     from dreamer4.dreamer4 import DynamicsWorldModel
 
     world_model = DynamicsWorldModel(
@@ -621,6 +627,7 @@ def test_dream_trainer():
         batch_size = 2,
         num_train_steps = 1,
         cpu = True,
+        use_autocast=use_autocast,
     )
 
     dream_trainer()
