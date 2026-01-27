@@ -40,7 +40,9 @@ from torch_einops_utils import (
     pad_at_dim,
     pad_right_at_dim_to,
     lens_to_mask,
-    masked_mean
+    masked_mean,
+    safe_stack,
+    safe_cat
 )
 
 # ein related
@@ -230,24 +232,6 @@ def mean_log_var_to_distr(
     std = (0.5 * log_var).exp()
     return Normal(mean, std)
 
-def safe_stack(tensors, dim = 0):
-    tensors = [*filter(exists, tensors)]
-
-    if len(tensors) == 0:
-        return None
-
-    return stack(tensors, dim = dim)
-
-def safe_cat(tensors, dim):
-    tensors = [*filter(exists, tensors)]
-
-    if len(tensors) == 0:
-        return None
-    elif len(tensors) == 1:
-        return tensors[0]
-
-    return cat(tensors, dim = dim)
-
 def safe_squeeze_first(t):
     if not exists(t):
         return None
@@ -322,11 +306,6 @@ def create_multi_token_prediction_targets(
     out = t[batch_arange, indices]
 
     return out, mask
-
-def safe_rearrange(x, pattern):
-    if exists(x):
-        return rearrange(x, pattern)
-    return None
 
 # loss related
 
@@ -2423,10 +2402,10 @@ class DynamicsWorldModel(Module):
 
         if env_is_vectorized:
             video = rearrange(init_obs['image'], 'b c vh vw -> b c 1 vh vw')
-            accumulated_proprio = safe_rearrange(proprio, 'b d -> b 1 d')
+            accumulated_proprio = maybe(rearrange)(proprio, 'b d -> b 1 d')
         else:
             video = rearrange(init_obs['image'], 'c vh vw -> 1 c 1 vh vw')
-            accumulated_proprio = safe_rearrange(proprio, 'd -> 1 1 d')
+            accumulated_proprio = maybe(rearrange)(proprio, 'd -> 1 1 d')
 
         batch, device = video.shape[0], video.device
 
@@ -2588,13 +2567,14 @@ class DynamicsWorldModel(Module):
             proprio = obs.get('proprio')
 
             # batch and time dimension
+
             if env_is_vectorized:
                 next_frame = rearrange(obs['image'], 'b c vh vw -> b c 1 vh vw')
-                proprio = safe_rearrange(proprio, 'b d -> b 1 d')
+                proprio = maybe(rearrange)(proprio, 'b d -> b 1 d')
                 reward = rearrange(reward, 'b -> b 1')
             else:
                 next_frame = rearrange(obs['image'], 'c vh vw -> 1 c 1 vh vw')
-                proprio = safe_rearrange(proprio, 'd -> 1 1 d')
+                proprio = maybe(rearrange)(proprio, 'd -> 1 1 d')
                 reward = rearrange(reward, ' -> 1 1')
 
             # concat
