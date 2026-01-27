@@ -853,3 +853,55 @@ def test_images_to_video_tokenizer():
     loss.backward()
 
     assert images.shape == recon_images.shape
+
+@param('vectorized', (False, True))
+def test_interact_with_env_dict_obs(vectorized):
+    from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
+
+    tokenizer = VideoTokenizer(
+        512,
+        dim_latent=32,
+        patch_size=32,
+        encoder_depth=2,
+        decoder_depth=2,
+        time_block_every=2,
+        attn_heads=8,
+        image_height=256,
+        image_width=256,
+        attn_kwargs=dict(
+            query_heads=16
+        )
+    )
+
+    dynamics = DynamicsWorldModel(
+        512,
+        num_agents=1,
+        video_tokenizer=tokenizer,
+        dim_latent=32,
+        dim_proprio=21,
+        num_tasks=4,
+        num_latent_genes=16,
+        num_discrete_actions=4,
+        num_residual_streams=1
+    )
+
+    from dreamer4.mocks import MockDictEnv
+
+    mock_env = MockDictEnv(
+        (256, 256),
+        21,
+        vectorized = vectorized,
+        num_envs = 4 if vectorized else 1,
+        terminate_after_step = 3
+    )
+
+    experience = dynamics.interact_with_env(
+        mock_env,
+        max_timesteps = 4,
+        env_is_vectorized = vectorized
+    )
+
+    assert exists(experience)
+    assert experience.proprio.shape[-1] == 21
+    assert experience.proprio.shape[1] > 0
+
