@@ -67,8 +67,18 @@ build-backend = "hatchling.build"
 managed = true
 dev-dependencies = []
 
-[tool.hatch.metadata]
-allow-direct-references = true
+[tool.hatch.build]
+ignore-vcs = true
+include = [
+    "/dreamer4",
+    "/README.md",
+    "/LICENSE",
+]
+exclude = [
+    "/tests",
+    "*.sh",
+    "*.png",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["dreamer4"]
