@@ -3763,7 +3763,7 @@ class DynamicsWorldModel(Module):
         if (
             self.num_agents == 1 and
             add_autoregressive_action_loss and
-            time > 1,
+            time > 1 and
             (exists(discrete_actions) or exists(continuous_actions))
         ):
             assert self.action_embedder.has_actions
