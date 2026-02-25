@@ -37,10 +37,11 @@ def test_e2e(
 
     tokenizer = VideoTokenizer(
         16,
-        encoder_depth = 4,
-        decoder_depth = 4,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        time_block_every = 1,
         dim_latent = 16,
-        patch_size = 32,
+        patch_size = 16,
         attn_dim_head = 16,
         num_latent_tokens = 4,
         num_residual_streams = num_residual_streams,
@@ -48,7 +49,7 @@ def test_e2e(
         decorr_sample_frac = 1.
     )
 
-    video = torch.randn(2, 3, 4, 256, 256)
+    video = torch.randn(2, 3, 4, 32, 32)
 
     loss = tokenizer(video)
     assert loss.numel() == 1
@@ -56,7 +57,7 @@ def test_e2e(
     latents = tokenizer(video, return_latents = True)
     assert latents.shape[-1] == 16
 
-    recon = tokenizer.decode(latents, 256, 256)
+    recon = tokenizer.decode(latents, 32, 32)
     assert recon.shape == video.shape
 
     query_heads, heads = (16, 4) if grouped_query_attn else (8, 8)
@@ -66,9 +67,9 @@ def test_e2e(
         video_tokenizer = tokenizer,
         dim_latent = 16,
         max_steps = 64,
-        num_tasks = 4,
+        num_tasks = 2,
         num_latent_tokens = 4,
-        depth = 4,
+        depth = 1,
         num_spatial_tokens = num_spatial_tokens,
         pred_orig_latent = pred_orig_latent,
         num_discrete_actions = 4,
@@ -80,7 +81,8 @@ def test_e2e(
         prob_no_shortcut_train = prob_no_shortcut_train,
         add_reward_embed_to_agent_token = add_reward_embed_to_agent_token,
         add_state_pred_head = add_state_pred_head,
-        num_residual_streams = num_residual_streams
+        num_residual_streams = num_residual_streams,
+        time_block_every = 1
     )
 
     signal_levels = step_sizes_log2 = None
@@ -96,7 +98,7 @@ def test_e2e(
 
     tasks = None
     if add_task_embeds:
-        tasks = torch.randint(0, 4, (2,))
+        tasks = torch.randint(0, 2, (2,))
 
     actions = None
     if condition_on_actions:
@@ -122,19 +124,19 @@ def test_e2e(
 
     generations = dynamics.generate(
         time_steps = 10,
-        image_height = 128,
-        image_width = 128,
+        image_height = 32,
+        image_width = 32,
         batch_size = 2,
         return_rewards_per_frame = True,
         use_time_cache = use_time_cache
     )
 
-    assert generations.video.shape == (2, 3, 10, 128, 128)
+    assert generations.video.shape == (2, 3, 10, 32, 32)
     assert generations.rewards.shape == (2, 10)
 
     # rl
 
-    rewards = torch.randn((2, 4)) * 100.
+    rewards = torch.randn((2, 2)) * 100.
 
     flow_loss = dynamics(
         **dynamics_input,
@@ -210,13 +212,14 @@ def test_action_with_world_model():
 
     tokenizer = VideoTokenizer(
         512,
-        dim_latent = 32,
-        patch_size = 32,
-        encoder_depth = 4,
-        decoder_depth = 4,
-        attn_heads = 8,
-        image_height = 256,
-        image_width = 256,
+        dim_latent = 8,
+        patch_size = 16,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        time_block_every = 1,
+        attn_heads = 2,
+        image_height = 32,
+        image_width = 32,
         attn_kwargs = dict(
             query_heads = 16
         )
@@ -226,8 +229,9 @@ def test_action_with_world_model():
         512,
         num_agents = 1,
         video_tokenizer = tokenizer,
-        dim_latent = 32,
-        depth = 4,
+        dim_latent = 8,
+        depth = 1,
+        time_block_every = 1,
         num_discrete_actions = 4
     )
 
@@ -242,7 +246,7 @@ def test_action_with_world_model():
         return_log_probs_and_values = True
     )
 
-    assert gen.video.shape == (4, 3, 16, 256, 256)
+    assert gen.video.shape == (4, 3, 16, 32, 32)
     assert gen.rewards.shape == (4, 16)
 
     discrete_actions, continuous_actions = gen.actions
@@ -764,18 +768,18 @@ def test_proprioception(
         512,
         num_agents = 1,
         video_tokenizer = tokenizer,
-        dim_latent = 32,
+        dim_latent = 8,
         dim_proprio = 21,
-        num_tasks = 4,
+        num_tasks = 2,
         num_video_views = num_video_views,
         num_discrete_actions = 4,
         num_residual_streams = 1
     )
 
     if num_video_views > 1:
-        video_shape = (2, num_video_views, 3, 10, 256, 256)
+        video_shape = (2, num_video_views, 3, 4, 32, 32)
     else:
-        video_shape = (2, 3, 10, 256, 256)
+        video_shape = (2, 3, 4, 32, 32)
 
     video = torch.randn(*video_shape)
     rewards = torch.randn(2, 10)

@@ -12,7 +12,7 @@ from dataclasses import dataclass, asdict
 import torch
 import torch.nn.functional as F
 from torch.nested import nested_tensor
-from torch.distributions import Normal, kl
+from torch.distributions import Normal, Beta, kl
 from torch.nn import Module, ModuleList, Embedding, Parameter, Sequential, Linear, RMSNorm, Identity
 from torch import nn, cat, stack, arange, tensor, Tensor, is_tensor, full, zeros, ones, randint, rand, randn, randn_like, empty, full, linspace, arange
 from torch.utils._pytree import tree_map, tree_flatten, tree_unflatten
@@ -231,6 +231,24 @@ def mean_log_var_to_distr(
     mean, log_var = mean_log_var.unbind(dim = -1)
     std = (0.5 * log_var).exp()
     return Normal(mean, std)
+
+class BetaDist(Module):
+    def __init__(
+        self,
+        unimodal = True
+    ):
+        super().__init__()
+        self.unimodal = unimodal
+
+    def forward(self, params):
+        alpha, beta = params.unbind(dim = -1)
+
+        offset = 1. if self.unimodal else 0.
+
+        alpha = F.softplus(alpha) + offset
+        beta = F.softplus(beta) + offset
+
+        return Beta(alpha, beta)
 
 def safe_squeeze_first(t):
     if not exists(t):
@@ -1996,6 +2014,7 @@ class DynamicsWorldModel(Module):
         add_state_pred_head = False,
         state_pred_loss_weight = 0.1,
         state_entropy_bonus_weight = 0.05,
+        eps_latent_pred = 1e-6,
         num_discrete_actions: int | tuple[int, ...] = 0,
         num_continuous_actions = 0,
         continuous_norm_stats = None,
@@ -2128,12 +2147,15 @@ class DynamicsWorldModel(Module):
 
         if self.should_pred_state:
             self.state_pred_token = nn.Parameter(torch.randn(dim) * 1e-2)
+            self.eps_latent_pred = eps_latent_pred
 
             self.to_state_pred = Sequential(
                 RMSNorm(dim),
                 nn.Linear(dim, num_latent_tokens * dim_latent * 2),
                 Rearrange('... (n d two) -> ... n d two', n = num_latent_tokens, two = 2)
             )
+
+            self.state_beta_dist = BetaDist(unimodal = True)
 
         self.state_entropy_bonus_weight = state_entropy_bonus_weight
         self.add_state_entropy_bonus = self.should_pred_state and state_entropy_bonus_weight > 0.
@@ -2537,9 +2559,11 @@ class DynamicsWorldModel(Module):
 
                 state_pred = self.to_state_pred(state_pred_token)
 
-                state_pred_log_variance = state_pred[..., 1].sum()
+                dist = self.state_beta_dist(state_pred)
 
-                reward = reward + state_pred_log_variance * self.state_entropy_bonus_weight
+                state_entropy = dist.entropy().sum()
+
+                reward = reward + state_entropy * self.state_entropy_bonus_weight
 
             # update episode lens
 
@@ -2849,8 +2873,8 @@ class DynamicsWorldModel(Module):
 
         value_bins, return_bins, clipped_value_bins = tuple(rearrange(t, 'b t l -> b l t') for t in (value_bins, return_bins, clipped_value_bins))
 
-        value_loss_1 = F.cross_entropy(value_bins, return_bins, reduction = 'none')
-        value_loss_2 = F.cross_entropy(clipped_value_bins, return_bins, reduction = 'none')
+        value_loss_1 = -(return_bins * value_bins.log_softmax(dim = 1)).sum(dim = 1)
+        value_loss_2 = -(return_bins * clipped_value_bins.log_softmax(dim = 1)).sum(dim = 1)
 
         value_loss = torch.maximum(value_loss_1, value_loss_2)
 
@@ -3734,7 +3758,7 @@ class DynamicsWorldModel(Module):
 
             reward_targets = rearrange(reward_targets, 'b t mtp l -> b l t mtp')
 
-            reward_losses = F.cross_entropy(reward_pred, reward_targets, reduction = 'none')
+            reward_losses = -(reward_targets * reward_pred.log_softmax(dim = 1)).sum(dim = 1)
 
             reward_losses = reward_losses.masked_fill(~reward_loss_mask, 0.)
 
@@ -3750,10 +3774,19 @@ class DynamicsWorldModel(Module):
         if self.should_pred_state:
             pred_latent, latent_to_pred = pred.state[:, :-1], latents[:, 1:]
 
-            pred_latent_mean, pred_latent_log_var = pred_latent.unbind(dim = -1)
-            pred_latent_var = pred_latent_log_var.exp()
+            dist = self.state_beta_dist(pred_latent)
 
-            state_pred_loss = F.gaussian_nll_loss(pred_latent_mean, latent_to_pred, var = pred_latent_var)
+            # scale latent from tanh-ed (-1, 1) to (0, 1)
+
+            latent_to_pred = (latent_to_pred + 1.) / 2.
+            latent_to_pred = latent_to_pred.clamp(min = self.eps_latent_pred, max = 1. - self.eps_latent_pred)
+
+            state_pred_losses = -dist.log_prob(latent_to_pred)
+
+            if is_var_len:
+                state_pred_loss = state_pred_losses[loss_mask_without_last].mean()
+            else:
+                state_pred_loss = state_pred_losses.mean()
 
         # maybe autoregressive action loss
 
