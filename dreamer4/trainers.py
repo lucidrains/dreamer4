@@ -274,7 +274,7 @@ class VideoTokenizerTrainer(Module):
                     num_rows = int(math.sqrt(batch))
                     num_keep = num_rows ** 2
                     combined_video = combined_video[:num_keep]
-                    
+
                     grid_video = rearrange(combined_video, '(row col) c f h w -> c f (row h) (col w)', row = num_rows)
                     gif_path = self.results_folder / f'sample-{self.step.item()}.gif'
 
