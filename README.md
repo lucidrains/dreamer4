@@ -101,13 +101,25 @@ actor_loss, critic_loss = world_model.learn_from_experience(experience)
 
 ```bibtex
 @misc{hafner2025trainingagentsinsidescalable,
-    title   = {Training Agents Inside of Scalable World Models}, 
+    title   = {Training Agents Inside of Scalable World Models},
     author  = {Danijar Hafner and Wilson Yan and Timothy Lillicrap},
     year    = {2025},
     eprint  = {2509.24527},
     archivePrefix = {arXiv},
     primaryClass = {cs.AI},
-    url     = {https://arxiv.org/abs/2509.24527}, 
+    url     = {https://arxiv.org/abs/2509.24527},
+}
+```
+
+````bibtex
+@misc{fang2026racrectifiedflowauto,
+    title   = {RAC: Rectified Flow Auto Coder},
+    author  = {Sen Fang and Yalin Feng and Yanxin Zhang and Dimitris N. Metaxas},
+    year    = {2026},
+    eprint  = {2603.05925},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.CV},
+    url     = {https://arxiv.org/abs/2603.05925},
 }
 ```
 

@@ -1,4 +1,5 @@
 from __future__ import annotations
+import math
 
 import torch
 from einops import rearrange
@@ -6,6 +7,12 @@ from torch import is_tensor, tensor
 from torch.nn import Module
 from torch.optim import AdamW
 from torch.utils.data import Dataset, TensorDataset, DataLoader
+
+import torchvision.transforms as T
+
+from pathlib import Path
+
+from tqdm import tqdm
 
 from accelerate import Accelerator
 
@@ -28,6 +35,27 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+def video_tensor_to_gif(
+    tensor,
+    path,
+    duration = 120,
+    loop = 0,
+    optimize = True
+):
+    tensor = tensor.clamp(0, 1)
+    images = [T.ToPILImage()(img) for img in tensor.unbind(dim = 1)]
+
+    first_img, *rest_imgs = images
+
+    first_img.save(
+        path,
+        save_all = True,
+        append_images = rest_imgs,
+        duration = duration,
+        loop = loop,
+        optimize = optimize
+    )
+
 def cycle(dl):
     while True:
         for batch in dl:
@@ -45,6 +73,7 @@ class VideoTokenizerTrainer(Module):
         learning_rate = 3e-4,
         max_grad_norm = None,
         num_train_steps = 10_000,
+        grad_accum_every = 1,
         weight_decay = 0.,
         accelerate_kwargs: dict = dict(),
         optim_kwargs: dict = dict(),
@@ -75,7 +104,14 @@ class VideoTokenizerTrainer(Module):
 
             self.fps = video_fps
             self.log_video_every = log_video_every
-            self.video_logger = self.accelerator.get_tracker("tensorboard").writer.add_video
+
+            self.results_folder = None
+            if exists(log_dir):
+                self.results_folder = Path(log_dir) / 'results'
+                self.results_folder.mkdir(parents = True, exist_ok = True)
+
+            if use_tensorboard_logger:
+                self.video_logger = self.accelerator.get_tracker("tensorboard").writer.add_video
 
             # Modern python versions have deprecated "\d" which moviepy 1.0.3 uses
             # We can mute those warnings here
@@ -110,6 +146,7 @@ class VideoTokenizerTrainer(Module):
         self.max_grad_norm = max_grad_norm
 
         self.num_train_steps = num_train_steps
+        self.grad_accum_every = grad_accum_every
         self.batch_size = batch_size
 
         self.register_buffer('step', tensor(0))
@@ -128,6 +165,10 @@ class VideoTokenizerTrainer(Module):
     def device(self):
         return self.accelerator.device
 
+    @property
+    def is_main_process(self):
+        return self.accelerator.is_main_process
+
     def print(self, *args, **kwargs):
         return self.accelerator.print(*args, **kwargs)
 
@@ -135,28 +176,45 @@ class VideoTokenizerTrainer(Module):
         self.accelerator.log(data, step = self.step.item())
 
     def log_video(self, video, tag: str):
-        self.video_logger(
-            tag,
-            rearrange(video, 'b c t h w -> b t c h w'),
-            self.step.item(),
-            self.fps
-        )
+        if hasattr(self, 'video_logger'):
+            self.video_logger(
+                tag,
+                rearrange(video, 'b c t h w -> b t c h w'),
+                self.step.item(),
+                self.fps
+            )
 
     def forward(
         self
     ):
         iter_train_dl = cycle(self.train_dataloader)
 
-        for _ in range(self.num_train_steps):
-            video = next(iter_train_dl)
+        if self.is_main_process and self.log_video_flag:
+            msg = "saving logs to tensorboard" if hasattr(self, 'video_logger') else "saving logs"
+            if exists(self.results_folder):
+                msg += f" and video samples to {self.results_folder}"
+            self.print(msg)
 
-            loss, (losses, recon_video) = self.model(
-                video,
-                update_loss_ema = True,
-                return_intermediates = True
-            )
+        pbar = tqdm(range(self.num_train_steps), disable = not self.is_main_process)
 
-            self.accelerator.backward(loss)
+        for _ in pbar:
+
+            total_loss = 0.
+
+            for _ in range(self.grad_accum_every):
+                video = next(iter_train_dl)
+
+                loss, (losses, recon_video) = self.model(
+                    video,
+                    update_loss_ema = True,
+                    return_intermediates = True
+                )
+
+                loss = loss / self.grad_accum_every
+
+                self.accelerator.backward(loss)
+
+                total_loss += loss.item()
 
             if exists(self.max_grad_norm):
                 self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
@@ -175,6 +233,21 @@ class VideoTokenizerTrainer(Module):
             if self.log_video_flag and (self.step % self.log_video_every == 0):
                 self.log_video(video, "original_video")
                 self.log_video(recon_video, "reconstructed_video")
+
+                if exists(self.results_folder) and self.is_main_process:
+                    combined_video = torch.cat((video, recon_video), dim = -1)
+                    batch = combined_video.shape[0]
+                    num_rows = int(math.sqrt(batch))
+
+                    grid_video = rearrange(combined_video, '(row col) c f h w -> c f (row h) (col w)', row = num_rows)
+                    gif_path = self.results_folder / f'sample-{self.step.item()}.gif'
+
+                    video_tensor_to_gif(
+                        grid_video.cpu(),
+                        str(gif_path)
+                    )
+
+            pbar.set_postfix(loss = f"{total_loss:.4f}")
 
             self.step += 1
 
@@ -263,6 +336,10 @@ class BehaviorCloneTrainer(Module):
     def print(self, *args, **kwargs):
         return self.accelerator.print(*args, **kwargs)
 
+    @property
+    def is_main_process(self):
+        return self.accelerator.is_main_process
+
     def log(self, **data):
         self.accelerator.log(data, step = self.step.item())
 
@@ -271,7 +348,9 @@ class BehaviorCloneTrainer(Module):
     ):
         iter_train_dl = cycle(self.train_dataloader)
 
-        for _ in range(self.num_train_steps):
+        pbar = tqdm(range(self.num_train_steps), disable = not self.is_main_process)
+
+        for _ in pbar:
             batch_data = next(iter_train_dl)
 
             # just assume raw video dynamics training if batch_data is a tensor
@@ -291,6 +370,7 @@ class BehaviorCloneTrainer(Module):
             self.optim.zero_grad()
 
             self.log(loss = loss.item())
+            pbar.set_postfix(loss = f"{loss.item():.4f}")
 
             self.step += 1
 
@@ -369,6 +449,10 @@ class DreamTrainer(Module):
     def unwrapped_model(self):
         return self.accelerator.unwrap_model(self.model)
 
+    @property
+    def is_main_process(self):
+        return self.accelerator.is_main_process
+
     def print(self, *args, **kwargs):
         return self.accelerator.print(*args, **kwargs)
 
@@ -378,9 +462,9 @@ class DreamTrainer(Module):
     def forward(
         self
     ):
+        pbar = tqdm(range(self.num_train_steps), disable = not self.is_main_process)
 
-        for _ in range(self.num_train_steps):
-
+        for _ in pbar:
             dreams = self.unwrapped_model.generate(
                 self.generate_timesteps + 1, # plus one for bootstrap value
                 batch_size = self.batch_size,
@@ -398,7 +482,7 @@ class DreamTrainer(Module):
             self.accelerator.backward(policy_head_loss)
 
             if exists(self.max_grad_norm):
-                self.accelerator.clip_grad_norm_(self.model.policy_head_parameters()(), self.max_grad_norm)
+                self.accelerator.clip_grad_norm_(self.model.policy_head_parameters(), self.max_grad_norm)
 
             self.policy_head_optim.step()
             self.policy_head_optim.zero_grad()
@@ -416,6 +500,11 @@ class DreamTrainer(Module):
             self.log(
                 policy_head_loss = policy_head_loss.item(),
                 value_head_loss = value_head_loss.item()
+            )
+
+            pbar.set_postfix(
+                policy_loss = f"{policy_head_loss.item():.4f}",
+                value_loss = f"{value_head_loss.item():.4f}"
             )
 
             self.step += 1
@@ -495,6 +584,10 @@ class SimTrainer(Module):
     @property
     def unwrapped_model(self):
         return self.accelerator.unwrap_model(self.model)
+
+    @property
+    def is_main_process(self):
+        return self.accelerator.is_main_process
 
     def log(self, **data):
         self.accelerator.log(data, step = self.step.item())
@@ -622,7 +715,7 @@ class SimTrainer(Module):
                 self.accelerator.backward(policy_head_loss)
 
                 if exists(self.max_grad_norm):
-                    self.accelerator.clip_grad_norm_(self.model.policy_head_parameters()(), self.max_grad_norm)
+                    self.accelerator.clip_grad_norm_(self.model.policy_head_parameters(), self.max_grad_norm)
 
                 self.policy_head_optim.step()
                 self.policy_head_optim.zero_grad()
@@ -648,9 +741,9 @@ class SimTrainer(Module):
         max_experiences_before_learn = 8,
         env_is_vectorized = False
     ):
+        pbar = tqdm(range(num_episodes), disable = not self.is_main_process)
 
-        for _ in range(num_episodes):
-
+        for _ in pbar:
             total_experience = 0
             experiences = []
 

@@ -1518,7 +1518,7 @@ class AxialSpaceTimeTransformer(Module):
 
         # attend functions for space and time
 
-        has_kv_cache = exists(kv_cache) 
+        has_kv_cache = exists(kv_cache)
         use_flex = exists(flex_attention) and tokens.is_cuda and not has_kv_cache # KV cache shape breaks flex attention TODO: Fix
 
         attend_kwargs = dict(use_flex = use_flex, softclamp_value = self.attn_softclamp_value, special_attend_only_itself = self.special_attend_only_itself, device = device)
@@ -3030,7 +3030,7 @@ class DynamicsWorldModel(Module):
 
                 signal_levels_val = min(step * step_size, self.max_steps - 1)
                 signal_levels = full((batch_size, 1), signal_levels_val, dtype = torch.long, device = self.device)
- 
+
                 # noising past latent context
 
                 noised_context = latents.lerp(past_latents_context_noise, context_signal_noise) # the paragraph after eq (8)
@@ -3877,7 +3877,7 @@ class DynamicsWorldModel(Module):
         total_loss = (
             flow_loss * self.latent_flow_loss_weight +
             (reward_loss * self.reward_loss_weight).sum() +
-            (discrete_action_loss * self.discrete_action_loss_weight).sum() + 
+            (discrete_action_loss * self.discrete_action_loss_weight).sum() +
             (continuous_action_loss * self.continuous_action_loss_weight).sum() +
             (state_pred_loss * self.state_pred_loss_weight)
         )

@@ -908,4 +908,3 @@ def test_interact_with_env_dict_obs(vectorized):
     assert exists(experience)
     assert experience.proprio.shape[-1] == 21
     assert experience.proprio.shape[1] > 0
-
