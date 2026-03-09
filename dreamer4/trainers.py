@@ -285,19 +285,19 @@ class VideoTokenizerTrainer(Module):
 
             # display active losses in pbar
             postfix_kwargs = dict(loss = f"{total_loss:.4f}")
-            
+
             recon_loss = losses.recon.item()
             if recon_loss > 0.:
                 postfix_kwargs['recon'] = f"{recon_loss:.4f}"
-                
+
             lpips_loss = losses.lpips.item()
             if lpips_loss > 0.:
                 postfix_kwargs['lpips'] = f"{lpips_loss:.4f}"
-                
+
             time_decorr_loss = losses.time_decorr.item()
             if time_decorr_loss > 0.:
                 postfix_kwargs['time_decorr'] = f"{time_decorr_loss:.4f}"
-                
+
             space_decorr_loss = losses.space_decorr.item()
             if space_decorr_loss > 0.:
                 postfix_kwargs['space_decorr'] = f"{space_decorr_loss:.4f}"
