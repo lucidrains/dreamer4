@@ -45,7 +45,7 @@ def test_e2e(
         attn_dim_head = 16,
         num_latent_tokens = 4,
         num_residual_streams = num_residual_streams,
-        encoder_add_decor_aux_loss = True,
+        encoder_add_decorr_aux_loss = True,
         decorr_sample_frac = 1.
     )
 
@@ -849,7 +849,7 @@ def test_images_to_video_tokenizer():
         patch_size = 32,
         image_height = 256,
         image_width = 256,
-        encoder_add_decor_aux_loss = True
+        encoder_add_decorr_aux_loss = True
     )
 
     images = torch.randn(2, 3, 256, 256)

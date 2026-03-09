@@ -117,7 +117,12 @@ def main(
     log_video_every = 50,
     log_dir = './logs_mnist_tokenizer',
     checkpoint_every = 5000,
-    checkpoint_folder = './checkpoints_mnist_tokenizer'
+    checkpoint_folder = './checkpoints_mnist_tokenizer',
+    time_decorr_loss_weight = 4e-3,
+    space_decorr_loss_weight = 4e-3,
+    use_loss_normalization = False,
+    encoder_add_decorr_aux_loss = True,
+    lpips_loss_weight = 0.
 ):
     import shutil
 
@@ -148,8 +153,11 @@ def main(
         decoder_depth = decoder_depth,
         attn_dim_head = attn_dim_head,
         attn_heads = attn_heads,
-        encoder_add_decor_aux_loss = True,
-        lpips_loss_weight = 0., # disable lpips
+        encoder_add_decorr_aux_loss = encoder_add_decorr_aux_loss,
+        time_decorr_loss_weight = time_decorr_loss_weight,
+        space_decorr_loss_weight = space_decorr_loss_weight,
+        use_loss_normalization = use_loss_normalization,
+        lpips_loss_weight = lpips_loss_weight,
     )
 
     # trainer

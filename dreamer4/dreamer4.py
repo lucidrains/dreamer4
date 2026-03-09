@@ -1673,8 +1673,9 @@ class VideoTokenizer(Module):
         per_image_patch_mask_prob = (0., 0.9), # probability of patch masking appears to be per image probabilities drawn uniformly between 0. and 0.9 - if you are a phd student and think i'm mistakened, please open an issue
         lpips_loss_network: Module | None = None,
         lpips_loss_weight = 0.2,
-        encoder_add_decor_aux_loss = False,
-        decor_auxx_loss_weight = 0.1,
+        encoder_add_decorr_aux_loss = False,
+        time_decorr_loss_weight = 4e-3,
+        space_decorr_loss_weight = 4e-3,
         decorr_sample_frac = 0.25,
         num_residual_streams = 1,
         use_loss_normalization = True
@@ -1773,12 +1774,13 @@ class VideoTokenizer(Module):
             self.lpips = LPIPSLoss(lpips_loss_network)
 
         # decorr aux loss
-        # https://arxiv.org/abs/2510.14657
+        # https://arxiv.org/abs/2510.14657        # decorr aux loss
 
-        self.encoder_add_decor_aux_loss = encoder_add_decor_aux_loss
-        self.decorr_aux_loss_weight = decor_auxx_loss_weight
+        self.encoder_add_decorr_aux_loss = encoder_add_decorr_aux_loss
+        self.time_decorr_loss_weight = time_decorr_loss_weight
+        self.space_decorr_loss_weight = space_decorr_loss_weight
 
-        self.decorr_loss = DecorrelationLoss(decorr_sample_frac, soft_validate_num_sampled = True) if encoder_add_decor_aux_loss else None
+        self.decorr_loss = DecorrelationLoss(decorr_sample_frac, soft_validate_num_sampled = True) if encoder_add_decorr_aux_loss else None
 
         # loss normalizer
 
@@ -1787,8 +1789,8 @@ class VideoTokenizer(Module):
         if use_loss_normalization:
             self.recon_loss_normalizer = LossNormalizer()
             self.lpips_loss_normalizer = LossNormalizer() if self.has_lpips_loss else None
-            self.time_decorr_loss_normalizer = LossNormalizer() if encoder_add_decor_aux_loss else None
-            self.space_decorr_loss_normalizer = LossNormalizer() if encoder_add_decor_aux_loss else None
+            self.time_decorr_loss_normalizer = LossNormalizer() if encoder_add_decorr_aux_loss else None
+            self.space_decorr_loss_normalizer = LossNormalizer() if encoder_add_decorr_aux_loss else None
 
     @property
     def device(self):
@@ -1940,7 +1942,7 @@ class VideoTokenizer(Module):
 
         time_decorr_loss = space_decorr_loss = self.zero
 
-        if self.encoder_add_decor_aux_loss:
+        if self.encoder_add_decorr_aux_loss:
             if exists(time_attn_normed_inputs):
                 time_decorr_loss = self.decorr_loss(time_attn_normed_inputs)
 
@@ -1955,7 +1957,7 @@ class VideoTokenizer(Module):
             if self.has_lpips_loss:
                 lpips_loss = self.lpips_loss_normalizer(lpips_loss, update_ema = update_loss_ema)
 
-            if self.encoder_add_decor_aux_loss:
+            if self.encoder_add_decorr_aux_loss:
                 time_decorr_loss = self.time_decorr_loss_normalizer(time_decorr_loss, update_ema = update_loss_ema)
                 space_decorr_loss = self.space_decorr_loss_normalizer(space_decorr_loss, update_ema = update_loss_ema)
 
@@ -1964,8 +1966,8 @@ class VideoTokenizer(Module):
         total_loss = (
             recon_loss +
             lpips_loss * self.lpips_loss_weight +
-            time_decorr_loss * self.decorr_aux_loss_weight +
-            space_decorr_loss * self.decorr_aux_loss_weight
+            time_decorr_loss * self.time_decorr_loss_weight +
+            space_decorr_loss * self.space_decorr_loss_weight
         )
 
         if not return_intermediates:
