@@ -112,6 +112,8 @@ def main(
     decoder_depth = 4,
     attn_dim_head = 32,
     attn_heads = 8,
+    use_ema = True,
+    ema_decay = 0.99,
     log_video_every = 50,
     log_dir = './logs_mnist_tokenizer'
 ):
@@ -163,6 +165,8 @@ def main(
         log_video = True,
         video_fps = 4,
         log_video_every = log_video_every,
+        use_ema = use_ema,
+        ema_decay = ema_decay,
     )
 
     trainer()

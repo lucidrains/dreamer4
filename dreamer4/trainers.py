@@ -35,6 +35,9 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+def divisible_by(num, den):
+    return (num % den) == 0
+
 def video_tensor_to_gif(
     tensor,
     path,
@@ -78,6 +81,8 @@ class VideoTokenizerTrainer(Module):
         accelerate_kwargs: dict = dict(),
         optim_kwargs: dict = dict(),
         cpu = False,
+        use_ema = False,
+        ema_decay = 0.999,
         use_tensorboard_logger = False,
         log_dir: str | None = None,
         project_name = 'dreamer4',
@@ -121,6 +126,9 @@ class VideoTokenizerTrainer(Module):
         self.log_video_flag = log_video
 
         self.model = model
+        self.use_ema = use_ema
+        self.ema_decay = ema_decay
+
         self.dataset = dataset
         self.train_dataloader = DataLoader(dataset, batch_size = batch_size, drop_last = True, shuffle = True)
 
@@ -151,6 +159,13 @@ class VideoTokenizerTrainer(Module):
 
         self.register_buffer('step', tensor(0))
 
+        self.ema_model = None
+        if self.use_ema and self.accelerator.is_main_process:
+            self.ema_model = EMA(
+                self.model,
+                beta = self.ema_decay
+            )
+
         (
             self.model,
             self.train_dataloader,
@@ -160,6 +175,9 @@ class VideoTokenizerTrainer(Module):
             self.train_dataloader,
             self.optim
         )
+
+        if exists(self.ema_model):
+            self.ema_model.to(self.device)
 
     @property
     def device(self):
@@ -222,19 +240,29 @@ class VideoTokenizerTrainer(Module):
             self.optim.step()
             self.optim.zero_grad()
 
+            if self.use_ema and self.is_main_process:
+                self.ema_model.update()
+
             self.log(
-                loss = loss.item(),
+                loss = total_loss,
                 recon_loss = losses.recon.item(),
                 lpips_loss = losses.lpips.item(),
                 time_decorr_loss = losses.time_decorr.item(),
                 space_decorr_loss = losses.space_decorr.item()
             )
 
-            if self.log_video_flag and (self.step % self.log_video_every == 0):
+            if self.log_video_flag and divisible_by(self.step.item(), self.log_video_every) and self.is_main_process:
+
+                if self.use_ema:
+                    self.ema_model.eval()
+                    with torch.no_grad():
+                        _, (_, recon_video) = self.ema_model(video, return_intermediates = True)
+
+                recon_video = recon_video.clamp(0., 1.)
                 self.log_video(video, "original_video")
                 self.log_video(recon_video, "reconstructed_video")
 
-                if exists(self.results_folder) and self.is_main_process:
+                if exists(self.results_folder):
                     combined_video = torch.cat((video, recon_video), dim = -1)
                     batch = combined_video.shape[0]
                     num_rows = int(math.sqrt(batch))
