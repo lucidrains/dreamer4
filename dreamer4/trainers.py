@@ -89,6 +89,8 @@ class VideoTokenizerTrainer(Module):
         log_video = False,
         video_fps = -1,
         log_video_every = 1000,
+        checkpoint_every = 2500,
+        checkpoint_folder = './checkpoints_tokenizer'
     ):
         super().__init__()
         batch_size = min(batch_size, len(dataset))
@@ -124,6 +126,9 @@ class VideoTokenizerTrainer(Module):
             warnings.filterwarnings("ignore", category=SyntaxWarning, module="moviepy")
 
         self.log_video_flag = log_video
+        self.checkpoint_every = checkpoint_every
+        self.checkpoint_folder = Path(checkpoint_folder)
+        self.checkpoint_folder.mkdir(parents = True, exist_ok = True)
 
         self.model = model
         self.use_ema = use_ema
@@ -265,8 +270,11 @@ class VideoTokenizerTrainer(Module):
                 if exists(self.results_folder):
                     combined_video = torch.cat((video, recon_video), dim = -1)
                     batch = combined_video.shape[0]
-                    num_rows = int(math.sqrt(batch))
 
+                    num_rows = int(math.sqrt(batch))
+                    num_keep = num_rows ** 2
+                    combined_video = combined_video[:num_keep]
+                    
                     grid_video = rearrange(combined_video, '(row col) c f h w -> c f (row h) (col w)', row = num_rows)
                     gif_path = self.results_folder / f'sample-{self.step.item()}.gif'
 
@@ -278,6 +286,16 @@ class VideoTokenizerTrainer(Module):
             pbar.set_postfix(loss = f"{total_loss:.4f}")
 
             self.step += 1
+
+            self.accelerator.wait_for_everyone()
+
+            if self.is_main_process and divisible_by(self.step.item(), self.checkpoint_every):
+                ckpt_path = self.checkpoint_folder / f'tokenizer-{self.step.item()}.pt'
+
+                model = self.accelerator.unwrap_model(self.model)
+                model.save(str(ckpt_path))
+
+                self.print(f"checkpoint saved to {ckpt_path}")
 
         self.accelerator.end_training()
 

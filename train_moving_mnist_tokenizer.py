@@ -100,8 +100,8 @@ from dreamer4.trainers import VideoTokenizerTrainer
 def main(
     num_frames = 10,
     num_train_steps = 100_000,
-    batch_size = 8,
-    grad_accum_every = 4,
+    batch_size = 32,
+    grad_accum_every = 1,
     min_velocity = -2,
     max_velocity = 3,
     lr = 3e-4,
@@ -115,7 +115,9 @@ def main(
     use_ema = True,
     ema_decay = 0.99,
     log_video_every = 50,
-    log_dir = './logs_mnist_tokenizer'
+    log_dir = './logs_mnist_tokenizer',
+    checkpoint_every = 5000,
+    checkpoint_folder = './checkpoints_mnist_tokenizer'
 ):
     import shutil
 
@@ -167,6 +169,8 @@ def main(
         log_video_every = log_video_every,
         use_ema = use_ema,
         ema_decay = ema_decay,
+        checkpoint_every = checkpoint_every,
+        checkpoint_folder = checkpoint_folder,
     )
 
     trainer()

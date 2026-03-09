@@ -44,6 +44,7 @@ from torch_einops_utils import (
     safe_stack,
     safe_cat
 )
+from torch_einops_utils.save_load import save_load
 
 # ein related
 
@@ -1649,6 +1650,7 @@ class AxialSpaceTimeTransformer(Module):
 
 # video tokenizer
 
+@save_load
 class VideoTokenizer(Module):
     def __init__(
         self,
