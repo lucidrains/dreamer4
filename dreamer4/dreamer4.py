@@ -3020,11 +3020,16 @@ class DynamicsWorldModel(Module):
 
             # denoising steps
 
-            for step in range(num_steps + int(take_extra_step)):
+            num_iterations = num_steps + int(take_extra_step)
 
-                is_last_step = (step + 1) == num_steps
+            for step in range(num_iterations):
 
-                signal_levels = full((batch_size, 1), step * step_size, dtype = torch.long, device = self.device)
+                is_last_step = (step + 1) == num_iterations
+
+                # clamp signal levels to max_steps - 1 for the extra clean step
+
+                signal_levels_val = min(step * step_size, self.max_steps - 1)
+                signal_levels = full((batch_size, 1), signal_levels_val, dtype = torch.long, device = self.device)
  
                 # noising past latent context
 
@@ -3068,8 +3073,6 @@ class DynamicsWorldModel(Module):
 
                 if take_extra_step and is_last_step:
                     break
-
-                # maybe proprio
 
                 # maybe proprio
 
