@@ -3848,7 +3848,6 @@ class DynamicsWorldModel(Module):
             loss_weight = self.loss_weight_fn(times)
             loss_weight, _ = align_dims_left((loss_weight, flow_losses))
 
-            shortcut_flow_losses = shortcut_flow_losses * loss_weight
             flow_losses = flow_losses * loss_weight
 
         # handle variable lengths if needed

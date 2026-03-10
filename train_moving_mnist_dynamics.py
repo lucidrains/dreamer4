@@ -32,7 +32,8 @@ def main(
     tokenizer_checkpoint_path: str,
     num_frames = 10,
     num_train_steps = 100_000,
-    batch_size = 32,
+    batch_size = 64,
+    grad_accum_every = 1,
     lr = 3e-4,
     dim = 512,
     depth = 6,
@@ -46,7 +47,7 @@ def main(
     checkpoint_folder = './checkpoints_mnist_dynamics',
     use_loss_normalization = False,
     multi_token_pred_len = 1,
-    grad_accum_every = 2
+    shortcut_loss_weight = 5e-2
 ):
     import shutil
 
@@ -80,6 +81,7 @@ def main(
         attn_heads = attn_heads,
         use_loss_normalization = use_loss_normalization,
         multi_token_pred_len = multi_token_pred_len,
+        shortcut_loss_weight = shortcut_loss_weight,
     )
 
     # initialize trainer
