@@ -313,6 +313,11 @@ class VideoTokenizerTrainer(Module):
 
                 model = self.accelerator.unwrap_model(self.model)
                 model.save(str(ckpt_path))
+                
+                if self.use_ema:
+                    ema_ckpt_path = self.checkpoint_folder / f'tokenizer-{self.step.item()}-ema.pt'
+                    ema_model = self.accelerator.unwrap_model(self.ema_model.ema_model)
+                    ema_model.save(str(ema_ckpt_path))
 
                 self.print(f"checkpoint saved to {ckpt_path}")
 
