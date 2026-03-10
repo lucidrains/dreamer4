@@ -92,7 +92,7 @@ VideoTokenizerIntermediates = namedtuple('VideoTokenizerIntermediates', ('losses
 
 TokenizerLosses = namedtuple('TokenizerLosses', ('recon', 'lpips', 'time_decorr', 'space_decorr'))
 
-WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'rewards', 'discrete_actions', 'continuous_actions', 'state_pred'))
+WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'shortcut', 'rewards', 'discrete_actions', 'continuous_actions', 'state_pred'))
 
 AttentionIntermediates = namedtuple('AttentionIntermediates', ('next_kv_cache', 'normed_inputs'))
 
@@ -802,7 +802,7 @@ class ActionEmbedder(Module):
         continuous_log_probs = None
         continuous_entropies = None
 
-        if exists(continuous_targets):
+        if exists(continuous_targets) and exists(continuous_action_mean_log_var):
             if not exists(pred_head_index) and self.num_unembed_preds > 1:
                 # if multiple heads and no index, broadcast targets to mtp dim
                 if continuous_targets.ndim == (continuous_action_mean_log_var.ndim - 1):
@@ -2081,7 +2081,7 @@ class DynamicsWorldModel(Module):
         ff_kwargs: dict = dict(),
         use_time_rnn = True,
         loss_weight_fn: Callable = ramp_weight,
-        prob_no_shortcut_train = None,              # probability of no shortcut training, defaults to 1 / num_step_sizes
+        prob_shortcut_train = None,                  # probability of shortcut training, defaults to 1 - 1 / num_step_sizes
         add_reward_embed_to_agent_token = False,
         add_reward_embed_dropout = 0.1,
         add_state_pred_head = False,
@@ -2095,6 +2095,7 @@ class DynamicsWorldModel(Module):
         value_head_mlp_depth = 3,
         policy_head_mlp_depth = 3,
         latent_flow_loss_weight = 1.,
+        shortcut_loss_weight = 1.,
         reward_loss_weight: float | list[float] = 1.,
         discrete_action_loss_weight: float | list[float] = 1.,
         continuous_action_loss_weight: float | list[float] = 1.,
@@ -2211,7 +2212,7 @@ class DynamicsWorldModel(Module):
         self.signal_levels_embed = nn.Embedding(max_steps, dim_half)
         self.step_size_embed = nn.Embedding(self.num_step_sizes_log2, dim_half) # power of 2, so 1/1, 1/2, 1/4, 1/8 ... 1/Kmax
 
-        self.prob_no_shortcut_train = default(prob_no_shortcut_train, self.num_step_sizes_log2 ** -1.)
+        self.prob_shortcut_train = default(prob_shortcut_train, 1. - self.num_step_sizes_log2 ** -1.)
 
         # loss related
 
@@ -2363,11 +2364,13 @@ class DynamicsWorldModel(Module):
         # loss related
 
         self.flow_loss_normalizer = LossNormalizer() if use_loss_normalization else None
+        self.shortcut_flow_loss_normalizer = LossNormalizer() if use_loss_normalization else None
         self.reward_loss_normalizer = LossNormalizer(multi_token_pred_len) if use_loss_normalization else None
         self.discrete_actions_loss_normalizer = LossNormalizer(multi_token_pred_len) if (exists(num_discrete_actions) and use_loss_normalization) else None
         self.continuous_actions_loss_normalizer = LossNormalizer(multi_token_pred_len) if (exists(num_continuous_actions) and use_loss_normalization) else None
 
         self.latent_flow_loss_weight = latent_flow_loss_weight
+        self.shortcut_loss_weight = shortcut_loss_weight
 
         self.register_buffer('reward_loss_weight', tensor(reward_loss_weight))
         self.register_buffer('discrete_action_loss_weight', tensor(discrete_action_loss_weight))
@@ -3479,7 +3482,6 @@ class DynamicsWorldModel(Module):
         assert not (exists(signal_levels) ^ exists(step_sizes_log2))
 
         is_inference = exists(signal_levels)
-        no_shortcut_train = not is_inference
 
         return_pred_only = return_pred_only or latent_is_noised
 
@@ -3488,15 +3490,9 @@ class DynamicsWorldModel(Module):
 
         if not is_inference:
 
-            no_shortcut_train = sample_prob(self.prob_no_shortcut_train)
+            shortcut_train = sample_prob(self.prob_shortcut_train)
 
-            if no_shortcut_train:
-                # if no shortcut training, step sizes are just 1 and noising is all steps, where each step is 1 / d_min
-                # in original shortcut paper, they actually set d = 0 for some reason, look into that later, as there is no mention in the dreamer paper of doing this
-
-                step_sizes_log2 = zeros((batch,), device = device).long() # zero because zero is equivalent to step size of 1
-                signal_levels = randint(0, self.max_steps, (batch, time), device = device)
-            else:
+            if shortcut_train:
 
                 # now we follow eq (4)
 
@@ -3504,6 +3500,9 @@ class DynamicsWorldModel(Module):
                 num_step_sizes = 2 ** step_sizes_log2
 
                 signal_levels = randint(0, self.max_steps, (batch, time), device = device) // num_step_sizes[:, None] * num_step_sizes[:, None] # times are discretized to step sizes
+            else:
+                step_sizes_log2 = torch.zeros((batch,), device = device).long() # zero because zero is equivalent to step size of 1
+                signal_levels = randint(0, self.max_steps, (batch, time), device = device)
 
         # times is from 0 to 1
 
@@ -3640,16 +3639,6 @@ class DynamicsWorldModel(Module):
 
             space_tokens, inverse_pack_space_per_latent = pack_one(space_tokens, 'b t * d')
 
-            num_spatial_tokens = space_tokens.shape[-2]
-
-            # action tokens
-
-            num_action_tokens = 1 if not is_empty(action_tokens) else 0
-
-            # reward tokens
-
-            num_reward_tokens = 1 if not is_empty(reward_tokens) else 0
-
             # pack to tokens
             # [signal + step size embed] [latent space tokens] [register] [actions / agent]
 
@@ -3768,30 +3757,39 @@ class DynamicsWorldModel(Module):
 
         wrapped_get_prediction = maybe_pack_unpack(_get_prediction)
 
-        # determine the target for the loss
-
-        pred_target = None
+        # determine the targets for the standard and shortcut losses
 
         is_x_space = self.pred_orig_latent
         is_v_space_pred = not self.pred_orig_latent
 
-        maybe_shortcut_loss_weight = 1.
+        # flow loss prep
 
-        if no_shortcut_train:
-
-            # allow for original velocity pred
-            # x-space as in paper is in else clause
-
-            if is_v_space_pred:
-                pred_target = flow = data - noise
-            else:
-                pred_target = data
+        if is_v_space_pred:
+            pred_target = data - noise
+            pred = packed_pred
         else:
-            # shortcut training - Frans et al. https://arxiv.org/abs/2410.12557
+            pred_target = data
+            pred = packed_pred
 
-            # basically a consistency loss where you ensure quantity of two half steps equals one step
-            # dreamer then makes it works for x-space with some math
+        # flow loss
 
+        flow_loss_weight = 1.
+
+        if is_x_space:
+            flow_loss_weight = (1. - times) ** 2
+
+        flow_losses = F.mse_loss(pred, pred_target, reduction = 'none')
+
+        if is_tensor(flow_loss_weight):
+            flow_loss_weight, _ = align_dims_left((flow_loss_weight, flow_losses))
+
+        flow_losses = flow_losses * flow_loss_weight
+
+        # shortcut loss
+
+        should_compute_shortcut = not is_inference and shortcut_train
+
+        if should_compute_shortcut:
             step_sizes_log2_minus_one = step_sizes_log2 - 1 # which equals d / 2
             half_step_size = 2 ** step_sizes_log2_minus_one
 
@@ -3825,19 +3823,24 @@ class DynamicsWorldModel(Module):
 
             # pred target is sg(b' + b'') / 2
 
-            pred_target = (first_step_pred_flow + second_step_pred_flow).detach() / 2
+            shortcut_pred_target = (first_step_pred_flow + second_step_pred_flow).detach() / 2
+            shortcut_pred = packed_pred
 
-            # need to convert x-space to v-space
+            # shortcut loss
+
+            shortcut_loss_weight = 1.
 
             if is_x_space:
-                packed_pred = (packed_pred - noised) / (1. - first_times)
-                maybe_shortcut_loss_weight = (1. - first_times) ** 2
+                shortcut_pred = (shortcut_pred - noised) / (1. - first_times)
+                shortcut_loss_weight = (1. - first_times) ** 2
 
-        # mse loss
+            if is_tensor(shortcut_loss_weight):
+                shortcut_loss_weight, _ = align_dims_left((shortcut_loss_weight, shortcut_pred_target))
 
-        flow_losses = F.mse_loss(packed_pred, pred_target, reduction = 'none')
-
-        flow_losses = flow_losses * maybe_shortcut_loss_weight # handle the (1-t)^2 in eq(7)
+            shortcut_flow_losses = F.mse_loss(shortcut_pred, shortcut_pred_target, reduction = 'none')
+            shortcut_flow_losses = shortcut_flow_losses * shortcut_loss_weight
+        else:
+            shortcut_flow_losses = torch.zeros_like(flow_losses)
 
         # loss weighting with their ramp function
 
@@ -3845,6 +3848,7 @@ class DynamicsWorldModel(Module):
             loss_weight = self.loss_weight_fn(times)
             loss_weight, _ = align_dims_left((loss_weight, flow_losses))
 
+            shortcut_flow_losses = shortcut_flow_losses * loss_weight
             flow_losses = flow_losses * loss_weight
 
         # handle variable lengths if needed
@@ -3857,9 +3861,11 @@ class DynamicsWorldModel(Module):
             loss_mask_without_last = loss_mask[:, :-1]
 
             flow_loss = flow_losses[loss_mask].mean()
+            shortcut_flow_loss = shortcut_flow_losses[loss_mask].mean() if should_compute_shortcut else self.zero
 
         else:
             flow_loss = flow_losses.mean()
+            shortcut_flow_loss = shortcut_flow_losses.mean() if should_compute_shortcut else self.zero
 
         # now take care of the agent token losses
 
@@ -3977,10 +3983,13 @@ class DynamicsWorldModel(Module):
 
         # handle loss normalization
 
-        losses = WorldModelLosses(flow_loss, reward_loss, discrete_action_loss, continuous_action_loss, state_pred_loss)
+        losses = WorldModelLosses(flow_loss, shortcut_flow_loss, reward_loss, discrete_action_loss, continuous_action_loss, state_pred_loss)
 
         if exists(self.flow_loss_normalizer):
             flow_loss = self.flow_loss_normalizer(flow_loss, update_ema = update_loss_ema)
+
+        if exists(self.shortcut_flow_loss_normalizer):
+            shortcut_flow_loss = self.shortcut_flow_loss_normalizer(shortcut_flow_loss, update_ema = update_loss_ema)
 
         if exists(rewards) and exists(self.reward_loss_normalizer):
             reward_loss = self.reward_loss_normalizer(reward_loss, update_ema = update_loss_ema)
@@ -3995,6 +4004,7 @@ class DynamicsWorldModel(Module):
 
         total_loss = (
             flow_loss * self.latent_flow_loss_weight +
+            shortcut_flow_loss * self.shortcut_loss_weight +
             (reward_loss * self.reward_loss_weight).sum() +
             (discrete_action_loss * self.discrete_action_loss_weight).sum() +
             (continuous_action_loss * self.continuous_action_loss_weight).sum() +

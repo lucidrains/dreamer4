@@ -1,5 +1,6 @@
 from __future__ import annotations
 import math
+from collections import OrderedDict
 
 import torch
 from torch import is_tensor, tensor
@@ -404,7 +405,8 @@ class BehaviorCloneTrainer(Module):
         sample_time_steps = 16,
         sample_batch_size = 25,
         use_ema = False,
-        ema_decay = 0.999
+        ema_decay = 0.999,
+        grad_accum_every = 1
     ):
         super().__init__()
         batch_size = min(batch_size, len(dataset))
@@ -423,6 +425,8 @@ class BehaviorCloneTrainer(Module):
         self.model = model
         self.dataset = dataset
         self.train_dataloader = DataLoader(dataset, batch_size = batch_size, drop_last = True, shuffle = True)
+
+        self.grad_accum_every = grad_accum_every
 
         optim_kwargs = dict(
             lr = learning_rate,
@@ -632,14 +636,31 @@ class BehaviorCloneTrainer(Module):
         )
 
         for _ in pbar:
-            batch_data = next(iter_train_dl)
+            total_loss = 0.
+            total_flow_loss = 0.
+            total_shortcut_loss = 0.
+            total_reward_loss = 0.
+            total_discrete_action_loss = 0.
+            total_continuous_action_loss = 0.
 
-            if is_tensor(batch_data):
-                loss = self.model(video = batch_data)
-            else:
-                loss = self.model(**batch_data)
+            for _ in range(self.grad_accum_every):
+                batch_data = next(iter_train_dl)
 
-            self.accelerator.backward(loss)
+                if is_tensor(batch_data):
+                    batch_data = dict(video = batch_data)
+
+                loss, losses = self.model(**batch_data, return_all_losses = True)
+
+                loss = loss / self.grad_accum_every
+
+                self.accelerator.backward(loss)
+
+                total_loss += loss.item()
+                total_flow_loss += (losses.flow.item() / self.grad_accum_every)
+                total_shortcut_loss += (losses.shortcut.item() / self.grad_accum_every)
+                total_reward_loss += (losses.rewards.sum().item() / self.grad_accum_every)
+                total_discrete_action_loss += (losses.discrete_actions.sum().item() / self.grad_accum_every)
+                total_continuous_action_loss += (losses.continuous_actions.sum().item() / self.grad_accum_every)
 
             if exists(self.max_grad_norm):
                 self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
@@ -650,8 +671,27 @@ class BehaviorCloneTrainer(Module):
             if self.use_ema and self.is_main_process:
                 self.ema_model.update()
 
-            self.log(loss = loss.item())
-            pbar.set_postfix(loss = f"{loss.item():.4f}")
+            self.log(
+                total_loss = total_loss,
+                flow_loss = total_flow_loss,
+                shortcut_loss = total_shortcut_loss,
+                reward_loss = total_reward_loss,
+                discrete_action_loss = total_discrete_action_loss,
+                continuous_action_loss = total_continuous_action_loss,
+            )
+
+            postfix = OrderedDict(total = f"{total_loss:.4f}")
+
+            if total_flow_loss > 0.:
+                postfix['flow'] = f"{total_flow_loss:.4f}"
+
+            if total_shortcut_loss > 0.:
+                postfix['shortcut'] = f"{total_shortcut_loss:.4f}"
+
+            if total_reward_loss > 0.:
+                postfix['reward'] = f"{total_reward_loss:.4f}"
+
+            pbar.set_postfix(ordered_dict = postfix)
 
             self.step += 1
 

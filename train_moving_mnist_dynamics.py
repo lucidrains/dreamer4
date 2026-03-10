@@ -45,7 +45,8 @@ def main(
     checkpoint_every = 5000,
     checkpoint_folder = './checkpoints_mnist_dynamics',
     use_loss_normalization = False,
-    multi_token_pred_len = 1
+    multi_token_pred_len = 1,
+    grad_accum_every = 2
 ):
     import shutil
 
@@ -97,6 +98,7 @@ def main(
         use_ema = use_ema,
         use_tensorboard_logger = True,
         log_video = True,
+        grad_accum_every = grad_accum_every,
     )
 
     # Train dynamics model

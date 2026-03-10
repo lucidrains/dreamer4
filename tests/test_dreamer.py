@@ -8,7 +8,7 @@ def exists(v):
 @param('pred_orig_latent', (False, True))
 @param('grouped_query_attn', (False, True))
 @param('dynamics_with_video_input', (False, True))
-@param('prob_no_shortcut_train', (None, 0., 1.))
+@param('prob_shortcut_train', (None, 1., 0.))
 @param('add_task_embeds', (False, True))
 @param('num_spatial_tokens', (2, 8))
 @param('signal_and_step_passed_in', (False, True))
@@ -22,7 +22,7 @@ def test_e2e(
     pred_orig_latent,
     grouped_query_attn,
     dynamics_with_video_input,
-    prob_no_shortcut_train,
+    prob_shortcut_train,
     add_task_embeds,
     num_spatial_tokens,
     signal_and_step_passed_in,
@@ -78,7 +78,7 @@ def test_e2e(
         attn_kwargs = dict(
             query_heads = query_heads,
         ),
-        prob_no_shortcut_train = prob_no_shortcut_train,
+        prob_shortcut_train = prob_shortcut_train,
         add_reward_embed_to_agent_token = add_reward_embed_to_agent_token,
         add_state_pred_head = add_state_pred_head,
         num_residual_streams = num_residual_streams,
@@ -583,7 +583,7 @@ def test_bc_trainer(
         pred_orig_latent = True,
         num_discrete_actions = 4,
         attn_dim_head = 16,
-        prob_no_shortcut_train = 0.1,
+        prob_shortcut_train = 0.9,
         num_residual_streams = 1
     )
 
@@ -612,7 +612,7 @@ def test_dream_trainer():
         pred_orig_latent = True,
         num_discrete_actions = 4,
         attn_dim_head = 16,
-        prob_no_shortcut_train = 0.1,
+        prob_shortcut_train = 0.9,
         num_residual_streams = 1
     )
 
@@ -644,7 +644,7 @@ def test_cache_generate():
         pred_orig_latent = True,
         num_discrete_actions = 4,
         attn_dim_head = 16,
-        prob_no_shortcut_train = 0.1,
+        prob_shortcut_train = 0.9,
         num_residual_streams = 1
     )
 
@@ -692,7 +692,7 @@ def test_online_rl(
         pred_orig_latent = True,
         num_discrete_actions = 4,
         attn_dim_head = 16,
-        prob_no_shortcut_train = 0.1,
+        prob_shortcut_train = 0.9,
         num_residual_streams = 1
     )
 
