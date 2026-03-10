@@ -100,6 +100,7 @@ from dreamer4.trainers import VideoTokenizerTrainer
 def main(
     num_frames = 10,
     num_train_steps = 100_000,
+    num_latents = 16,
     batch_size = 32,
     grad_accum_every = 1,
     min_velocity = -2,
@@ -122,6 +123,8 @@ def main(
     space_decorr_loss_weight = 4e-3,
     use_loss_normalization = False,
     encoder_add_decorr_aux_loss = True,
+    use_causal_conv3d = True,
+    causal_conv3d_kernel_size = 3,
     lpips_loss_weight = 0.
 ):
     import shutil
@@ -148,6 +151,7 @@ def main(
         dim = dim,
         dim_latent = dim_latent,
         patch_size = patch_size,
+        num_latent_tokens = num_latents,
         channels = 3,
         encoder_depth = encoder_depth,
         decoder_depth = decoder_depth,
@@ -157,6 +161,8 @@ def main(
         time_decorr_loss_weight = time_decorr_loss_weight,
         space_decorr_loss_weight = space_decorr_loss_weight,
         use_loss_normalization = use_loss_normalization,
+        use_causal_conv3d = use_causal_conv3d,
+        causal_conv3d_kernel_size = causal_conv3d_kernel_size,
         lpips_loss_weight = lpips_loss_weight,
     )
 

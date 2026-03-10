@@ -42,7 +42,8 @@ from torch_einops_utils import (
     lens_to_mask,
     masked_mean,
     safe_stack,
-    safe_cat
+    safe_cat,
+    slice_right_at_dim
 )
 from torch_einops_utils.save_load import save_load
 
@@ -210,6 +211,9 @@ def ensure_tuple(t):
 
 def divisible_by(num, den):
     return (num % den) == 0
+
+def is_odd(n):
+    return not divisible_by(n, 2)
 
 def sample_prob(prob):
     return random() < prob
@@ -1648,6 +1652,45 @@ class AxialSpaceTimeTransformer(Module):
 
         return out, intermediates
 
+class CausalDepthwiseConv3d(Module):
+    def __init__(
+        self,
+        dim,
+        kernel_size = 3
+    ):
+        super().__init__()
+        assert is_odd(kernel_size), 'kernel size must be odd'
+        self.kernel_size = kernel_size
+        self.causal_pad = kernel_size - 1
+        self.padding = kernel_size // 2
+
+        self.norm = RMSNorm(dim)
+
+        self.conv = nn.Conv3d(
+            dim, dim,
+            kernel_size = kernel_size,
+            padding = (0, self.padding, self.padding),
+            groups = dim
+        )
+
+    def forward(
+        self,
+        x # (b, t, h, w, c)
+    ):
+        res = x
+
+        x = self.norm(x)
+        x = rearrange(x, 'b t h w c -> b c t h w')
+
+        # causal pad
+        x = pad_at_dim(x, (self.causal_pad, 0), dim = 2)
+
+        x = self.conv(x)
+
+        x = rearrange(x, 'b c t h w -> b t h w c')
+        
+        return x + res
+
 # video tokenizer
 
 @save_load
@@ -1678,15 +1721,15 @@ class VideoTokenizer(Module):
         space_decorr_loss_weight = 4e-3,
         decorr_sample_frac = 0.25,
         num_residual_streams = 1,
-        use_loss_normalization = True
+        use_loss_normalization = True,
+        use_causal_conv3d = False,
+        causal_conv3d_kernel_size = 3
     ):
         super().__init__()
 
         self.patch_size = patch_size
-
-        # special tokens
-
-        assert num_latent_tokens >= 1
+        self.channels = channels
+        self.dim = dim
         self.num_latent_tokens = num_latent_tokens
         self.latent_tokens = Parameter(randn(num_latent_tokens, dim) * 1e-2)
 
@@ -1712,6 +1755,14 @@ class VideoTokenizer(Module):
             Linear(dim, dim_patch),
             Rearrange('b t h w (p1 p2 c) -> b c t (h p1) (w p2)', p1 = patch_size, p2 = patch_size),
         )
+
+        # optional causal depthwise 3d convs
+
+        self.use_causal_conv3d = use_causal_conv3d
+
+        if use_causal_conv3d:
+            self.encoder_causal_conv3d = CausalDepthwiseConv3d(dim, kernel_size = causal_conv3d_kernel_size)
+            self.decoder_causal_conv3d = CausalDepthwiseConv3d(dim, kernel_size = causal_conv3d_kernel_size)
 
         # encoder space / time transformer
 
@@ -1853,7 +1904,10 @@ class VideoTokenizer(Module):
 
         tokens, latent_tokens = unpack(tokens, packed_latent_shape, 'b t * d')
 
-        # project back to patches
+        # project to patches
+
+        if self.use_causal_conv3d:
+            tokens = self.decoder_causal_conv3d(tokens)
 
         recon_video = self.tokens_to_patch(tokens)
 
@@ -1887,6 +1941,9 @@ class VideoTokenizer(Module):
         # to tokens
 
         tokens = self.patch_to_tokens(video)
+
+        if self.use_causal_conv3d:
+            tokens = self.encoder_causal_conv3d(tokens)
 
         # get some dimensions
 
