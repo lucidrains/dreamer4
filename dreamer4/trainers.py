@@ -71,6 +71,8 @@ class VideoTokenizerTrainer(Module):
         self,
         model: VideoTokenizer,
         dataset: Dataset,
+        *,
+        checkpoint_path: str | None = None,
         optim_klass = MuonAdamAtan2,
         batch_size = 16,
         learning_rate = 3e-4,
@@ -133,6 +135,7 @@ class VideoTokenizerTrainer(Module):
         self.model = model
         self.use_ema = use_ema
         self.ema_decay = ema_decay
+        self.checkpoint_path = checkpoint_path
 
         self.dataset = dataset
         self.train_dataloader = DataLoader(dataset, batch_size = batch_size, drop_last = True, shuffle = True)
@@ -171,6 +174,9 @@ class VideoTokenizerTrainer(Module):
                 beta = self.ema_decay
             )
 
+        if exists(self.checkpoint_path):
+            self.load(self.checkpoint_path)
+
         (
             self.model,
             self.train_dataloader,
@@ -192,6 +198,10 @@ class VideoTokenizerTrainer(Module):
     def is_main_process(self):
         return self.accelerator.is_main_process
 
+    @property
+    def unwrap_model(self):
+        return self.accelerator.unwrap_model
+
     def print(self, *args, **kwargs):
         return self.accelerator.print(*args, **kwargs)
 
@@ -207,6 +217,33 @@ class VideoTokenizerTrainer(Module):
                 self.fps
             )
 
+    def load(self, path):
+        path = Path(path)
+        assert path.exists(), f"checkpoint not found at {path}"
+
+        pkg = torch.load(str(path), map_location = 'cpu', weights_only = True)
+
+        if 'step' in pkg:
+            self.step.copy_(tensor(pkg['step']))
+
+        self.unwrap_model(self.model).load_state_dict(pkg.get('model', pkg), strict = False)
+
+        # load ema model if active
+        if not self.is_main_process or not self.use_ema or not exists(self.ema_model):
+            return
+
+        ema_model = self.ema_model.ema_model
+
+        ema_path = path.parent / f"{path.stem}-ema.pt"
+
+        if not ema_path.exists():
+            self.print(f"warning: ema model checkpoint not found at {ema_path}, loading from main model")
+            ema_model.load_state_dict(pkg.get('model', pkg), strict = False)
+            return
+
+        ema_pkg = torch.load(str(ema_path), map_location = 'cpu', weights_only = True)
+        ema_model.load_state_dict(ema_pkg.get('model', ema_pkg), strict = False)
+
     def forward(
         self
     ):
@@ -218,7 +255,12 @@ class VideoTokenizerTrainer(Module):
                 msg += f" and video samples to {self.results_folder}"
             self.print(msg)
 
-        pbar = tqdm(range(self.num_train_steps), disable = not self.is_main_process)
+        pbar = tqdm(
+            range(self.step.item(), self.num_train_steps),
+            initial = self.step.item(),
+            total = self.num_train_steps,
+            disable = not self.is_main_process
+        )
 
         for _ in pbar:
 
@@ -311,13 +353,29 @@ class VideoTokenizerTrainer(Module):
             if self.is_main_process and divisible_by(self.step.item(), self.checkpoint_every):
                 ckpt_path = self.checkpoint_folder / f'tokenizer-{self.step.item()}.pt'
 
-                model = self.accelerator.unwrap_model(self.model)
-                model.save(str(ckpt_path))
+                model = self.unwrap_model(self.model)
+                config = getattr(model, '_config', None)
+                
+                import pickle
+                from torch_einops_utils.save_load import dehydrate_config
+                pkg = dict(
+                    model = model.state_dict(),
+                    config = pickle.dumps(dehydrate_config(config, '_config')) if config else None,
+                    step = self.step.item()
+                )
+                torch.save(pkg, str(ckpt_path))
                 
                 if self.use_ema:
                     ema_ckpt_path = self.checkpoint_folder / f'tokenizer-{self.step.item()}-ema.pt'
-                    ema_model = self.accelerator.unwrap_model(self.ema_model.ema_model)
-                    ema_model.save(str(ema_ckpt_path))
+                    ema_model = self.ema_model.ema_model
+                    
+                    ema_config = getattr(ema_model, '_config', None)
+                    ema_pkg = dict(
+                        model = ema_model.state_dict(),
+                        config = pickle.dumps(dehydrate_config(ema_config, '_config')) if ema_config else None,
+                        step = self.step.item()
+                    )
+                    torch.save(ema_pkg, str(ema_ckpt_path))
 
                 self.print(f"checkpoint saved to {ckpt_path}")
 

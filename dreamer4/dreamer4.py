@@ -1825,7 +1825,7 @@ class VideoTokenizer(Module):
             self.lpips = LPIPSLoss(lpips_loss_network)
 
         # decorr aux loss
-        # https://arxiv.org/abs/2510.14657        # decorr aux loss
+        # https://arxiv.org/abs/2510.14657
 
         self.encoder_add_decorr_aux_loss = encoder_add_decorr_aux_loss
         self.time_decorr_loss_weight = time_decorr_loss_weight

@@ -99,6 +99,7 @@ from dreamer4.trainers import VideoTokenizerTrainer
 
 def main(
     num_frames = 10,
+    checkpoint_path = None,
     num_train_steps = 100_000,
     num_latents = 16,
     batch_size = 32,
@@ -171,6 +172,7 @@ def main(
     trainer = VideoTokenizerTrainer(
         model = tokenizer,
         dataset = dataset,
+        checkpoint_path = checkpoint_path,
         optim_klass = torch.optim.AdamW,
         batch_size = batch_size,
         grad_accum_every = grad_accum_every,
@@ -186,6 +188,9 @@ def main(
         checkpoint_every = checkpoint_every,
         checkpoint_folder = checkpoint_folder,
     )
+
+    if exists(checkpoint_path):
+        trainer.load(checkpoint_path)
 
     trainer()
 
