@@ -44,6 +44,8 @@ def main(
     log_dir = './logs_mnist_dynamics',
     checkpoint_every = 5000,
     checkpoint_folder = './checkpoints_mnist_dynamics',
+    use_loss_normalization = False,
+    multi_token_pred_len = 1
 ):
     import shutil
 
@@ -75,6 +77,8 @@ def main(
         depth = depth,
         attn_dim_head = attn_dim_head,
         attn_heads = attn_heads,
+        use_loss_normalization = use_loss_normalization,
+        multi_token_pred_len = multi_token_pred_len,
     )
 
     # initialize trainer
@@ -85,14 +89,14 @@ def main(
         batch_size = batch_size,
         learning_rate = lr,
         num_train_steps = num_train_steps,
-        use_tensorboard_logger = True,
         log_dir = log_dir,
-        log_video = True,
         video_fps = video_fps,
         log_video_every = log_video_every,
         checkpoint_every = checkpoint_every,
         checkpoint_folder = checkpoint_folder,
-        use_ema = use_ema
+        use_ema = use_ema,
+        use_tensorboard_logger = True,
+        log_video = True,
     )
 
     # Train dynamics model

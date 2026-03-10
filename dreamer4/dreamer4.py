@@ -2112,7 +2112,8 @@ class DynamicsWorldModel(Module):
         normalize_advantages = None,
         value_clip = 0.4,
         policy_entropy_weight = .01,
-        gae_use_accelerated = False
+        gae_use_accelerated = False,
+        use_loss_normalization = True
     ):
         super().__init__()
 
@@ -2125,6 +2126,10 @@ class DynamicsWorldModel(Module):
             assert video_tokenizer.num_latent_tokens == num_latent_tokens, f'`num_latent_tokens` must be the same for the tokenizer and dynamics model'
 
         assert exists(num_latent_tokens), '`num_latent_tokens` must be set'
+
+        # loss normalization
+
+        self.use_loss_normalization = use_loss_normalization
 
         # spatial
 
@@ -2357,10 +2362,10 @@ class DynamicsWorldModel(Module):
 
         # loss related
 
-        self.flow_loss_normalizer = LossNormalizer()
-        self.reward_loss_normalizer = LossNormalizer(multi_token_pred_len)
-        self.discrete_actions_loss_normalizer = LossNormalizer(multi_token_pred_len) if exists(num_discrete_actions) else None
-        self.continuous_actions_loss_normalizer = LossNormalizer(multi_token_pred_len) if exists(num_continuous_actions) else None
+        self.flow_loss_normalizer = LossNormalizer() if use_loss_normalization else None
+        self.reward_loss_normalizer = LossNormalizer(multi_token_pred_len) if use_loss_normalization else None
+        self.discrete_actions_loss_normalizer = LossNormalizer(multi_token_pred_len) if (exists(num_discrete_actions) and use_loss_normalization) else None
+        self.continuous_actions_loss_normalizer = LossNormalizer(multi_token_pred_len) if (exists(num_continuous_actions) and use_loss_normalization) else None
 
         self.latent_flow_loss_weight = latent_flow_loss_weight
 
