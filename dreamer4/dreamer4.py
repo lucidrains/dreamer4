@@ -78,6 +78,8 @@ flex_attention = None
 try:
     from torch.nn.attention.flex_attention import flex_attention, create_block_mask
     if torch.cuda.is_available():
+        import torch._dynamo
+        torch._dynamo.config.cache_size_limit = 256
         flex_attention = torch.compile(flex_attention)
 except ImportError:
     pass
@@ -1144,6 +1146,15 @@ def compose_mask(mask1, mask2):
 
     return inner
 
+def eval_decorator(fn):
+    def inner(self, *args, **kwargs):
+        was_training = self.training
+        self.eval()
+        out = fn(self, *args, **kwargs)
+        self.train(was_training)
+        return out
+    return inner
+
 def block_mask_noop(b, h, q, k):
     return b >= 0
 
@@ -1730,6 +1741,7 @@ class VideoTokenizer(Module):
         self.patch_size = patch_size
         self.channels = channels
         self.dim = dim
+        self.dim_latent = dim_latent
         self.num_latent_tokens = num_latent_tokens
         self.latent_tokens = Parameter(randn(num_latent_tokens, dim) * 1e-2)
 
@@ -2164,6 +2176,8 @@ class DynamicsWorldModel(Module):
 
         # proprioception
 
+        dim_proprio = dim_proprio if dim_proprio else None
+
         self.has_proprio = exists(dim_proprio)
         self.dim_proprio = dim_proprio
 
@@ -2345,8 +2359,8 @@ class DynamicsWorldModel(Module):
 
         self.flow_loss_normalizer = LossNormalizer()
         self.reward_loss_normalizer = LossNormalizer(multi_token_pred_len)
-        self.discrete_actions_loss_normalizer = LossNormalizer(multi_token_pred_len) if num_discrete_actions > 0 else None
-        self.continuous_actions_loss_normalizer = LossNormalizer(multi_token_pred_len) if num_continuous_actions > 0 else None
+        self.discrete_actions_loss_normalizer = LossNormalizer(multi_token_pred_len) if exists(num_discrete_actions) else None
+        self.continuous_actions_loss_normalizer = LossNormalizer(multi_token_pred_len) if exists(num_continuous_actions) else None
 
         self.latent_flow_loss_weight = latent_flow_loss_weight
 
@@ -2977,7 +2991,13 @@ class DynamicsWorldModel(Module):
         return_for_policy_optimization = False,
         return_time_cache = False,
         store_agent_embed = True,
-        store_old_action_unembeds = True
+        store_old_action_unembeds = True,
+        prompt: Tensor | None = None, # (b c t h w) or (b c h w)
+        prompt_latents: Tensor | None = None, # (b t v n d)
+        prompt_proprio: Tensor | None = None,
+        prompt_discrete_actions: Tensor | None = None,
+        prompt_continuous_actions: Tensor | None = None,
+        prompt_rewards: Tensor | None = None
 
     ): # (b t n d) | (b c t h w)
 
@@ -3012,17 +3032,40 @@ class DynamicsWorldModel(Module):
 
         step_size = self.max_steps // num_steps
 
+        # handle prompt or prompt_latents
+
+        assert not (exists(prompt) and exists(prompt_latents)), 'cannot pass in both prompt video and prompt latents'
+
+        if exists(prompt):
+            if prompt.ndim == 4:
+                prompt = rearrange(prompt, 'b c h w -> b c 1 h w')
+            
+            tokenizer = self.video_tokenizer
+            if prompt.shape[1] != tokenizer.channels:
+                prompt = repeat(prompt, 'b 1 t h w -> b c t h w', c = tokenizer.channels)
+
+            prompt_latents = tokenizer.tokenize(prompt)
+            assert self.num_video_views == 1, 'num video views > 1 not supported yet for auto-deriving prompt latents'
+            prompt_latents = rearrange(prompt_latents, 'b t n d -> b t 1 n d')
+
         # denoising
         # teacher forcing to start with
 
-        latents = empty((batch_size, 0, self.num_video_views, *latent_shape), device = self.device)
+        if exists(prompt_latents):
+            assert prompt_latents.shape[0] == batch_size
+            latents = prompt_latents.clone()
+        else:
+            latents = empty((batch_size, 0, self.num_video_views, *latent_shape), device = self.device)
 
         past_latents_context_noise = latents.clone()
 
         # maybe internal state
 
         if has_proprio:
-            proprio = empty((batch_size, 0, self.dim_proprio), device = self.device)
+            if exists(prompt_proprio):
+                proprio = prompt_proprio.clone()
+            else:
+                proprio = empty((batch_size, 0, self.dim_proprio), device = self.device)
 
             past_proprio_context_noise = proprio.clone()
 
@@ -3030,8 +3073,15 @@ class DynamicsWorldModel(Module):
 
         return_agent_actions |= return_log_probs_and_values
 
-        decoded_discrete_actions = None
-        decoded_continuous_actions = None
+        if return_agent_actions:
+            num_discrete_action_types = self.action_embedder.num_discrete_action_types
+            decoded_discrete_actions = prompt_discrete_actions.clone() if exists(prompt_discrete_actions) else empty((batch_size, 0, num_discrete_action_types), device = self.device, dtype = torch.long)
+
+            num_continuous_action_types = self.action_embedder.num_continuous_action_types
+            decoded_continuous_actions = prompt_continuous_actions.clone() if exists(prompt_continuous_actions) else empty((batch_size, 0, num_continuous_action_types), device = self.device, dtype = torch.float)
+        else:
+            decoded_discrete_actions = None
+            decoded_continuous_actions = None
 
         # policy optimization related
 
@@ -3051,7 +3101,10 @@ class DynamicsWorldModel(Module):
 
         decoded_rewards = None
         if return_rewards_per_frame:
-            decoded_rewards = empty((batch_size, 0), device = self.device, dtype = torch.float32)
+            if exists(prompt_rewards):
+                decoded_rewards = prompt_rewards.clone()
+            else:
+                decoded_rewards = empty((batch_size, 0), device = self.device, dtype = torch.float32)
 
         # while all the frames of the video (per latent) is not generated
 
@@ -3117,8 +3170,8 @@ class DynamicsWorldModel(Module):
                     rewards = decoded_rewards,
                     tasks = tasks,
                     latent_gene_ids = latent_gene_ids,
-                    discrete_actions = decoded_discrete_actions,
-                    continuous_actions = decoded_continuous_actions,
+                    discrete_actions = decoded_discrete_actions if exists(decoded_discrete_actions) and not is_empty(decoded_discrete_actions) else None,
+                    continuous_actions = decoded_continuous_actions if exists(decoded_continuous_actions) and not is_empty(decoded_continuous_actions) else None,
                     proprio = noised_proprio_with_context,
                     time_cache = time_cache,
                     latent_is_noised = True,
@@ -3445,7 +3498,7 @@ class DynamicsWorldModel(Module):
                 step_sizes_log2 = randint(1, self.num_step_sizes_log2, (batch,), device = device)
                 num_step_sizes = 2 ** step_sizes_log2
 
-                signal_levels = randint(0, self.max_steps, (batch, time)) // num_step_sizes[:, None] * num_step_sizes[:, None] # times are discretized to step sizes
+                signal_levels = randint(0, self.max_steps, (batch, time), device = device) // num_step_sizes[:, None] * num_step_sizes[:, None] # times are discretized to step sizes
 
         # times is from 0 to 1
 

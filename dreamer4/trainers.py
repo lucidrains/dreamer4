@@ -2,13 +2,14 @@ from __future__ import annotations
 import math
 
 import torch
-from einops import rearrange
 from torch import is_tensor, tensor
 from torch.nn import Module
 from torch.optim import AdamW
-from torch.utils.data import Dataset, TensorDataset, DataLoader
+from torch.utils.data import Dataset, DataLoader
 
 import torchvision.transforms as T
+
+from einops import rearrange, repeat
 
 from pathlib import Path
 
@@ -22,7 +23,8 @@ from dreamer4.dreamer4 import (
     VideoTokenizer,
     DynamicsWorldModel,
     Experience,
-    combine_experiences
+    combine_experiences,
+    eval_decorator
 )
 
 from ema_pytorch import EMA
@@ -58,6 +60,14 @@ def video_tensor_to_gif(
         loop = loop,
         optimize = optimize
     )
+
+def save_video_grid_as_gif(video, path):
+    batch = video.shape[0]
+    num_rows = int(math.sqrt(batch))
+    num_keep = num_rows ** 2
+    video = video[:num_keep]
+    grid = rearrange(video, '(row col) c f h w -> c f (row h) (col w)', row = num_rows)
+    video_tensor_to_gif(grid.cpu(), str(path))
 
 def cycle(dl):
     while True:
@@ -121,11 +131,6 @@ class VideoTokenizerTrainer(Module):
 
             if use_tensorboard_logger:
                 self.video_logger = self.accelerator.get_tracker("tensorboard").writer.add_video
-
-            # Modern python versions have deprecated "\d" which moviepy 1.0.3 uses
-            # We can mute those warnings here
-            import warnings
-            warnings.filterwarnings("ignore", category=SyntaxWarning, module="moviepy")
 
         self.log_video_flag = log_video
         self.checkpoint_every = checkpoint_every
@@ -209,7 +214,7 @@ class VideoTokenizerTrainer(Module):
         self.accelerator.log(data, step = self.step.item())
 
     def log_video(self, video, tag: str):
-        if hasattr(self, 'video_logger'):
+        if exists(self.video_logger):
             self.video_logger(
                 tag,
                 rearrange(video, 'b c t h w -> b t c h w'),
@@ -250,7 +255,7 @@ class VideoTokenizerTrainer(Module):
         iter_train_dl = cycle(self.train_dataloader)
 
         if self.is_main_process and self.log_video_flag:
-            msg = "saving logs to tensorboard" if hasattr(self, 'video_logger') else "saving logs"
+            msg = "saving logs to tensorboard" if exists(self.video_logger) else "saving logs"
             if exists(self.results_folder):
                 msg += f" and video samples to {self.results_folder}"
             self.print(msg)
@@ -311,19 +316,8 @@ class VideoTokenizerTrainer(Module):
 
                 if exists(self.results_folder):
                     combined_video = torch.cat((video, recon_video), dim = -1)
-                    batch = combined_video.shape[0]
-
-                    num_rows = int(math.sqrt(batch))
-                    num_keep = num_rows ** 2
-                    combined_video = combined_video[:num_keep]
-
-                    grid_video = rearrange(combined_video, '(row col) c f h w -> c f (row h) (col w)', row = num_rows)
                     gif_path = self.results_folder / f'sample-{self.step.item()}.gif'
-
-                    video_tensor_to_gif(
-                        grid_video.cpu(),
-                        str(gif_path)
-                    )
+                    save_video_grid_as_gif(combined_video, gif_path)
 
             # display active losses in pbar
             postfix_kwargs = dict(loss = f"{total_loss:.4f}")
@@ -401,7 +395,16 @@ class BehaviorCloneTrainer(Module):
         cpu = False,
         use_tensorboard_logger = False,
         log_dir: str | None = None,
-        project_name = 'dreamer4'
+        project_name = 'dreamer4',
+        log_video = True,
+        log_video_every = 100,
+        checkpoint_every = 5000,
+        checkpoint_folder = './checkpoints',
+        video_fps = -1,
+        sample_time_steps = 16,
+        sample_batch_size = 25,
+        use_ema = False,
+        ema_decay = 0.999
     ):
         super().__init__()
         batch_size = min(batch_size, len(dataset))
@@ -447,6 +450,42 @@ class BehaviorCloneTrainer(Module):
 
         self.register_buffer('step', tensor(0))
 
+        self.video_logger = None
+        self.results_folder = None
+
+        if log_video:
+            assert video_fps > 0, "Video fps must be passed in and positive when log_video=True"
+
+            self.fps = video_fps
+            self.log_video_every = log_video_every
+
+            self.results_folder = None
+            if exists(log_dir):
+                self.results_folder = Path(log_dir) / 'results'
+                self.results_folder.mkdir(parents = True, exist_ok = True)
+
+            if use_tensorboard_logger:
+                self.video_logger = self.accelerator.get_tracker("tensorboard").writer.add_video
+
+        self.log_video_flag = log_video
+        self.sample_time_steps = sample_time_steps
+        self.sample_batch_size = sample_batch_size
+
+        self.checkpoint_every = checkpoint_every
+        self.checkpoint_folder = Path(checkpoint_folder)
+        self.checkpoint_folder.mkdir(exist_ok = True, parents = True)
+
+        self.use_ema = use_ema
+        self.ema_decay = ema_decay
+
+        self.ema_model = None
+        if self.use_ema and self.accelerator.is_main_process:
+            from ema_pytorch import EMA
+            self.ema_model = EMA(
+                self.model,
+                beta = self.ema_decay
+            )
+
         (
             self.model,
             self.train_dataloader,
@@ -456,6 +495,9 @@ class BehaviorCloneTrainer(Module):
             self.train_dataloader,
             self.optim
         )
+
+        if exists(self.ema_model):
+            self.ema_model.to(self.device)
 
     @property
     def device(self):
@@ -468,24 +510,132 @@ class BehaviorCloneTrainer(Module):
     def is_main_process(self):
         return self.accelerator.is_main_process
 
+    @property
+    def unwrap_model(self):
+        return self.accelerator.unwrap_model
+
     def log(self, **data):
         self.accelerator.log(data, step = self.step.item())
+
+    def log_video(self, video, tag: str):
+        if exists(self.video_logger):
+            self.video_logger(
+                tag,
+                rearrange(video, 'b c t h w -> b t c h w'),
+                self.step.item(),
+                self.fps
+            )
+
+    def load(self, path):
+        path = Path(path)
+        assert path.exists(), f"checkpoint not found at {path}"
+
+        pkg = torch.load(str(path), map_location = 'cpu', weights_only = True)
+
+        if 'step' in pkg:
+            self.step.copy_(tensor(pkg['step']))
+
+        self.unwrap_model(self.model).load_state_dict(pkg.get('model', pkg), strict = False)
+
+        # load ema model if active
+        if not self.is_main_process or not self.use_ema or not exists(self.ema_model):
+            return
+
+        ema_model = self.ema_model.ema_model
+
+        ema_path = path.parent / f"{path.stem}-ema.pt"
+        if not ema_path.exists():
+            self.print(f"warning: ema model checkpoint not found at {ema_path}, loading from main model")
+            ema_model.load_state_dict(pkg.get('model', pkg), strict = False)
+            return
+
+        ema_pkg = torch.load(str(ema_path), map_location = 'cpu', weights_only = True)
+        ema_model.load_state_dict(ema_pkg.get('model', ema_pkg), strict = False)
+
+    def save_checkpoint(self):
+        import pickle
+        from torch_einops_utils.save_load import dehydrate_config
+
+        ckpt_path = self.checkpoint_folder / f'dynamics-{self.step.item()}.pt'
+
+        model = self.unwrap_model(self.model)
+        config = getattr(model, '_config', None)
+
+        pkg = dict(
+            model = model.state_dict(),
+            config = pickle.dumps(dehydrate_config(config, '_config')) if config else None,
+            step = self.step.item()
+        )
+        torch.save(pkg, str(ckpt_path))
+
+        if self.use_ema:
+            ema_ckpt_path = self.checkpoint_folder / f'dynamics-{self.step.item()}-ema.pt'
+            ema_model = self.ema_model.ema_model
+
+            ema_config = getattr(ema_model, '_config', None)
+            ema_pkg = dict(
+                model = ema_model.state_dict(),
+                config = pickle.dumps(dehydrate_config(ema_config, '_config')) if ema_config else None,
+                step = self.step.item()
+            )
+            torch.save(ema_pkg, str(ema_ckpt_path))
+
+        self.print(f"checkpoint saved to {ckpt_path}")
+
+    @eval_decorator
+    @torch.no_grad()
+    def sample(self, batch_data):
+        unwrapped = self.unwrap_model(self.model)
+        tokenizer = unwrapped.video_tokenizer
+
+        if is_tensor(batch_data):
+            prompt_video = batch_data[:self.sample_batch_size, :, :1]
+        else:
+            prompt_video = batch_data['video'][:self.sample_batch_size, :, :1]
+
+        image_size = prompt_video.shape[-1]
+
+        generated_video = unwrapped.generate(
+            prompt = prompt_video,
+            time_steps = self.sample_time_steps,
+            batch_size = self.sample_batch_size,
+            image_height = image_size,
+            image_width = image_size,
+            return_decoded_video = True
+        )
+
+        generated_video = generated_video.clamp(0., 1.)
+        self.log_video(generated_video, 'samples')
+
+        if exists(self.results_folder):
+            prompt_expanded = repeat(prompt_video, 'b c 1 h w -> b c t h w', t = generated_video.shape[2])
+            combined_video = torch.cat((prompt_expanded, generated_video), dim = -1)
+            gif_path = self.results_folder / f'sample-{self.step.item()}.gif'
+            save_video_grid_as_gif(combined_video, gif_path)
 
     def forward(
         self
     ):
         iter_train_dl = cycle(self.train_dataloader)
 
-        pbar = tqdm(range(self.num_train_steps), disable = not self.is_main_process)
+        if self.is_main_process and self.log_video_flag:
+            msg = "saving logs to tensorboard" if exists(self.video_logger) else "saving logs"
+            if exists(self.results_folder):
+                msg += f" and video samples to {self.results_folder}"
+            self.print(msg)
+
+        pbar = tqdm(
+            range(self.step.item(), self.num_train_steps),
+            initial = self.step.item(),
+            total = self.num_train_steps,
+            disable = not self.is_main_process
+        )
 
         for _ in pbar:
             batch_data = next(iter_train_dl)
 
-            # just assume raw video dynamics training if batch_data is a tensor
-            # else kwargs for video, actions, rewards
-
             if is_tensor(batch_data):
-                loss = self.model(batch_data)
+                loss = self.model(video = batch_data)
             else:
                 loss = self.model(**batch_data)
 
@@ -497,13 +647,23 @@ class BehaviorCloneTrainer(Module):
             self.optim.step()
             self.optim.zero_grad()
 
+            if self.use_ema and self.is_main_process:
+                self.ema_model.update()
+
             self.log(loss = loss.item())
             pbar.set_postfix(loss = f"{loss.item():.4f}")
 
             self.step += 1
 
-        self.accelerator.end_training()
+            self.accelerator.wait_for_everyone()
 
+            if self.is_main_process and self.log_video_flag and divisible_by(self.step.item(), self.log_video_every):
+                self.sample(batch_data)
+
+            if self.is_main_process and divisible_by(self.step.item(), self.checkpoint_every):
+                self.save_checkpoint()
+
+        self.accelerator.end_training()
         self.print('training complete')
 
 # training from dreams

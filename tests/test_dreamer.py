@@ -908,3 +908,105 @@ def test_interact_with_env_dict_obs(vectorized):
     assert exists(experience)
     assert experience.proprio.shape[-1] == 21
     assert experience.proprio.shape[1] > 0
+
+@param('prompt_type', ('video', 'image', 'latents'))
+@param('with_proprio', (False, True))
+@param('with_discrete_actions', (False, True))
+@param('with_continuous_actions', (False, True))
+@param('with_rewards', (False, True))
+def test_prompting_generation(
+    prompt_type,
+    with_proprio,
+    with_discrete_actions,
+    with_continuous_actions,
+    with_rewards
+):
+    from einops import rearrange
+    from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
+
+    tokenizer = VideoTokenizer(
+        512,
+        dim_latent = 32,
+        patch_size = 32,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        time_block_every = 1,
+        attn_heads = 2,
+        image_height = 256,
+        image_width = 256,
+    )
+
+    dynamics = DynamicsWorldModel(
+        512,
+        num_agents = 1,
+        video_tokenizer = tokenizer,
+        dim_latent = 32,
+        num_tasks = 1,
+        num_discrete_actions = (4, 4) if with_discrete_actions else 0,
+        num_continuous_actions = 2 if with_continuous_actions else 0,
+        dim_proprio = 21 if with_proprio else None,
+        depth = 1,
+        time_block_every = 1
+    )
+
+    # 1. generate the required prompt components
+
+    prompt_kwargs = dict()
+
+    if prompt_type == 'video':
+        prompt_kwargs['prompt'] = torch.randn(2, 3, 1, 256, 256)
+    elif prompt_type == 'image':
+        prompt_kwargs['prompt'] = torch.randn(2, 3, 256, 256)
+    elif prompt_type == 'latents':
+        raw_video = torch.randn(2, 3, 1, 256, 256)
+        latents = tokenizer.tokenize(raw_video)
+        prompt_kwargs['prompt_latents'] = rearrange(latents, 'b t n d -> b t 1 n d')
+
+    if with_proprio:
+        prompt_kwargs['prompt_proprio'] = torch.randn(2, 1, 21)
+
+    if with_discrete_actions:
+        prompt_kwargs['prompt_discrete_actions'] = torch.randint(0, 4, (2, 1, 2))
+
+    if with_continuous_actions:
+        prompt_kwargs['prompt_continuous_actions'] = torch.randn(2, 1, 2)
+
+    if with_rewards:
+        prompt_kwargs['prompt_rewards'] = torch.randn(2, 1)
+
+    # 2. execute generation
+
+    generations = dynamics.generate(
+        time_steps = 8,
+        batch_size = 2,
+        image_height = 256,
+        image_width = 256,
+        return_rewards_per_frame = with_rewards,
+        return_agent_actions = (with_discrete_actions or with_continuous_actions),
+        return_decoded_video = True,
+        **prompt_kwargs
+    )
+
+    has_extras = with_rewards or with_proprio or with_discrete_actions or with_continuous_actions
+
+    if has_extras:
+        video = generations.video
+    else:
+        video = generations
+
+    assert video.shape == (2, 3, 8, 256, 256)
+
+    if with_rewards:
+        assert generations.rewards.shape == (2, 8)
+
+    if with_proprio:
+        assert generations.proprio.shape == (2, 8, 21)
+
+    if with_discrete_actions or with_continuous_actions:
+        discrete_actions, continuous_actions = generations.actions
+
+        if with_discrete_actions:
+            assert discrete_actions.shape == (2, 8, 2)
+        
+        if with_continuous_actions:
+            assert continuous_actions.shape == (2, 8, 2)
