@@ -1007,6 +1007,6 @@ def test_prompting_generation(
 
         if with_discrete_actions:
             assert discrete_actions.shape == (2, 8, 2)
-        
+
         if with_continuous_actions:
             assert continuous_actions.shape == (2, 8, 2)

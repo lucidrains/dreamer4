@@ -1699,7 +1699,7 @@ class CausalDepthwiseConv3d(Module):
         x = self.conv(x)
 
         x = rearrange(x, 'b c t h w -> b t h w c')
-        
+
         return x + res
 
 # video tokenizer
@@ -3039,7 +3039,7 @@ class DynamicsWorldModel(Module):
         if exists(prompt):
             if prompt.ndim == 4:
                 prompt = rearrange(prompt, 'b c h w -> b c 1 h w')
-            
+
             tokenizer = self.video_tokenizer
             if prompt.shape[1] != tokenizer.channels:
                 prompt = repeat(prompt, 'b 1 t h w -> b c t h w', c = tokenizer.channels)

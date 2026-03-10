@@ -349,7 +349,7 @@ class VideoTokenizerTrainer(Module):
 
                 model = self.unwrap_model(self.model)
                 config = getattr(model, '_config', None)
-                
+
                 import pickle
                 from torch_einops_utils.save_load import dehydrate_config
                 pkg = dict(
@@ -358,11 +358,11 @@ class VideoTokenizerTrainer(Module):
                     step = self.step.item()
                 )
                 torch.save(pkg, str(ckpt_path))
-                
+
                 if self.use_ema:
                     ema_ckpt_path = self.checkpoint_folder / f'tokenizer-{self.step.item()}-ema.pt'
                     ema_model = self.ema_model.ema_model
-                    
+
                     ema_config = getattr(ema_model, '_config', None)
                     ema_pkg = dict(
                         model = ema_model.state_dict(),

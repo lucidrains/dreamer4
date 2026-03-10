@@ -62,7 +62,7 @@ def main(
     # Load frozen tokenizer
 
     assert Path(tokenizer_checkpoint_path).exists(), f"Tokenizer checkpoint missing at {tokenizer_checkpoint_path}"
-    
+
     tokenizer = VideoTokenizer.init_and_load(tokenizer_checkpoint_path)
     tokenizer.eval().requires_grad_(False)
 
