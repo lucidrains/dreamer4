@@ -31,11 +31,11 @@ class MovingMNISTDataset(Dataset):
     def __getitem__(self, idx):
         digit, _ = self.mnist[idx]
         digit = T.functional.to_tensor(digit)
-        
+
         if self.digit_size != 28:
             resizer = T.Resize((self.digit_size, self.digit_size), antialias=True)
             digit = resizer(digit)
-            
+
         digit = digit.squeeze(0)
 
         seq = torch.arange(self.num_frames)

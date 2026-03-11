@@ -65,8 +65,8 @@ def main(
     # instantiate the dataset
 
     dataset = MovingMNISTDataset(
-        num_frames = num_frames, 
-        image_size = image_size, 
+        num_frames = num_frames,
+        image_size = image_size,
         digit_size = digit_size
     )
 
@@ -77,7 +77,7 @@ def main(
     if checkpoint_path.is_dir():
         ema_checkpoints = list(checkpoint_path.glob('tokenizer-*-ema.pt'))
         assert len(ema_checkpoints) > 0, f"No EMA tokenizer checkpoints found in {tokenizer_checkpoint_path}"
-        
+
         # Sort by step number (e.g. tokenizer-15000-ema.pt -> 15000)
         get_step = lambda p: int(p.stem.split('-')[1])
         checkpoint_path = max(ema_checkpoints, key=get_step)

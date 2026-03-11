@@ -531,9 +531,11 @@ def test_tokenizer_trainer():
 
 @param('with_actions', (True, False))
 @param('with_rewards', (True, False))
+@param('self_flow', (True, False))
 def test_bc_trainer(
     with_actions,
-    with_rewards
+    with_rewards,
+    self_flow
 ):
     from dreamer4.trainers import BehaviorCloneTrainer
     from dreamer4.dreamer4 import DynamicsWorldModel, VideoTokenizer
@@ -577,7 +579,7 @@ def test_bc_trainer(
         max_steps = 64,
         num_tasks = 4,
         num_latent_tokens = 1,
-        depth = 1,
+        depth = 4,
         time_block_every = 1,
         num_spatial_tokens = 1,
         pred_orig_latent = True,
@@ -592,7 +594,12 @@ def test_bc_trainer(
         dataset = dataset,
         batch_size = 1,
         num_train_steps = 1,
-        cpu = True
+        log_video = False,
+        cpu = True,
+        self_flow = self_flow,
+        self_flow_student_layer = -3,
+        self_flow_teacher_layer = -1,
+        self_flow_loss_weight = 1.0
     )
 
     trainer()
@@ -606,7 +613,7 @@ def test_dream_trainer():
         max_steps = 64,
         num_tasks = 4,
         num_latent_tokens = 1,
-        depth = 1,
+        depth = 4,
         time_block_every = 1,
         num_spatial_tokens = 1,
         pred_orig_latent = True,
@@ -686,7 +693,7 @@ def test_online_rl(
         max_steps = 64,
         num_tasks = 4,
         num_latent_tokens = 1,
-        depth = 1,
+        depth = 4,
         time_block_every = 1,
         num_spatial_tokens = 1,
         pred_orig_latent = True,

@@ -111,7 +111,7 @@ actor_loss, critic_loss = world_model.learn_from_experience(experience)
 }
 ```
 
-````bibtex
+```bibtex
 @misc{fang2026racrectifiedflowauto,
     title   = {RAC: Rectified Flow Auto Coder},
     author  = {Sen Fang and Yalin Feng and Yanxin Zhang and Dimitris N. Metaxas},

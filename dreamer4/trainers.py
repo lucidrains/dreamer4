@@ -1,6 +1,7 @@
 from __future__ import annotations
 import math
 from collections import OrderedDict
+from random import randint
 
 import torch
 from torch import is_tensor, tensor
@@ -25,6 +26,7 @@ from dreamer4.dreamer4 import (
     VideoTokenizer,
     DynamicsWorldModel,
     Experience,
+    SelfFlow,
     combine_experiences,
     eval_decorator
 )
@@ -408,7 +410,11 @@ class BehaviorCloneTrainer(Module):
         sample_prompt_frames = 1,
         use_ema = False,
         ema_decay = 0.999,
-        grad_accum_every = 1
+        grad_accum_every = 1,
+        self_flow = False,
+        self_flow_student_layer = -3,
+        self_flow_teacher_layer = -1,
+        self_flow_loss_weight = 1.0
     ):
         super().__init__()
         batch_size = min(batch_size, len(dataset))
@@ -430,20 +436,47 @@ class BehaviorCloneTrainer(Module):
 
         self.grad_accum_every = grad_accum_every
 
+        # self-flow distillation
+
+        self.self_flow = self_flow
+        self.self_flow_loss_weight = self_flow_loss_weight
+
+        self.self_flow_module = None
+
+        if self_flow:
+            use_ema = True
+
+            self.self_flow_module = SelfFlow(
+                model = model,
+                student_layer = self_flow_student_layer,
+                teacher_layer = self_flow_teacher_layer
+            )
+
+        self.use_ema = use_ema
+        self.ema_decay = ema_decay
+
+        # optimizer
+
         optim_kwargs = dict(
             lr = learning_rate,
             weight_decay = weight_decay
         )
 
+        model_params = list(model.parameters())
+        muon_params = list(model.muon_parameters()) if hasattr(model, 'muon_parameters') else []
+
+        if exists(self.self_flow_module):
+            model_params.extend(self.self_flow_module.parameters())
+
         if optim_klass is MuonAdamAtan2:
             optim = MuonAdamAtan2(
-                model.muon_parameters(),
-                model.parameters(),
+                muon_params,
+                model_params,
                 **optim_kwargs
             )
         else:
             optim = optim_klass(
-                model.parameters(),
+                model_params,
                 **optim_kwargs
             )
 
@@ -482,26 +515,25 @@ class BehaviorCloneTrainer(Module):
         self.checkpoint_folder = Path(checkpoint_folder)
         self.checkpoint_folder.mkdir(exist_ok = True, parents = True)
 
-        self.use_ema = use_ema
-        self.ema_decay = ema_decay
-
         self.ema_model = None
+
         if self.use_ema and self.accelerator.is_main_process:
-            from ema_pytorch import EMA
             self.ema_model = EMA(
                 self.model,
                 beta = self.ema_decay
             )
 
-        (
-            self.model,
-            self.train_dataloader,
-            self.optim
-        ) = self.accelerator.prepare(
-            self.model,
-            self.train_dataloader,
-            self.optim
-        )
+        # prepare with accelerator
+
+        to_prepare = [self.model, self.train_dataloader, self.optim]
+
+        if exists(self.self_flow_module):
+            to_prepare.append(self.self_flow_module)
+
+        self.model, self.train_dataloader, self.optim, *rest = self.accelerator.prepare(*to_prepare)
+
+        if rest:
+            self.self_flow_module, = rest
 
         if exists(self.ema_model):
             self.ema_model.to(self.device)
@@ -593,7 +625,6 @@ class BehaviorCloneTrainer(Module):
     @torch.no_grad()
     def sample(self, batch_data):
         unwrapped = self.unwrap_model(self.model)
-        tokenizer = unwrapped.video_tokenizer
 
         if is_tensor(batch_data):
             prompt_video = batch_data[:self.sample_batch_size, :, :self.sample_prompt_frames]
@@ -619,10 +650,10 @@ class BehaviorCloneTrainer(Module):
         if exists(self.results_folder):
             # Prepend the prompt to the generated video
             generated_video = torch.cat((prompt_video, generated_video), dim=2)
-            
+
             gen_len = generated_video.shape[2]
             real_len = real_video.shape[2]
-            
+
             # pad generated or real video so they match in time length for concat
             if gen_len < real_len:
                 padding = torch.zeros(shape_with_replace(generated_video, {2: real_len - gen_len}), device=generated_video.device)
@@ -662,6 +693,7 @@ class BehaviorCloneTrainer(Module):
             total_reward_loss = 0.
             total_discrete_action_loss = 0.
             total_continuous_action_loss = 0.
+            total_self_flow_loss = 0.
 
             for _ in range(self.grad_accum_every):
                 batch_data = next(iter_train_dl)
@@ -669,9 +701,24 @@ class BehaviorCloneTrainer(Module):
                 if is_tensor(batch_data):
                     batch_data = dict(video = batch_data)
 
-                loss, losses = self.model(**batch_data, return_all_losses = True)
+                batch_data['return_intermediates'] = True
+
+                if self.self_flow:
+                    batch_data['seed'] = randint(0, int(1e7))
+
+                loss, losses, intermediates = self.model(**batch_data, return_all_losses = True)
 
                 loss = loss / self.grad_accum_every
+
+                if self.self_flow:
+                    with torch.no_grad():
+                        *_, teacher_intermediates = self.ema_model.ema_model(**batch_data)
+
+                    self_flow_loss = self.self_flow_module(intermediates, teacher_intermediates)
+                    self_flow_loss = self_flow_loss / self.grad_accum_every
+
+                    loss = loss + self_flow_loss * self.self_flow_loss_weight
+                    total_self_flow_loss += self_flow_loss.item()
 
                 self.accelerator.backward(loss)
 
@@ -691,7 +738,7 @@ class BehaviorCloneTrainer(Module):
             if self.use_ema and self.is_main_process:
                 self.ema_model.update()
 
-            self.log(
+            log_dict = dict(
                 total_loss = total_loss,
                 flow_loss = total_flow_loss,
                 shortcut_loss = total_shortcut_loss,
@@ -700,10 +747,18 @@ class BehaviorCloneTrainer(Module):
                 continuous_action_loss = total_continuous_action_loss,
             )
 
+            if self.self_flow:
+                log_dict.update(self_flow_loss = total_self_flow_loss)
+
+            self.log(**log_dict)
+
             postfix = OrderedDict(total = f"{total_loss:.4f}")
 
             if total_flow_loss > 0.:
                 postfix['flow'] = f"{total_flow_loss:.4f}"
+
+            if self.self_flow:
+                postfix['self_flow'] = f"{total_self_flow_loss:.4f}"
 
             if total_shortcut_loss > 0.:
                 last_shortcut_loss = total_shortcut_loss

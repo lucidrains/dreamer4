@@ -221,12 +221,50 @@ def is_odd(n):
     return not divisible_by(n, 2)
 
 def sample_prob(prob):
-    return random() < prob
+    return rand(1).item() < prob
 
 def is_power_two(num):
     return log2(num).is_integer()
 
 # tensor helpers
+
+def with_seed(seed):
+    def decorator(fn):
+
+        # if no seed, just return the function
+
+        if not exists(seed):
+            return fn
+
+        @wraps(fn)
+        def inner(*args, **kwargs):
+
+            has_cuda = torch.cuda.is_available()
+
+            orig_torch_state = torch.get_rng_state()
+
+            orig_cuda_states = None
+            if has_cuda:
+                orig_cuda_states = torch.cuda.get_rng_state_all()
+
+            torch.manual_seed(seed)
+
+            if has_cuda:
+                torch.cuda.manual_seed_all(seed)
+
+            try:
+                out = fn(*args, **kwargs)
+
+            finally:
+                torch.set_rng_state(orig_torch_state)
+
+                if has_cuda and orig_cuda_states:
+                    torch.cuda.set_rng_state_all(orig_cuda_states)
+
+            return out
+        return inner
+
+    return decorator
 
 def is_empty(t):
     return t.numel() == 0
@@ -845,7 +883,6 @@ class ActionEmbedder(Module):
             tgt_dist = MultiCategorical(tgt_logits, use_parallel_multi_discrete = True)
 
             discrete_kl = src_dist.kl_div(tgt_dist)
-
 
             # MultiCategorical.kl_div already returns a reduced tensor across actions
             # so we should not sum it again if it is already reduced
@@ -2094,6 +2131,48 @@ class VideoTokenizer(Module):
 
         return total_loss, out
 
+# self-flow distillation - Chefer et al. https://arxiv.org/abs/2603.06507
+
+class SelfFlow(Module):
+    def __init__(
+        self,
+        model,
+        student_layer = -3,
+        teacher_layer = -1
+    ):
+        super().__init__()
+        depth = model.depth
+
+        to_pos = lambda l: l if l >= 0 else (depth + l)
+
+        student_layer_pos = to_pos(student_layer)
+        teacher_layer_pos = to_pos(teacher_layer)
+
+        assert 0 <= student_layer_pos < depth, f'student layer {student_layer} out of range for depth {depth}'
+        assert 0 <= teacher_layer_pos < depth, f'teacher layer {teacher_layer} out of range for depth {depth}'
+        assert student_layer_pos < teacher_layer_pos, f'student layer must be shallower than teacher layer'
+
+        self.student_layer = student_layer
+        self.teacher_layer = teacher_layer
+
+        self.student_predict_head = SwiGLUFeedforward(dim = model.dim)
+
+    def forward(
+        self,
+        student_intermediates,
+        teacher_intermediates,
+        lens = None,
+        mask = None
+    ):
+        student_hidden = student_intermediates.layer_hiddens[self.student_layer]
+        teacher_hidden = teacher_intermediates.layer_hiddens[self.teacher_layer]
+
+        if exists(lens) and not exists(mask):
+            mask = lens_to_mask(lens, student_hidden.shape[-2])
+
+        pred = self.student_predict_head(student_hidden)
+        return cosine_distance(pred, teacher_hidden, mask = mask)
+
 # dynamics model, axial space-time transformer
 
 class DynamicsWorldModel(Module):
@@ -2158,6 +2237,8 @@ class DynamicsWorldModel(Module):
         use_loss_normalization = True
     ):
         super().__init__()
+        self.dim = dim
+        self.depth = depth
 
         # can accept raw video if tokenizer is passed in
 
@@ -3446,6 +3527,7 @@ class DynamicsWorldModel(Module):
         add_autoregressive_action_loss = True,
         update_loss_ema = None,
         latent_has_view_dim = False,
+        seed = None
     ):
         # handle video or latents
 
@@ -3526,24 +3608,30 @@ class DynamicsWorldModel(Module):
 
         return_pred_only = return_pred_only or latent_is_noised
 
+        # seeded stochastic helpers
+
+        _sample_prob = with_seed(seed)(sample_prob)
+        _randint = with_seed(seed)(randint)
+        _randn_like = with_seed(seed)(randn_like)
+
         # if neither signal levels or step sizes passed in, assume training
         # generate them randomly for training
 
         if not is_inference:
 
-            shortcut_train = sample_prob(self.prob_shortcut_train)
+            shortcut_train = _sample_prob(self.prob_shortcut_train)
 
             if shortcut_train:
 
                 # now we follow eq (4)
 
-                step_sizes_log2 = randint(1, self.num_step_sizes_log2, (batch,), device = device)
+                step_sizes_log2 = _randint(1, self.num_step_sizes_log2, (batch,), device = device)
                 num_step_sizes = 2 ** step_sizes_log2
 
-                signal_levels = randint(0, self.max_steps, (batch, time), device = device) // num_step_sizes[:, None] * num_step_sizes[:, None] # times are discretized to step sizes
+                signal_levels = _randint(0, self.max_steps, (batch, time), device = device) // num_step_sizes[:, None] * num_step_sizes[:, None] # times are discretized to step sizes
             else:
                 step_sizes_log2 = torch.zeros((batch,), device = device).long() # zero because zero is equivalent to step size of 1
-                signal_levels = randint(0, self.max_steps, (batch, time), device = device)
+                signal_levels = _randint(0, self.max_steps, (batch, time), device = device)
 
         # times is from 0 to 1
 
@@ -3552,7 +3640,7 @@ class DynamicsWorldModel(Module):
         if not latent_is_noised:
             # get the noise
 
-            noise = randn_like(latents)
+            noise = _randn_like(latents)
             aligned_times, _ = align_dims_left((times, latents))
 
             # noise from 0 as noise to 1 as data
@@ -3597,7 +3685,7 @@ class DynamicsWorldModel(Module):
 
             if (
                 self.add_reward_embed_to_agent_token and
-                (not self.training or not sample_prob(self.add_reward_embed_dropout)) # a bit of noise goes a long way
+                (not self.training or not _sample_prob(self.add_reward_embed_dropout)) # a bit of noise goes a long way
             ):
                 assert self.num_agents == 1
 
@@ -3620,7 +3708,7 @@ class DynamicsWorldModel(Module):
             if not latent_is_noised:
                 # get the noise
 
-                proprio_noise = randn_like(proprio)
+                proprio_noise = _randn_like(proprio)
                 aligned_times, _ = align_dims_left((times, proprio))
 
                 # noise from 0 as noise to 1 as data
