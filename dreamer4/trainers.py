@@ -11,6 +11,7 @@ from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as T
 
 from einops import rearrange, repeat
+from torch_einops_utils import shape_with_replace
 
 from pathlib import Path
 
@@ -404,6 +405,7 @@ class BehaviorCloneTrainer(Module):
         video_fps = -1,
         sample_time_steps = 16,
         sample_batch_size = 25,
+        sample_prompt_frames = 1,
         use_ema = False,
         ema_decay = 0.999,
         grad_accum_every = 1
@@ -474,6 +476,7 @@ class BehaviorCloneTrainer(Module):
         self.log_video_flag = log_video
         self.sample_time_steps = sample_time_steps
         self.sample_batch_size = sample_batch_size
+        self.sample_prompt_frames = sample_prompt_frames
 
         self.checkpoint_every = checkpoint_every
         self.checkpoint_folder = Path(checkpoint_folder)
@@ -593,9 +596,11 @@ class BehaviorCloneTrainer(Module):
         tokenizer = unwrapped.video_tokenizer
 
         if is_tensor(batch_data):
-            prompt_video = batch_data[:self.sample_batch_size, :, :1]
+            prompt_video = batch_data[:self.sample_batch_size, :, :self.sample_prompt_frames]
+            real_video = batch_data[:self.sample_batch_size]
         else:
-            prompt_video = batch_data['video'][:self.sample_batch_size, :, :1]
+            prompt_video = batch_data['video'][:self.sample_batch_size, :, :self.sample_prompt_frames]
+            real_video = batch_data['video'][:self.sample_batch_size]
 
         image_size = prompt_video.shape[-1]
 
@@ -612,8 +617,21 @@ class BehaviorCloneTrainer(Module):
         self.log_video(generated_video, 'samples')
 
         if exists(self.results_folder):
-            prompt_expanded = repeat(prompt_video, 'b c 1 h w -> b c t h w', t = generated_video.shape[2])
-            combined_video = torch.cat((prompt_expanded, generated_video), dim = -1)
+            # Prepend the prompt to the generated video
+            generated_video = torch.cat((prompt_video, generated_video), dim=2)
+            
+            gen_len = generated_video.shape[2]
+            real_len = real_video.shape[2]
+            
+            # pad generated or real video so they match in time length for concat
+            if gen_len < real_len:
+                padding = torch.zeros(shape_with_replace(generated_video, {2: real_len - gen_len}), device=generated_video.device)
+                generated_video = torch.cat((generated_video, padding), dim=2)
+            elif real_len < gen_len:
+                padding = torch.zeros(shape_with_replace(real_video, {2: gen_len - real_len}), device=real_video.device)
+                real_video = torch.cat((real_video, padding), dim=2)
+
+            combined_video = torch.cat((real_video, generated_video), dim = -1)
             gif_path = self.results_folder / f'sample-{self.step.item()}.gif'
             save_video_grid_as_gif(combined_video, gif_path)
 
@@ -634,6 +652,8 @@ class BehaviorCloneTrainer(Module):
             total = self.num_train_steps,
             disable = not self.is_main_process
         )
+
+        last_shortcut_loss = 0.
 
         for _ in pbar:
             total_loss = 0.
@@ -686,7 +706,10 @@ class BehaviorCloneTrainer(Module):
                 postfix['flow'] = f"{total_flow_loss:.4f}"
 
             if total_shortcut_loss > 0.:
-                postfix['shortcut'] = f"{total_shortcut_loss:.4f}"
+                last_shortcut_loss = total_shortcut_loss
+
+            if last_shortcut_loss > 0.:
+                postfix['shortcut'] = f"{last_shortcut_loss:.4f}"
 
             if total_reward_loss > 0.:
                 postfix['reward'] = f"{total_reward_loss:.4f}"

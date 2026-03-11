@@ -54,12 +54,14 @@ from dreamer4.trainers import VideoTokenizerTrainer
 # main
 
 def main(
-    num_frames = 10,
+    num_frames = 5,
+    image_size = 32,
+    digit_size = 14,
     checkpoint_path = None,
     num_train_steps = 100_000,
     num_latents = 32,
-    batch_size = 16,
-    grad_accum_every = 4,
+    batch_size = 64,
+    grad_accum_every = 1,
     min_velocity = -2,
     max_velocity = 3,
     lr = 3e-4,
@@ -68,6 +70,7 @@ def main(
     patch_size = 4,
     encoder_depth = 4,
     decoder_depth = 4,
+    time_block_every = 4,
     attn_dim_head = 32,
     attn_heads = 8,
     use_ema = True,
@@ -97,6 +100,8 @@ def main(
     # dataset
 
     dataset = MovingMNISTDataset(
+        image_size = image_size,
+        digit_size = digit_size,
         num_frames = num_frames,
         min_velocity = min_velocity,
         max_velocity = max_velocity
@@ -110,8 +115,11 @@ def main(
         patch_size = patch_size,
         num_latent_tokens = num_latents,
         channels = 3,
+        image_height = image_size,
+        image_width = image_size,
         encoder_depth = encoder_depth,
         decoder_depth = decoder_depth,
+        time_block_every = time_block_every,
         attn_dim_head = attn_dim_head,
         attn_heads = attn_heads,
         encoder_add_decorr_aux_loss = encoder_add_decorr_aux_loss,

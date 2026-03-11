@@ -30,7 +30,9 @@ from dreamer4.trainers import BehaviorCloneTrainer
 
 def main(
     tokenizer_checkpoint_path: str,
-    num_frames = 10,
+    num_frames = 5,
+    image_size = 32,
+    digit_size = 14,
     num_train_steps = 100_000,
     batch_size = 64,
     grad_accum_every = 1,
@@ -47,7 +49,8 @@ def main(
     checkpoint_folder = './checkpoints_mnist_dynamics',
     use_loss_normalization = False,
     multi_token_pred_len = 1,
-    shortcut_loss_weight = 5e-2
+    shortcut_loss_weight = 5e-2,
+    sample_prompt_frames = 2
 ):
     import shutil
 
@@ -61,13 +64,28 @@ def main(
 
     # instantiate the dataset
 
-    dataset = MovingMNISTDataset(num_frames = num_frames)
+    dataset = MovingMNISTDataset(
+        num_frames = num_frames, 
+        image_size = image_size, 
+        digit_size = digit_size
+    )
 
     # Load frozen tokenizer
 
-    assert Path(tokenizer_checkpoint_path).exists(), f"Tokenizer checkpoint missing at {tokenizer_checkpoint_path}"
+    checkpoint_path = Path(tokenizer_checkpoint_path)
 
-    tokenizer = VideoTokenizer.init_and_load(tokenizer_checkpoint_path)
+    if checkpoint_path.is_dir():
+        ema_checkpoints = list(checkpoint_path.glob('tokenizer-*-ema.pt'))
+        assert len(ema_checkpoints) > 0, f"No EMA tokenizer checkpoints found in {tokenizer_checkpoint_path}"
+        
+        # Sort by step number (e.g. tokenizer-15000-ema.pt -> 15000)
+        get_step = lambda p: int(p.stem.split('-')[1])
+        checkpoint_path = max(ema_checkpoints, key=get_step)
+
+    assert checkpoint_path.exists(), f"Tokenizer checkpoint missing at {checkpoint_path}"
+    print(f"Loading Tokenizer from: {checkpoint_path}")
+
+    tokenizer = VideoTokenizer.init_and_load(str(checkpoint_path))
     tokenizer.eval().requires_grad_(False)
 
     # initialize world model
@@ -100,6 +118,7 @@ def main(
         use_ema = use_ema,
         use_tensorboard_logger = True,
         log_video = True,
+        sample_prompt_frames = sample_prompt_frames,
         grad_accum_every = grad_accum_every,
     )
 
