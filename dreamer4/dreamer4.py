@@ -2138,7 +2138,8 @@ class SelfFlow(Module):
         self,
         model,
         student_layer = -3,
-        teacher_layer = -1
+        teacher_layer = -1,
+        teacher_time_modifier_fn: Callable | None = None
     ):
         super().__init__()
         depth = model.depth
@@ -2155,15 +2156,25 @@ class SelfFlow(Module):
         self.student_layer = student_layer
         self.teacher_layer = teacher_layer
 
+        self.teacher_time_modifier_fn = teacher_time_modifier_fn
+
         self.student_predict_head = SwiGLUFeedforward(dim = model.dim)
 
     def forward(
         self,
+        ema_teacher_model,
         student_intermediates,
-        teacher_intermediates,
+        batch_kwargs: dict,
         lens = None,
         mask = None
     ):
+        teacher_batch_kwargs = dict(**batch_kwargs)
+
+        if exists(self.teacher_time_modifier_fn):
+            teacher_batch_kwargs['time_modifier_fn'] = self.teacher_time_modifier_fn
+
+        *_, teacher_intermediates = ema_teacher_model(**teacher_batch_kwargs)
+
         student_hidden = student_intermediates.layer_hiddens[self.student_layer]
         teacher_hidden = teacher_intermediates.layer_hiddens[self.teacher_layer]
 
@@ -3527,7 +3538,8 @@ class DynamicsWorldModel(Module):
         add_autoregressive_action_loss = True,
         update_loss_ema = None,
         latent_has_view_dim = False,
-        seed = None
+        seed = None,
+        time_modifier_fn: Callable | None = None
     ):
         # handle video or latents
 
@@ -3636,6 +3648,12 @@ class DynamicsWorldModel(Module):
         # times is from 0 to 1
 
         times = self.get_times_from_signal_level(signal_levels)
+
+        if exists(time_modifier_fn):
+            times = time_modifier_fn(times).clamp(0., 1.)
+
+            # update signal levels for the embeddings so it reflects the modified noise level
+            signal_levels = (times * self.max_steps).long().clamp(0, self.max_steps - 1)
 
         if not latent_is_noised:
             # get the noise

@@ -414,7 +414,8 @@ class BehaviorCloneTrainer(Module):
         self_flow = False,
         self_flow_student_layer = -3,
         self_flow_teacher_layer = -1,
-        self_flow_loss_weight = 1.0
+        self_flow_loss_weight = 1.0,
+        self_flow_kwargs: dict = dict()
     ):
         super().__init__()
         batch_size = min(batch_size, len(dataset))
@@ -449,7 +450,8 @@ class BehaviorCloneTrainer(Module):
             self.self_flow_module = SelfFlow(
                 model = model,
                 student_layer = self_flow_student_layer,
-                teacher_layer = self_flow_teacher_layer
+                teacher_layer = self_flow_teacher_layer,
+                **self_flow_kwargs
             )
 
         self.use_ema = use_ema
@@ -712,9 +714,8 @@ class BehaviorCloneTrainer(Module):
 
                 if self.self_flow:
                     with torch.no_grad():
-                        *_, teacher_intermediates = self.ema_model.ema_model(**batch_data)
+                        self_flow_loss = self.self_flow_module(self.ema_model.ema_model, intermediates, batch_data)
 
-                    self_flow_loss = self.self_flow_module(intermediates, teacher_intermediates)
                     self_flow_loss = self_flow_loss / self.grad_accum_every
 
                     loss = loss + self_flow_loss * self.self_flow_loss_weight
