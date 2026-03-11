@@ -123,4 +123,14 @@ actor_loss, critic_loss = world_model.learn_from_experience(experience)
 }
 ```
 
+```bibtex
+@misc{chefer2026self,
+    title   = {Self-Supervised Flow Matching for Scalable Multi-Modal Synthesis},
+    author  = {Hila Chefer and Patrick Esser and Dominik Lorenz and Dustin Podell and Vikash Raja and Vinh Tong and Antonio Torralba and Robin Rombach},
+    year    = {2026},
+    url     = {https://bfl.ai/research/self-flow},
+    note    = {Preprint}
+}
+```
+
 *the conquest of nature is to be achieved through number and measure - angels to Descartes in a dream*

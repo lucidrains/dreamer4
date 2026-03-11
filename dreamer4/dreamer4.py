@@ -11,7 +11,6 @@ from dataclasses import dataclass, asdict
 
 import torch
 import torch.nn.functional as F
-from torch.nested import nested_tensor
 from torch.distributions import Normal, Beta, kl
 from torch.nn import Module, ModuleList, Embedding, Parameter, Sequential, Linear, RMSNorm, Identity
 from torch import nn, cat, stack, arange, tensor, Tensor, is_tensor, full, zeros, ones, randint, rand, randn, randn_like, empty, full, linspace, arange
@@ -96,7 +95,7 @@ WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'shortcut', 'rewards'
 
 AttentionIntermediates = namedtuple('AttentionIntermediates', ('next_kv_cache', 'normed_inputs'))
 
-TransformerIntermediates = namedtuple('TransformerIntermediates', ('next_kv_cache', 'normed_time_inputs', 'normed_space_inputs', 'next_rnn_hiddens'))
+TransformerIntermediates = namedtuple('TransformerIntermediates', ('next_kv_cache', 'normed_time_inputs', 'normed_space_inputs', 'next_rnn_hiddens', 'layer_hiddens'), defaults=(None,))
 
 Predictions = namedtuple('Predictions', ('flow', 'proprioception', 'state'))
 
@@ -198,6 +197,10 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+def cosine_distance(x, y, mask = None):
+    dist = 1. - F.cosine_similarity(x, y, dim = -1)
+    return masked_mean(dist, mask)
 
 def first(arr):
     return arr[0]
@@ -1517,7 +1520,6 @@ class AxialSpaceTimeTransformer(Module):
         tokens, # (b t s d)
         cache: TransformerIntermediates | None = None,
         return_intermediates = False
-
     ): # (b t s d) | (y 2 b h t d)
 
         batch, time, space_seq_len, _, device = *tokens.shape, tokens.device
@@ -1585,6 +1587,8 @@ class AxialSpaceTimeTransformer(Module):
 
         tokens = self.expand_streams(tokens)
 
+        hiddens = []
+
         for (pre_attn_rearrange, post_attn_rearrange, attn, ff), maybe_rnn, layer_is_time in zip(self.layers, self.rnn_layers, self.is_time):
 
             tokens = pre_attn_rearrange(tokens)
@@ -1643,6 +1647,8 @@ class AxialSpaceTimeTransformer(Module):
 
             space_or_time_inputs.append(attn_intermediates.normed_inputs)
 
+            hiddens.append(tokens)
+
         tokens = self.reduce_streams(tokens)
 
         out = self.final_norm(tokens)
@@ -1658,7 +1664,8 @@ class AxialSpaceTimeTransformer(Module):
             stack(time_attn_kv_caches),
             safe_stack(normed_time_attn_inputs),
             safe_stack(normed_space_attn_inputs),
-            safe_stack(rnn_hiddens)
+            safe_stack(rnn_hiddens),
+            hiddens
         )
 
         return out, intermediates
@@ -1790,10 +1797,13 @@ class VideoTokenizer(Module):
             dim = dim,
             depth = encoder_depth,
             attn_dim_head = attn_dim_head,
+            attn_heads = attn_heads,
             attn_softclamp_value = attn_softclamp_value,
             time_block_every = time_block_every,
             num_special_spatial_tokens = num_latent_tokens,
             num_residual_streams = num_residual_streams,
+            attn_kwargs = attn_kwargs,
+            ff_kwargs = ff_kwargs,
             final_norm = True
         )
 
@@ -1826,11 +1836,14 @@ class VideoTokenizer(Module):
             dim = dim,
             depth = decoder_depth,
             attn_dim_head = attn_dim_head,
+            attn_heads = attn_heads,
             attn_softclamp_value = attn_softclamp_value,
             time_block_every = time_block_every,
             num_special_spatial_tokens = num_latent_tokens,
             num_residual_streams = num_residual_streams,
             special_attend_only_itself = True,
+            attn_kwargs = attn_kwargs,
+            ff_kwargs = ff_kwargs,
             final_norm = True
         )
 
@@ -2004,7 +2017,7 @@ class VideoTokenizer(Module):
 
         # encoder attention
 
-        tokens, (_, time_attn_normed_inputs, space_attn_normed_inputs, _) = self.encoder_transformer(tokens, return_intermediates = True)
+        tokens, (_, time_attn_normed_inputs, space_attn_normed_inputs, *_) = self.encoder_transformer(tokens, return_intermediates = True)
 
         if self.use_causal_conv3d:
             b, t, *_ = tokens.shape
@@ -3432,7 +3445,7 @@ class DynamicsWorldModel(Module):
         return_intermediates = False,
         add_autoregressive_action_loss = True,
         update_loss_ema = None,
-        latent_has_view_dim = False
+        latent_has_view_dim = False,
     ):
         # handle video or latents
 
@@ -3652,7 +3665,7 @@ class DynamicsWorldModel(Module):
 
         # main function, needs to be defined as such for shortcut training - additional calls for consistency loss
 
-        def get_prediction(noised_latents, noised_proprio, signal_levels, step_sizes_log2, state_pred_token, action_tokens, reward_tokens, agent_tokens, return_agent_tokens = False, return_time_cache = False):
+        def get_prediction(noised_latents, noised_proprio, signal_levels, step_sizes_log2, state_pred_token, action_tokens, reward_tokens, agent_tokens, return_agent_tokens = False, return_time_cache = False, return_intermediates = False):
 
             # latents to spatial tokens
 
@@ -3741,7 +3754,7 @@ class DynamicsWorldModel(Module):
 
         # forward the network
 
-        pred, (embeds, intermediates) = _get_prediction(noised_latents, noised_proprio, signal_levels, step_sizes_log2, return_agent_tokens = True, return_time_cache = True)
+        pred, (embeds, intermediates) = _get_prediction(noised_latents, noised_proprio, signal_levels, step_sizes_log2, return_agent_tokens = True, return_time_cache = True, return_intermediates = return_intermediates)
 
         if return_pred_only:
             if not return_intermediates:
@@ -4038,7 +4051,15 @@ class DynamicsWorldModel(Module):
             (state_pred_loss * self.state_pred_loss_weight)
         )
 
-        if not return_all_losses:
+        if not (return_all_losses or return_intermediates):
             return total_loss
 
-        return total_loss, losses
+        ret = (total_loss,)
+
+        if return_all_losses:
+            ret = (*ret, losses)
+
+        if return_intermediates:
+            ret = (*ret, intermediates)
+
+        return ret
