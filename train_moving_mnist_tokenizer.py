@@ -24,6 +24,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch import nn
+from adam_atan2_pytorch import MuonAdamAtan2
 from torch.utils.data import DataLoader, Dataset
 import torchvision.transforms as T
 from torchvision.utils import save_image
@@ -56,13 +57,13 @@ def main(
     num_frames = 10,
     checkpoint_path = None,
     num_train_steps = 100_000,
-    num_latents = 16,
-    batch_size = 32,
-    grad_accum_every = 1,
+    num_latents = 32,
+    batch_size = 16,
+    grad_accum_every = 4,
     min_velocity = -2,
     max_velocity = 3,
     lr = 3e-4,
-    dim = 64,
+    dim = 128,
     dim_latent = 32,
     patch_size = 4,
     encoder_depth = 4,
@@ -128,7 +129,7 @@ def main(
         model = tokenizer,
         dataset = dataset,
         checkpoint_path = checkpoint_path,
-        optim_klass = torch.optim.AdamW,
+        optim_klass = MuonAdamAtan2,
         batch_size = batch_size,
         grad_accum_every = grad_accum_every,
         learning_rate = lr,

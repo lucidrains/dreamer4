@@ -42,7 +42,7 @@ def test_e2e(
         time_block_every = 1,
         dim_latent = 16,
         patch_size = 16,
-        attn_dim_head = 16,
+        attn_dim_head = 8,
         num_latent_tokens = 4,
         num_residual_streams = num_residual_streams,
         encoder_add_decorr_aux_loss = True,
@@ -73,7 +73,7 @@ def test_e2e(
         num_spatial_tokens = num_spatial_tokens,
         pred_orig_latent = pred_orig_latent,
         num_discrete_actions = 4,
-        attn_dim_head = 16,
+        attn_dim_head = 8,
         attn_heads = heads,
         attn_kwargs = dict(
             query_heads = query_heads,

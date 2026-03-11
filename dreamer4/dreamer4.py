@@ -1684,6 +1684,9 @@ class CausalDepthwiseConv3d(Module):
             groups = dim
         )
 
+        self.act = nn.SiLU()
+        self.proj = Linear(dim, dim)
+
     def forward(
         self,
         x # (b, t, h, w, c)
@@ -1699,6 +1702,9 @@ class CausalDepthwiseConv3d(Module):
         x = self.conv(x)
 
         x = rearrange(x, 'b c t h w -> b t h w c')
+
+        x = self.act(x)
+        x = self.proj(x)
 
         return x + res
 
@@ -1773,8 +1779,10 @@ class VideoTokenizer(Module):
         self.use_causal_conv3d = use_causal_conv3d
 
         if use_causal_conv3d:
-            self.encoder_causal_conv3d = CausalDepthwiseConv3d(dim, kernel_size = causal_conv3d_kernel_size)
-            self.decoder_causal_conv3d = CausalDepthwiseConv3d(dim, kernel_size = causal_conv3d_kernel_size)
+            self.encoder_pre_causal_conv3d = CausalDepthwiseConv3d(dim, kernel_size = causal_conv3d_kernel_size)
+            self.encoder_post_causal_conv3d = CausalDepthwiseConv3d(dim, kernel_size = causal_conv3d_kernel_size)
+            self.decoder_pre_causal_conv3d = CausalDepthwiseConv3d(dim, kernel_size = causal_conv3d_kernel_size)
+            self.decoder_post_causal_conv3d = CausalDepthwiseConv3d(dim, kernel_size = causal_conv3d_kernel_size)
 
         # encoder space / time transformer
 
@@ -1910,6 +1918,15 @@ class VideoTokenizer(Module):
 
         # decoder attention
 
+        if self.use_causal_conv3d:
+            b, t, *_ = tokens.shape
+            
+            spatial_tokens, latent_tokens = unpack(tokens, packed_latent_shape, 'b t * d')
+            
+            spatial_tokens = self.decoder_pre_causal_conv3d(spatial_tokens)
+
+            tokens, _ = pack((spatial_tokens, latent_tokens), 'b t * d')
+
         tokens = self.decoder_transformer(tokens)
 
         # unpack latents
@@ -1919,7 +1936,7 @@ class VideoTokenizer(Module):
         # project to patches
 
         if self.use_causal_conv3d:
-            tokens = self.decoder_causal_conv3d(tokens)
+            tokens = self.decoder_post_causal_conv3d(tokens)
 
         recon_video = self.tokens_to_patch(tokens)
 
@@ -1955,7 +1972,7 @@ class VideoTokenizer(Module):
         tokens = self.patch_to_tokens(video)
 
         if self.use_causal_conv3d:
-            tokens = self.encoder_causal_conv3d(tokens)
+            tokens = self.encoder_pre_causal_conv3d(tokens)
 
         # get some dimensions
 
@@ -1988,6 +2005,17 @@ class VideoTokenizer(Module):
         # encoder attention
 
         tokens, (_, time_attn_normed_inputs, space_attn_normed_inputs, _) = self.encoder_transformer(tokens, return_intermediates = True)
+
+        if self.use_causal_conv3d:
+            b, t, *_ = tokens.shape
+            
+            spatial_tokens, latent_tokens = unpack(tokens, packed_latent_shape, 'b t * d')
+            spatial_tokens = inverse_pack_space(spatial_tokens)
+            
+            spatial_tokens = self.encoder_post_causal_conv3d(spatial_tokens)
+            
+            spatial_tokens, _ = pack_one(spatial_tokens, 'b t * d')
+            tokens, _ = pack((spatial_tokens, latent_tokens), 'b t * d')
 
         # latent bottleneck
 
