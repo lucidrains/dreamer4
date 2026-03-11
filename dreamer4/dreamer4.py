@@ -1920,9 +1920,9 @@ class VideoTokenizer(Module):
 
         if self.use_causal_conv3d:
             b, t, *_ = tokens.shape
-            
+
             spatial_tokens, latent_tokens = unpack(tokens, packed_latent_shape, 'b t * d')
-            
+
             spatial_tokens = self.decoder_pre_causal_conv3d(spatial_tokens)
 
             tokens, _ = pack((spatial_tokens, latent_tokens), 'b t * d')
@@ -2008,12 +2008,12 @@ class VideoTokenizer(Module):
 
         if self.use_causal_conv3d:
             b, t, *_ = tokens.shape
-            
+
             spatial_tokens, latent_tokens = unpack(tokens, packed_latent_shape, 'b t * d')
             spatial_tokens = inverse_pack_space(spatial_tokens)
-            
+
             spatial_tokens = self.encoder_post_causal_conv3d(spatial_tokens)
-            
+
             spatial_tokens, _ = pack_one(spatial_tokens, 'b t * d')
             tokens, _ = pack((spatial_tokens, latent_tokens), 'b t * d')
 
