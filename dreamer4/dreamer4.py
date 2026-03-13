@@ -2228,12 +2228,17 @@ class VideoTokenizer(Module):
             noised_video = noise.lerp(video, t)
 
             recon_video = self.decode_step(latents, noised_video = noised_video, time_indices = time_indices, height = height, width = width)
+
+            flow = video - noise
+            pred_flow = (recon_video - noised_video) / (1. - t)
+
+            recon_loss = F.mse_loss(flow, pred_flow)
         else:
             recon_video = self.decode_step(latents, height = height, width = width)
 
-        # losses
+            recon_loss = F.mse_loss(video, recon_video)
 
-        recon_loss = F.mse_loss(video, recon_video)
+        # losses
 
         lpips_loss = self.zero
 
