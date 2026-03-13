@@ -129,6 +129,7 @@ def main(
         time_decorr_loss_weight = time_decorr_loss_weight,
         space_decorr_loss_weight = space_decorr_loss_weight,
         use_loss_normalization = use_loss_normalization,
+        use_causal_conv3d = use_causal_conv3d,
         causal_conv3d_kernel_size = causal_conv3d_kernel_size,
         lpips_loss_weight = lpips_loss_weight,
         decoder_flow_steps = decoder_flow_steps,
