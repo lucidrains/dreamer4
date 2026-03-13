@@ -86,7 +86,9 @@ def main(
     use_causal_conv3d = True,
     causal_conv3d_kernel_size = 3,
     lpips_loss_weight = 0.,
-    decoder_flow_steps = 4
+    decoder_flow_steps = 4,
+    latent_ar_loss_weight = 0.,
+    latent_ar_placement = 'encoder'
 ):
     import shutil
 
@@ -127,10 +129,11 @@ def main(
         time_decorr_loss_weight = time_decorr_loss_weight,
         space_decorr_loss_weight = space_decorr_loss_weight,
         use_loss_normalization = use_loss_normalization,
-        use_causal_conv3d = use_causal_conv3d,
         causal_conv3d_kernel_size = causal_conv3d_kernel_size,
         lpips_loss_weight = lpips_loss_weight,
         decoder_flow_steps = decoder_flow_steps,
+        latent_ar_loss_weight = latent_ar_loss_weight,
+        latent_ar_placement = latent_ar_placement
     )
 
     # trainer

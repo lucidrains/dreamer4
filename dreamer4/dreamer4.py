@@ -45,6 +45,7 @@ from torch_einops_utils import (
     safe_cat,
     slice_right_at_dim
 )
+from torch_einops_utils.device import move_inputs_to_module_device
 from torch_einops_utils.save_load import save_load
 
 # ein related
@@ -90,7 +91,7 @@ LinearNoBias = partial(Linear, bias = False)
 
 VideoTokenizerIntermediates = namedtuple('VideoTokenizerIntermediates', ('losses', 'recon'))
 
-TokenizerLosses = namedtuple('TokenizerLosses', ('recon', 'lpips', 'time_decorr', 'space_decorr'))
+TokenizerLosses = namedtuple('TokenizerLosses', ('recon', 'lpips', 'time_decorr', 'space_decorr', 'latent_ar'))
 
 WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'shortcut', 'rewards', 'discrete_actions', 'continuous_actions', 'state_pred'))
 
@@ -466,6 +467,50 @@ class LPIPSLoss(Module):
         pred_embed, embed = tuple(vgg(t) for t in (pred, data))
 
         return F.mse_loss(embed, pred_embed)
+
+class LatentAutoregressiveLoss(Module):
+    def __init__(
+        self,
+        dim,
+        use_rmsnorm = False,
+        target_detach = True
+    ):
+        super().__init__()
+        self.target_detach = target_detach
+
+        self.net = nn.Sequential(
+            RMSNorm(dim) if use_rmsnorm else Identity(),
+            Linear(dim, dim)
+        )
+
+    def forward(
+        self,
+        x,
+        return_loss = True,
+        mask = None,
+        return_unreduced_loss = False
+    ):
+        pred_input = x[:, :-1]
+        target = x[:, 1:]
+
+        if self.target_detach:
+            target = target.detach()
+
+        pred = self.net(pred_input)
+
+        if not return_loss:
+            return pred
+
+        loss = F.l1_loss(pred, target, reduction = 'none')
+
+        if return_unreduced_loss:
+            return loss, pred
+
+        if exists(mask):
+            mask = mask[:, 1:]
+
+        loss = masked_mean(loss, mask)
+        return loss, pred
 
 def ramp_weight(times, slope = 0.9, intercept = 0.1):
     # equation (8) paper, their "ramp" loss weighting
@@ -1786,7 +1831,9 @@ class VideoTokenizer(Module):
         use_loss_normalization = True,
         use_causal_conv3d = False,
         causal_conv3d_kernel_size = 3,
-        decoder_flow_steps = 1
+        decoder_flow_steps = 1,
+        latent_ar_loss_weight = 0.,
+        latent_ar_placement = 'encoder'
     ):
         super().__init__()
 
@@ -1918,6 +1965,23 @@ class VideoTokenizer(Module):
 
         self.decorr_loss = DecorrelationLoss(decorr_sample_frac, soft_validate_num_sampled = True) if encoder_add_decorr_aux_loss else None
 
+        # optional latent autoregression
+
+        assert latent_ar_placement in ('encoder', 'decoder'), 'latent_ar_placement must be either "encoder" or "decoder"'
+
+        self.latent_ar_loss_weight = latent_ar_loss_weight
+        self.latent_ar_placement = latent_ar_placement
+
+        self.latent_ar_in_encoder = latent_ar_placement == 'encoder'
+        self.latent_ar_in_decoder = latent_ar_placement == 'decoder'
+
+        self.has_latent_ar = latent_ar_loss_weight > 0.
+
+        if self.has_latent_ar:
+            latent_ar_use_rmsnorm = self.latent_ar_in_encoder
+            latent_ar_dim = dim if self.latent_ar_in_encoder else dim_latent
+            self.latent_ar = LatentAutoregressiveLoss(latent_ar_dim, use_rmsnorm = latent_ar_use_rmsnorm)
+
         # loss normalizer
 
         self.use_loss_normalization = use_loss_normalization
@@ -1927,6 +1991,7 @@ class VideoTokenizer(Module):
             self.lpips_loss_normalizer = LossNormalizer() if self.has_lpips_loss else None
             self.time_decorr_loss_normalizer = LossNormalizer() if encoder_add_decorr_aux_loss else None
             self.space_decorr_loss_normalizer = LossNormalizer() if encoder_add_decorr_aux_loss else None
+            self.latent_ar_loss_normalizer = LossNormalizer() if self.has_latent_ar else None
 
     @property
     def device(self):
@@ -2138,10 +2203,18 @@ class VideoTokenizer(Module):
 
         tokens, latents = unpack(tokens, packed_latent_shape, 'b t * d')
 
+        latent_ar_loss = self.zero
+
+        if self.has_latent_ar and self.latent_ar_in_encoder:
+            latent_ar_loss, _ = self.latent_ar(latents)
+
         latents = self.encoded_to_latents(latents)
 
         if return_latents:
             return latents
+
+        if self.has_latent_ar and self.latent_ar_in_decoder:
+            latent_ar_loss, _ = self.latent_ar(latents)
 
         if self.has_flow:
 
@@ -2181,6 +2254,9 @@ class VideoTokenizer(Module):
         if self.use_loss_normalization:
             recon_loss = self.recon_loss_normalizer(recon_loss, update_ema = update_loss_ema)
 
+            if self.has_latent_ar:
+                latent_ar_loss = self.latent_ar_loss_normalizer(latent_ar_loss, update_ema = update_loss_ema)
+
             if self.has_lpips_loss:
                 lpips_loss = self.lpips_loss_normalizer(lpips_loss, update_ema = update_loss_ema)
 
@@ -2194,13 +2270,14 @@ class VideoTokenizer(Module):
             recon_loss +
             lpips_loss * self.lpips_loss_weight +
             time_decorr_loss * self.time_decorr_loss_weight +
-            space_decorr_loss * self.space_decorr_loss_weight
+            space_decorr_loss * self.space_decorr_loss_weight +
+            latent_ar_loss * self.latent_ar_loss_weight
         )
 
         if not return_intermediates:
             return total_loss
 
-        losses = TokenizerLosses(recon_loss, lpips_loss, time_decorr_loss, space_decorr_loss)
+        losses = TokenizerLosses(recon_loss, lpips_loss, time_decorr_loss, space_decorr_loss, latent_ar_loss)
 
         # handle returning of reconstructed, and image pretraining
 

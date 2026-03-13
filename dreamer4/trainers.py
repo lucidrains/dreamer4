@@ -304,7 +304,8 @@ class VideoTokenizerTrainer(Module):
                 recon_loss = losses.recon.item(),
                 lpips_loss = losses.lpips.item(),
                 time_decorr_loss = losses.time_decorr.item(),
-                space_decorr_loss = losses.space_decorr.item()
+                space_decorr_loss = losses.space_decorr.item(),
+                latent_ar_loss = losses.latent_ar.item()
             )
 
             if self.log_video_flag and divisible_by(self.step.item(), self.log_video_every) and self.is_main_process:
@@ -341,6 +342,10 @@ class VideoTokenizerTrainer(Module):
             space_decorr_loss = losses.space_decorr.item()
             if space_decorr_loss > 0.:
                 postfix_kwargs['space_decorr'] = f"{space_decorr_loss:.4f}"
+
+            latent_ar_loss = losses.latent_ar.item()
+            if latent_ar_loss > 0.:
+                postfix_kwargs['latent_ar'] = f"{latent_ar_loss:.4f}"
 
             pbar.set_postfix(**postfix_kwargs)
 
