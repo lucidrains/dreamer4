@@ -38,6 +38,7 @@ from torch_einops_utils import (
     align_dims_left,
     pad_at_dim,
     pad_right_at_dim_to,
+    pad_right_ndim_to,
     lens_to_mask,
     masked_mean,
     safe_stack,
@@ -1784,7 +1785,8 @@ class VideoTokenizer(Module):
         num_residual_streams = 1,
         use_loss_normalization = True,
         use_causal_conv3d = False,
-        causal_conv3d_kernel_size = 3
+        causal_conv3d_kernel_size = 3,
+        decoder_flow_steps = 1
     ):
         super().__init__()
 
@@ -1827,6 +1829,19 @@ class VideoTokenizer(Module):
             self.encoder_post_causal_conv3d = CausalDepthwiseConv3d(dim, kernel_size = causal_conv3d_kernel_size)
             self.decoder_pre_causal_conv3d = CausalDepthwiseConv3d(dim, kernel_size = causal_conv3d_kernel_size)
             self.decoder_post_causal_conv3d = CausalDepthwiseConv3d(dim, kernel_size = causal_conv3d_kernel_size)
+
+        # latent conditioned flow matching decoder - inspired by RAC https://arxiv.org/abs/2412.16279 - enabled by setting flow steps > 1
+        # predicting clean, as in 'back to basics' https://arxiv.org/abs/2502.13745
+
+        self.decoder_flow_steps = decoder_flow_steps
+        self.has_flow = decoder_flow_steps > 1
+
+        if self.has_flow:
+            self.time_embed = Embedding(decoder_flow_steps, dim)
+            self.noised_patch_to_tokens = Sequential(
+                Rearrange('b c t (h p1) (w p2) -> b t h w (p1 p2 c)', p1 = patch_size, p2 = patch_size),
+                Linear(dim_patch, dim)
+            )
 
         # encoder space / time transformer
 
@@ -1931,9 +1946,11 @@ class VideoTokenizer(Module):
         self.eval()
         return self.forward(video, return_latents = True)
 
-    def decode(
+    def decode_step(
         self,
         latents, # (b t n d)
+        noised_video = None,
+        time_indices = None,
         height = None,
         width = None,
     ): # (b c t h w)
@@ -1943,7 +1960,7 @@ class VideoTokenizer(Module):
 
         assert exists(height) and exists(width), f'image height and width need to be passed in when decoding latents'
 
-        batch, time, device = *latents.shape[:2], latents.device
+        batch, time_len, device = *latents.shape[:2], latents.device
 
         use_flex = latents.is_cuda and exists(flex_attention)
 
@@ -1954,6 +1971,11 @@ class VideoTokenizer(Module):
 
         latent_tokens = self.latents_to_decoder(latents)
 
+        if exists(time_indices):
+            time_embedding = self.time_embed(time_indices)
+            time_embedding = rearrange(time_embedding, 'b d -> b 1 1 d')
+            latent_tokens = latent_tokens + time_embedding
+
         # generate decoder positional embedding and concat the latent token
 
         spatial_pos_height = torch.linspace(-1., 1., num_patch_height, device = device)
@@ -1962,9 +1984,15 @@ class VideoTokenizer(Module):
         space_height_width_coor = stack(torch.meshgrid(spatial_pos_height, spatial_pos_width, indexing = 'ij'), dim = -1)
 
         decoder_pos_emb = self.to_decoder_pos_emb(space_height_width_coor)
-        decoder_pos_emb = repeat(decoder_pos_emb, '... -> b t ...', b = batch, t = time)
+        decoder_pos_emb = repeat(decoder_pos_emb, '... -> b t ...', b = batch, t = time_len)
 
-        tokens, packed_latent_shape = pack((decoder_pos_emb, latent_tokens), 'b t * d')
+        spatial_tokens = decoder_pos_emb
+
+        if exists(noised_video):
+            image_tokens = self.noised_patch_to_tokens(noised_video)
+            spatial_tokens = spatial_tokens + image_tokens
+
+        tokens, packed_latent_shape = pack((spatial_tokens, latent_tokens), 'b t * d')
 
         # decoder attention
 
@@ -1991,6 +2019,45 @@ class VideoTokenizer(Module):
         recon_video = self.tokens_to_patch(tokens)
 
         return recon_video
+
+    @torch.no_grad()
+    def decode(
+        self,
+        latents, # (b t n d)
+        height = None,
+        width = None,
+    ): # (b c t h w)
+
+        height = default(height, self.image_height)
+        width = default(width, self.image_width)
+
+        if not self.has_flow:
+            return self.decode_step(latents, height = height, width = width)
+
+        batch, time_len, device = *latents.shape[:2], latents.device
+
+        noise = torch.randn(batch, self.channels, time_len, height, width, device=device)
+
+        steps = self.decoder_flow_steps
+        times = torch.linspace(0., 1., steps + 1, device = device)
+
+        video = noise
+
+        delta = 1. / steps
+
+        for i, time in enumerate(times[:-1].unbind()):
+
+            time_indices = torch.full((batch,), i, device = device, dtype = torch.long)
+
+            pred_video = self.decode_step(latents, noised_video = video, time_indices = time_indices, height = height, width = width)
+
+            padded_time = pad_right_ndim_to(time[None], video.ndim)
+
+            pred_flow = (pred_video - video) / (1. - padded_time)
+
+            video = video + pred_flow * delta
+
+        return video
 
     def forward(
         self,
@@ -2076,7 +2143,20 @@ class VideoTokenizer(Module):
         if return_latents:
             return latents
 
-        recon_video = self.decode(latents, height = height, width = width)
+        if self.has_flow:
+
+            time_indices = torch.randint(0, self.decoder_flow_steps, (batch,), device = device)
+
+            noise = torch.randn_like(video)
+
+            t = time_indices.float() / self.decoder_flow_steps
+            t = pad_right_ndim_to(t, video.ndim)
+
+            noised_video = noise.lerp(video, t)
+
+            recon_video = self.decode_step(latents, noised_video = noised_video, time_indices = time_indices, height = height, width = width)
+        else:
+            recon_video = self.decode_step(latents, height = height, width = width)
 
         # losses
 

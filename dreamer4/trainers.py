@@ -348,7 +348,7 @@ class VideoTokenizerTrainer(Module):
 
             self.accelerator.wait_for_everyone()
 
-            if self.is_main_process and divisible_by(self.step.item(), self.checkpoint_every):
+            if self.checkpoint_every > 0 and self.is_main_process and divisible_by(self.step.item(), self.checkpoint_every):
                 ckpt_path = self.checkpoint_folder / f'tokenizer-{self.step.item()}.pt'
 
                 model = self.unwrap_model(self.model)
@@ -779,7 +779,7 @@ class BehaviorCloneTrainer(Module):
             if self.is_main_process and self.log_video_flag and divisible_by(self.step.item(), self.log_video_every):
                 self.sample(batch_data)
 
-            if self.is_main_process and divisible_by(self.step.item(), self.checkpoint_every):
+            if self.checkpoint_every > 0 and self.is_main_process and divisible_by(self.step.item(), self.checkpoint_every):
                 self.save_checkpoint()
 
         self.accelerator.end_training()

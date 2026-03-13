@@ -1,4 +1,6 @@
 *.sh
+data/
+logs_*/
 
 logs/
 

@@ -1017,3 +1017,39 @@ def test_prompting_generation(
 
         if with_continuous_actions:
             assert continuous_actions.shape == (2, 8, 2)
+
+@param('steps', (1, 2, 4))
+def test_rac_like_tokenizer(steps):
+    from dreamer4.dreamer4 import VideoTokenizer
+
+    model = VideoTokenizer(
+        dim = 32,
+        dim_latent = 32,
+        patch_size = 4,
+        image_height = 32,
+        image_width = 32,
+        num_latent_tokens = 16,
+        encoder_depth = 2,
+        decoder_depth = 2,
+        time_block_every = 2,
+        attn_dim_head = 16,
+        attn_heads = 2,
+        decoder_flow_steps = steps
+    )
+
+    batch = 2
+    channels = 3
+    time = 2
+    height, width = 32, 32
+
+    video = torch.randn(batch, channels, time, height, width)
+
+    loss = model(video)
+    assert loss.numel() == 1
+
+    model.eval()
+    latents = torch.randn(batch, time, 16, 32)
+    with torch.no_grad():
+        recon_video = model.decode(latents, height = height, width = width)
+
+    assert recon_video.shape == (batch, channels, time, height, width)

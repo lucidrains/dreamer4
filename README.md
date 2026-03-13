@@ -133,4 +133,16 @@ actor_loss, critic_loss = world_model.learn_from_experience(experience)
 }
 ```
 
+```bibtex
+@misc{li2025basicsletdenoisinggenerative,
+    title   = {Back to Basics: Let Denoising Generative Models Denoise},
+    author  = {Tianhong Li and Kaiming He},
+    year    = {2025},
+    eprint  = {2511.13720},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.CV},
+    url     = {https://arxiv.org/abs/2511.13720},
+}
+```
+
 *the conquest of nature is to be achieved through number and measure - angels to Descartes in a dream*
