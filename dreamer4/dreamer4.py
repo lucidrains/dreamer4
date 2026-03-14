@@ -230,6 +230,13 @@ def is_power_two(num):
 
 # tensor helpers
 
+def straight_through(src, tgt):
+    return tgt + src - src.detach()
+
+def frac_gradient(t, frac = 1.):
+    t_grad = t * frac
+    return straight_through(t_grad, t.detach())
+
 def with_seed(seed):
     def decorator(fn):
 
@@ -1832,6 +1839,7 @@ class VideoTokenizer(Module):
         use_causal_conv3d = False,
         causal_conv3d_kernel_size = 3,
         decoder_flow_steps = 1,
+        latent_receive_grad_frac: Callable | None = None,
         latent_ar_loss_weight = 0.,
         latent_ar_placement = 'encoder'
     ):
@@ -1881,6 +1889,7 @@ class VideoTokenizer(Module):
         # predicting clean, as in 'back to basics' https://arxiv.org/abs/2502.13745
 
         self.decoder_flow_steps = decoder_flow_steps
+        self.latent_receive_grad_frac = latent_receive_grad_frac
         self.has_flow = decoder_flow_steps > 1
 
         if self.has_flow:
@@ -2226,6 +2235,14 @@ class VideoTokenizer(Module):
             t = pad_right_ndim_to(t, video.ndim)
 
             noised_video = noise.lerp(video, t)
+
+            # allow for different times during decoder training to influence the latent differently
+            # say allowing for only those near timestep of 0 to shape the latents (which would come closer to RAC)
+
+            if exists(self.latent_receive_grad_frac):
+                frac = self.latent_receive_grad_frac(time_indices.float() / self.decoder_flow_steps)
+                frac = pad_right_ndim_to(frac, latents.ndim)
+                latents = frac_gradient(latents, frac)
 
             recon_video = self.decode_step(latents, noised_video = noised_video, time_indices = time_indices, height = height, width = width)
 
