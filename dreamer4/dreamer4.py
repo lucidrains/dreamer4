@@ -3706,6 +3706,7 @@ class DynamicsWorldModel(Module):
         rewards = None,                  # (b t)
         discrete_actions = None,         # (b t na) | (b t-1 na)
         continuous_actions = None,       # (b t na) | (b t-1 na)
+        shift_action_tokens = True,      # set to False if actions already properly paired, which is different than the usual replay buffer pairing
         discrete_action_types = None,    # (na)
         continuous_action_types = None,  # (na)
         proprio = None,                  # (b t dp)
@@ -3935,10 +3936,16 @@ class DynamicsWorldModel(Module):
                 continuous_action_types = continuous_action_types
             )
 
-            # handle first timestep not having an associated past action
+            action_len = action_tokens.shape[1]
 
-            if action_tokens.shape[1] == (time - 1):
-                action_tokens = pad_at_dim(action_tokens, (1, 0), value = 0. , dim = 1)
+            if action_len == time and shift_action_tokens:
+                # handle first timestep not having an associated past action
+                # in replay buffers for rl, typically the action paired up with the state is the very next one, not the previous one that led up to that state
+                action_tokens = pad_at_dim(action_tokens[:, :-1], (1, 0), value = 0., dim = 1)
+
+            elif action_len == (time - 1):
+                # explicitly pad first timestep when actions do not include final step
+                action_tokens = pad_at_dim(action_tokens, (1, 0), value = 0., dim = 1)
 
             action_tokens = add('1 d, b t d', self.action_learned_embed, action_tokens)
 
@@ -4255,37 +4262,36 @@ class DynamicsWorldModel(Module):
             assert self.action_embedder.has_actions
 
             # handle actions having time vs time - 1 length
-            # remove the first action if it is equal to time (as it would come from some agent token in the past)
 
-            if exists(discrete_actions) and discrete_actions.shape[1] == time:
-                discrete_actions = discrete_actions[:, 1:]
+            has_discrete = exists(discrete_actions)
+            has_continuous = exists(continuous_actions)
 
-            if exists(continuous_actions) and continuous_actions.shape[1] == time:
-                continuous_actions = continuous_actions[:, 1:]
+            first_has_action = discrete_actions if has_discrete else continuous_actions
+            pred_len = first_has_action.shape[1]
 
             # only for 1 agent
 
             agent_tokens = rearrange(agent_tokens, 'b t 1 d -> b t d')
-            policy_embed = self.policy_head(agent_tokens[:, :-1])
+            policy_embed = self.policy_head(agent_tokens[:, :pred_len])
 
             # constitute multi token prediction targets
 
             discrete_action_targets = continuous_action_targets = None
 
-            if exists(discrete_actions):
+            if has_discrete:
                 discrete_action_targets, discrete_mask = create_multi_token_prediction_targets(discrete_actions, self.multi_token_pred_len)
                 discrete_action_targets = rearrange(discrete_action_targets, 'b t mtp ... -> mtp b t ...')
                 discrete_mask = rearrange(discrete_mask, 'b t mtp -> mtp b t')
 
-            if exists(continuous_actions):
+            if has_continuous:
                 continuous_action_targets, continuous_mask = create_multi_token_prediction_targets(continuous_actions, self.multi_token_pred_len)
                 continuous_action_targets = rearrange(continuous_action_targets, 'b t mtp ... -> mtp b t ...')
                 continuous_mask = rearrange(continuous_mask, 'b t mtp -> mtp b t')
 
             discrete_log_probs, continuous_log_probs = self.action_embedder.log_probs(
                 policy_embed,
-                discrete_targets = discrete_action_targets if exists(discrete_actions) else None,
-                continuous_targets = continuous_action_targets if exists(continuous_actions) else None
+                discrete_targets = discrete_action_targets,
+                continuous_targets = continuous_action_targets
             )
 
             if exists(discrete_log_probs):
@@ -4293,7 +4299,7 @@ class DynamicsWorldModel(Module):
 
                 if is_var_len:
                     discrete_action_losses = rearrange(-discrete_log_probs, 'mtp b t na -> b t na mtp')
-                    discrete_action_loss = reduce(discrete_action_losses[loss_mask_without_last], '... mtp -> mtp', 'mean')
+                    discrete_action_loss = reduce(discrete_action_losses[(loss_mask_without_last if pred_len == (time - 1) else loss_mask)], '... mtp -> mtp', 'mean')
                 else:
                     discrete_action_loss = reduce(-discrete_log_probs, 'mtp b t na -> mtp', 'mean')
 
@@ -4302,7 +4308,7 @@ class DynamicsWorldModel(Module):
 
                 if is_var_len:
                     continuous_action_losses = rearrange(-continuous_log_probs, 'mtp b t na -> b t na mtp')
-                    continuous_action_loss = reduce(continuous_action_losses[loss_mask_without_last], '... mtp -> mtp', 'mean')
+                    continuous_action_loss = reduce(continuous_action_losses[(loss_mask_without_last if pred_len == (time - 1) else loss_mask)], '... mtp -> mtp', 'mean')
                 else:
                     continuous_action_loss = reduce(-continuous_log_probs, 'mtp b t na -> mtp', 'mean')
 
