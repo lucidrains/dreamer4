@@ -88,7 +88,8 @@ def main(
     lpips_loss_weight = 0.,
     decoder_flow_steps = 4,
     latent_ar_loss_weight = 0.,
-    latent_ar_placement = 'encoder'
+    latent_ar_placement = 'encoder',
+    decoder_v_space_loss = True
 ):
     import shutil
 
@@ -134,7 +135,8 @@ def main(
         lpips_loss_weight = lpips_loss_weight,
         decoder_flow_steps = decoder_flow_steps,
         latent_ar_loss_weight = latent_ar_loss_weight,
-        latent_ar_placement = latent_ar_placement
+        latent_ar_placement = latent_ar_placement,
+        decoder_v_space_loss = decoder_v_space_loss
     )
 
     # trainer
