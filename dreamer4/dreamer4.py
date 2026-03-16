@@ -582,14 +582,14 @@ class SymExpTwoHot(Module):
         values
     ):
         bin_values = self.bin_values
-        min_bin_value, max_bin_value = self.bin_values[0], self.bin_values[-1]
+        min_bin_value, max_bin_value = bin_values[0], bin_values[-1]
 
         values, inverse_pack = pack_one(values, '*')
         num_values = values.shape[0]
 
         values = values.clamp(min = min_bin_value, max = max_bin_value)
 
-        indices = torch.searchsorted(self.bin_values, values)
+        indices = torch.searchsorted(bin_values, values)
 
         # fetch the closest two indices (two-hot encoding)
 
@@ -600,8 +600,8 @@ class SymExpTwoHot(Module):
 
         # fetch the left and right values for the consecutive indices
 
-        left_values = self.bin_values[left_indices]
-        right_values = self.bin_values[right_indices]
+        left_values = bin_values[left_indices]
+        right_values = bin_values[right_indices]
 
         # calculate the left and right values by the distance to the left and right
 
@@ -1838,6 +1838,7 @@ class VideoTokenizer(Module):
         use_causal_conv3d = False,
         causal_conv3d_kernel_size = 3,
         decoder_flow_steps = 1,
+        decoder_v_space_loss = True,
         latent_receive_grad_frac: Callable | None = None,
         latent_ar_loss_weight = 0.,
         latent_ar_placement = 'encoder'
@@ -1888,6 +1889,7 @@ class VideoTokenizer(Module):
         # predicting clean, as in 'back to basics' https://arxiv.org/abs/2502.13745
 
         self.decoder_flow_steps = decoder_flow_steps
+        self.decoder_v_space_loss = decoder_v_space_loss
         self.latent_receive_grad_frac = latent_receive_grad_frac
         self.has_flow = decoder_flow_steps > 1
 
@@ -2245,14 +2247,21 @@ class VideoTokenizer(Module):
 
             recon_video = self.decode_step(latents, noised_video = noised_video, time_indices = time_indices, height = height, width = width)
 
-            flow = video - noise
-            pred_flow = (recon_video - noised_video) / (1. - t)
-
-            recon_loss = F.mse_loss(flow, pred_flow)
+            if self.decoder_v_space_loss:
+                target = video - noise
+                pred = (recon_video - noised_video) / (1. - t)
+            else:
+                target = video
+                pred = recon_video
         else:
             recon_video = self.decode_step(latents, height = height, width = width)
 
-            recon_loss = F.mse_loss(video, recon_video)
+            target = video
+            pred = recon_video
+
+        # mse loss
+
+        recon_loss = F.mse_loss(pred, target)
 
         # losses
 
