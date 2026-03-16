@@ -4262,9 +4262,16 @@ class DynamicsWorldModel(Module):
             assert self.action_embedder.has_actions
 
             # handle actions having time vs time - 1 length
+            # remove the first action if it is equal to time (as it would come from some agent token in the past)
 
             has_discrete = exists(discrete_actions)
             has_continuous = exists(continuous_actions)
+
+            if has_discrete and discrete_actions.shape[1] == time and shift_action_tokens:
+                discrete_actions = discrete_actions[:, 1:]
+
+            if has_continuous and continuous_actions.shape[1] == time and shift_action_tokens:
+                continuous_actions = continuous_actions[:, 1:]
 
             first_has_action = discrete_actions if has_discrete else continuous_actions
             pred_len = first_has_action.shape[1]
@@ -4294,12 +4301,15 @@ class DynamicsWorldModel(Module):
                 continuous_targets = continuous_action_targets
             )
 
+            if is_var_len:
+                action_loss_mask = loss_mask_without_last if pred_len == (time - 1) else loss_mask
+
             if exists(discrete_log_probs):
                 discrete_log_probs = discrete_log_probs.masked_fill(~discrete_mask[..., None], 0.)
 
                 if is_var_len:
                     discrete_action_losses = rearrange(-discrete_log_probs, 'mtp b t na -> b t na mtp')
-                    discrete_action_loss = reduce(discrete_action_losses[(loss_mask_without_last if pred_len == (time - 1) else loss_mask)], '... mtp -> mtp', 'mean')
+                    discrete_action_loss = reduce(discrete_action_losses[action_loss_mask], '... mtp -> mtp', 'mean')
                 else:
                     discrete_action_loss = reduce(-discrete_log_probs, 'mtp b t na -> mtp', 'mean')
 
@@ -4308,7 +4318,7 @@ class DynamicsWorldModel(Module):
 
                 if is_var_len:
                     continuous_action_losses = rearrange(-continuous_log_probs, 'mtp b t na -> b t na mtp')
-                    continuous_action_loss = reduce(continuous_action_losses[(loss_mask_without_last if pred_len == (time - 1) else loss_mask)], '... mtp -> mtp', 'mean')
+                    continuous_action_loss = reduce(continuous_action_losses[action_loss_mask], '... mtp -> mtp', 'mean')
                 else:
                     continuous_action_loss = reduce(-continuous_log_probs, 'mtp b t na -> mtp', 'mean')
 
