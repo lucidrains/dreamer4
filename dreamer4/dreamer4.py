@@ -98,7 +98,7 @@ AttentionIntermediates = namedtuple('AttentionIntermediates', ('next_kv_cache', 
 
 TransformerIntermediates = namedtuple('TransformerIntermediates', ('next_kv_cache', 'normed_time_inputs', 'normed_space_inputs', 'next_rnn_hiddens', 'layer_hiddens'), defaults=(None,))
 
-Predictions = namedtuple('Predictions', ('flow', 'proprioception', 'state', 'agent_state'))
+Predictions = namedtuple('Predictions', ['flow', 'proprioception', 'state'])
 
 Embeds = namedtuple('Embeds', ['agent', 'state_pred'])
 
@@ -2564,20 +2564,6 @@ class DynamicsWorldModel(Module):
         self.state_entropy_bonus_weight = state_entropy_bonus_weight
         self.add_state_entropy_bonus = self.should_pred_state and state_entropy_bonus_weight > 0.
 
-        # agent predicting state
-
-        self.agent_predicts_state = agent_predicts_state
-        self.agent_state_pred_loss_weight = agent_state_pred_loss_weight
-
-        if self.agent_predicts_state:
-            self.to_agent_state_pred = Sequential(
-                RMSNorm(dim),
-                nn.Linear(dim, num_latent_tokens * dim_latent * 2),
-                Rearrange('... (n d two) -> ... n d two', n = num_latent_tokens, two = 2)
-            )
-
-            self.agent_state_beta_dist = BetaDist(unimodal = True)
-
         # reinforcement related
 
         # they sum all the actions into a single token
@@ -2619,6 +2605,25 @@ class DynamicsWorldModel(Module):
             num_unembed_preds = multi_token_pred_len,
             squeeze_unembed_preds = False
         )
+
+        # agent predicting state
+
+        self.agent_predicts_state = agent_predicts_state
+        self.agent_state_pred_loss_weight = agent_state_pred_loss_weight
+
+        if self.agent_predicts_state:
+            dim_agent_state_in = dim * 2 if self.action_embedder.has_actions else dim
+
+            self.to_agent_state_pred = Sequential(
+                nn.Linear(dim_agent_state_in, dim_agent_state_in),
+                nn.SiLU(),
+                nn.Linear(dim_agent_state_in, dim),
+                RMSNorm(dim),
+                nn.Linear(dim, num_latent_tokens * dim_latent * 2),
+                Rearrange('... (n d two) -> ... n d two', n = num_latent_tokens, two = 2)
+            )
+
+            self.agent_state_beta_dist = BetaDist(unimodal = True)
 
         # multi token prediction length
 
@@ -3961,24 +3966,31 @@ class DynamicsWorldModel(Module):
                 continuous_action_types = continuous_action_types
             )
 
+            action_tokens = add('1 d, b t d', self.action_learned_embed, action_tokens)
+
             action_len = action_tokens.shape[1]
 
             if action_len == time and shift_action_tokens:
                 # handle first timestep not having an associated past action
                 # in replay buffers for rl, typically the action paired up with the state is the very next one, not the previous one that led up to that state
+                # next_action_tokens contains the actual actions from t=1 to t=time-1
+                next_action_tokens = action_tokens[:, 1:]
                 action_tokens = pad_at_dim(action_tokens[:, :-1], (1, 0), value = 0., dim = 1)
 
             elif action_len == (time - 1):
                 # explicitly pad first timestep when actions do not include final step
+                next_action_tokens = action_tokens
                 action_tokens = pad_at_dim(action_tokens, (1, 0), value = 0., dim = 1)
-
-            action_tokens = add('1 d, b t d', self.action_learned_embed, action_tokens)
+            else:
+                next_action_tokens = action_tokens
 
         elif self.action_embedder.has_actions:
             action_tokens = torch.zeros_like(agent_tokens[:, :, 0:1])
+            next_action_tokens = None
 
         else:
-            action_tokens = empty_token # else empty off agent tokens
+            action_tokens = empty_token
+            next_action_tokens = None
 
         # main function, needs to be defined as such for shortcut training - additional calls for consistency loss
 
@@ -4051,16 +4063,9 @@ class DynamicsWorldModel(Module):
             else:
                 pred_state = None
 
-            # maybe agent state pred
-
-            if self.agent_predicts_state:
-                pred_agent_state = self.to_agent_state_pred(agent_tokens)
-            else:
-                pred_agent_state = None
-
             # returning
 
-            predictions = Predictions(pred, pred_proprio, pred_state, pred_agent_state)
+            predictions = Predictions(pred, pred_proprio, pred_state)
 
             embeds = Embeds(agent_tokens, state_pred_token)
 
@@ -4079,15 +4084,12 @@ class DynamicsWorldModel(Module):
         # forward the network
 
         pred, (embeds, intermediates) = _get_prediction(noised_latents, noised_proprio, signal_levels, step_sizes_log2, return_agent_tokens = True, return_time_cache = True, return_intermediates = return_intermediates)
+
         if return_pred_only:
             if not return_intermediates:
                 return pred
 
             return pred, (embeds, intermediates)
-
-        # extract predictions that would be lost when `pred` is overwritten below
-        state_pred_logits = pred.state if self.should_pred_state else None
-        agent_state_pred_logits = pred.agent_state if self.agent_predicts_state else None
 
         # pack the predictions to calculate flow for different modalities all at once
 
@@ -4357,24 +4359,38 @@ class DynamicsWorldModel(Module):
                 else:
                     continuous_action_loss = reduce(-continuous_log_probs, 'mtp b t na -> mtp', 'mean')
 
-        # maybe agent predicting state prediction loss
+        # maybe agent state prediction loss
 
         agent_state_pred_loss = self.zero
 
-        if self.agent_predicts_state:
-            pred_latent, latent_to_pred = agent_state_pred_logits[:, :-1], latents[:, 1:]
+        has_next_actions = exists(next_action_tokens) and next_action_tokens.shape[-2] > 0
+        should_pred_agent_state = self.agent_predicts_state and (not self.action_embedder.has_actions or has_next_actions)
 
-            dist = self.agent_state_beta_dist(pred_latent)
+        if should_pred_agent_state:
+            agent_embeds = rearrange(embeds.agent[:, :-1], 'b t 1 d -> b t d')
 
-            # scale latent from tanh-ed (-1, 1) to (0, 1)
+            agent_pred_input = agent_embeds
 
+            if self.action_embedder.has_actions:
+                next_actions = rearrange(next_action_tokens, '... 1 d -> ... d') if next_action_tokens.ndim == 4 else next_action_tokens
+
+                seq_len = min(agent_pred_input.shape[1], next_actions.shape[1])
+                agent_pred_input = cat((agent_pred_input[:, :seq_len], next_actions[:, :seq_len]), dim = -1)
+
+            pred_latent = self.to_agent_state_pred(agent_pred_input)
+            pred_latent = rearrange(pred_latent, 'b t ... -> b t 1 ...')
+
+            seq_len = pred_latent.shape[1]
+
+            latent_to_pred = latents[:, 1:(1 + seq_len)]
             latent_to_pred = (latent_to_pred + 1.) / 2.
             latent_to_pred = latent_to_pred.clamp(min = self.eps_latent_pred, max = 1. - self.eps_latent_pred)
 
+            dist = self.agent_state_beta_dist(pred_latent)
             agent_state_pred_losses = -dist.log_prob(latent_to_pred)
 
             if is_var_len:
-                agent_state_pred_loss = agent_state_pred_losses[loss_mask_without_last].mean()
+                agent_state_pred_loss = agent_state_pred_losses[loss_mask_without_last[:, :seq_len]].mean()
             else:
                 agent_state_pred_loss = agent_state_pred_losses.mean()
 
