@@ -81,6 +81,7 @@ def test_e2e(
         prob_shortcut_train = prob_shortcut_train,
         add_reward_embed_to_agent_token = add_reward_embed_to_agent_token,
         add_state_pred_head = add_state_pred_head,
+        agent_predicts_state = add_state_pred_head,
         num_residual_streams = num_residual_streams,
         time_block_every = 1
     )

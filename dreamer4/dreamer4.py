@@ -1,7 +1,6 @@
 from __future__ import annotations
 from typing import Callable
 
-import math
 from math import ceil, log2
 from random import random
 from contextlib import nullcontext
@@ -93,13 +92,13 @@ VideoTokenizerIntermediates = namedtuple('VideoTokenizerIntermediates', ('losses
 
 TokenizerLosses = namedtuple('TokenizerLosses', ('recon', 'lpips', 'time_decorr', 'space_decorr', 'latent_ar'))
 
-WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'shortcut', 'rewards', 'discrete_actions', 'continuous_actions', 'state_pred'))
+WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'shortcut', 'rewards', 'discrete_actions', 'continuous_actions', 'state_pred', 'agent_state_pred'))
 
 AttentionIntermediates = namedtuple('AttentionIntermediates', ('next_kv_cache', 'normed_inputs'))
 
 TransformerIntermediates = namedtuple('TransformerIntermediates', ('next_kv_cache', 'normed_time_inputs', 'normed_space_inputs', 'next_rnn_hiddens', 'layer_hiddens'), defaults=(None,))
 
-Predictions = namedtuple('Predictions', ('flow', 'proprioception', 'state'))
+Predictions = namedtuple('Predictions', ('flow', 'proprioception', 'state', 'agent_state'))
 
 Embeds = namedtuple('Embeds', ['agent', 'state_pred'])
 
@@ -2397,6 +2396,8 @@ class DynamicsWorldModel(Module):
         add_state_pred_head = False,
         state_pred_loss_weight = 0.1,
         state_entropy_bonus_weight = 0.05,
+        agent_predicts_state = False,
+        agent_state_pred_loss_weight = 0.1,
         eps_latent_pred = 1e-6,
         num_discrete_actions: int | tuple[int, ...] = 0,
         num_continuous_actions = 0,
@@ -2538,9 +2539,10 @@ class DynamicsWorldModel(Module):
 
         self.should_pred_state = add_state_pred_head and state_pred_loss_weight > 0.
 
+        self.eps_latent_pred = eps_latent_pred
+
         if self.should_pred_state:
             self.state_pred_token = nn.Parameter(torch.randn(dim) * 1e-2)
-            self.eps_latent_pred = eps_latent_pred
 
             self.to_state_pred = Sequential(
                 RMSNorm(dim),
@@ -2552,6 +2554,20 @@ class DynamicsWorldModel(Module):
 
         self.state_entropy_bonus_weight = state_entropy_bonus_weight
         self.add_state_entropy_bonus = self.should_pred_state and state_entropy_bonus_weight > 0.
+
+        # agent predicting state
+
+        self.agent_predicts_state = agent_predicts_state
+        self.agent_state_pred_loss_weight = agent_state_pred_loss_weight
+
+        if self.agent_predicts_state:
+            self.to_agent_state_pred = Sequential(
+                RMSNorm(dim),
+                nn.Linear(dim, num_latent_tokens * dim_latent * 2),
+                Rearrange('... (n d two) -> ... n d two', n = num_latent_tokens, two = 2)
+            )
+
+            self.agent_state_beta_dist = BetaDist(unimodal = True)
 
         # reinforcement related
 
@@ -4026,9 +4042,16 @@ class DynamicsWorldModel(Module):
             else:
                 pred_state = None
 
+            # maybe agent state pred
+
+            if self.agent_predicts_state:
+                pred_agent_state = self.to_agent_state_pred(agent_tokens)
+            else:
+                pred_agent_state = None
+
             # returning
 
-            predictions = Predictions(pred, pred_proprio, pred_state)
+            predictions = Predictions(pred, pred_proprio, pred_state, pred_agent_state)
 
             embeds = Embeds(agent_tokens, state_pred_token)
 
@@ -4047,12 +4070,15 @@ class DynamicsWorldModel(Module):
         # forward the network
 
         pred, (embeds, intermediates) = _get_prediction(noised_latents, noised_proprio, signal_levels, step_sizes_log2, return_agent_tokens = True, return_time_cache = True, return_intermediates = return_intermediates)
-
         if return_pred_only:
             if not return_intermediates:
                 return pred
 
             return pred, (embeds, intermediates)
+
+        # extract predictions that would be lost when `pred` is overwritten below
+        state_pred_logits = pred.state if self.should_pred_state else None
+        agent_state_pred_logits = pred.agent_state if self.agent_predicts_state else None
 
         # pack the predictions to calculate flow for different modalities all at once
 
@@ -4232,7 +4258,7 @@ class DynamicsWorldModel(Module):
         state_pred_loss = self.zero
 
         if self.should_pred_state:
-            pred_latent, latent_to_pred = pred.state[:, :-1], latents[:, 1:]
+            pred_latent, latent_to_pred = state_pred_logits[:, :-1], latents[:, 1:]
 
             dist = self.state_beta_dist(pred_latent)
 
@@ -4322,9 +4348,30 @@ class DynamicsWorldModel(Module):
                 else:
                     continuous_action_loss = reduce(-continuous_log_probs, 'mtp b t na -> mtp', 'mean')
 
+        # maybe agent predicting state prediction loss
+
+        agent_state_pred_loss = self.zero
+
+        if self.agent_predicts_state:
+            pred_latent, latent_to_pred = agent_state_pred_logits[:, :-1], latents[:, 1:]
+
+            dist = self.agent_state_beta_dist(pred_latent)
+
+            # scale latent from tanh-ed (-1, 1) to (0, 1)
+
+            latent_to_pred = (latent_to_pred + 1.) / 2.
+            latent_to_pred = latent_to_pred.clamp(min = self.eps_latent_pred, max = 1. - self.eps_latent_pred)
+
+            agent_state_pred_losses = -dist.log_prob(latent_to_pred)
+
+            if is_var_len:
+                agent_state_pred_loss = agent_state_pred_losses[loss_mask_without_last].mean()
+            else:
+                agent_state_pred_loss = agent_state_pred_losses.mean()
+
         # handle loss normalization
 
-        losses = WorldModelLosses(flow_loss, shortcut_flow_loss, reward_loss, discrete_action_loss, continuous_action_loss, state_pred_loss)
+        losses = WorldModelLosses(flow_loss, shortcut_flow_loss, reward_loss, discrete_action_loss, continuous_action_loss, state_pred_loss, agent_state_pred_loss)
 
         if exists(self.flow_loss_normalizer):
             flow_loss = self.flow_loss_normalizer(flow_loss, update_ema = update_loss_ema)
@@ -4349,7 +4396,8 @@ class DynamicsWorldModel(Module):
             (reward_loss * self.reward_loss_weight).sum() +
             (discrete_action_loss * self.discrete_action_loss_weight).sum() +
             (continuous_action_loss * self.continuous_action_loss_weight).sum() +
-            (state_pred_loss * self.state_pred_loss_weight)
+            (state_pred_loss * self.state_pred_loss_weight) +
+            (agent_state_pred_loss * self.agent_state_pred_loss_weight)
         )
 
         if not (return_all_losses or return_intermediates):
