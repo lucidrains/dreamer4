@@ -32,6 +32,7 @@ from assoc_scan import AssocScan
 
 from discrete_continuous_embed_readout import MultiCategorical
 
+import einx
 from torch_einops_utils import (
     maybe,
     align_dims_left,
@@ -3749,6 +3750,7 @@ class DynamicsWorldModel(Module):
         update_loss_ema = None,
         latent_has_view_dim = False,
         seed = None,
+        agent_token_cond = None,         # (b t d) optional conditioning to be summed to agent tokens
         time_modifier_fn: Callable | None = None
     ):
         # handle video or latents
@@ -3899,6 +3901,10 @@ class DynamicsWorldModel(Module):
         # handle agent tokens w/ actions and task embeds
 
         agent_tokens = repeat(agent_tokens, 'b ... d -> b t ... d', t = time)
+
+        if exists(agent_token_cond):
+            assert self.num_agents == 1, 'agent_token_cond only supports the single agent case for now'
+            agent_tokens = einx.add('b t n d, b t d', agent_tokens, agent_token_cond)
 
         # empty token
 
