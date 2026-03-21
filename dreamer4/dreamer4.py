@@ -103,6 +103,8 @@ Predictions = namedtuple('Predictions', ['flow', 'proprioception', 'state'])
 
 Embeds = namedtuple('Embeds', ['agent', 'state_pred'])
 
+Actions = namedtuple('Actions', ['discrete', 'continuous'])
+
 MaybeTensor = Tensor | None
 
 @dataclass
@@ -112,8 +114,8 @@ class Experience:
     proprio: MaybeTensor = None
     agent_embed: MaybeTensor = None
     rewards: Tensor | None = None
-    actions: tuple[MaybeTensor, MaybeTensor] | None = None
-    log_probs: tuple[MaybeTensor, MaybeTensor] | None = None
+    actions: Actions | None = None
+    log_probs: Actions | None = None
     old_action_unembeds: tuple[MaybeTensor, MaybeTensor] | None = None
     values: MaybeTensor = None
     step_size: int | None = None
@@ -1835,7 +1837,7 @@ class VideoTokenizer(Module):
         space_decorr_loss_weight = 4e-3,
         decorr_sample_frac = 0.25,
         num_residual_streams = 1,
-        use_loss_normalization = True,
+        use_loss_normalization = False,
         use_causal_conv3d = False,
         causal_conv3d_kernel_size = 3,
         decoder_flow_steps = 1,
@@ -2435,7 +2437,7 @@ class DynamicsWorldModel(Module):
         value_clip = 0.4,
         policy_entropy_weight = .01,
         gae_use_accelerated = False,
-        use_loss_normalization = True
+        use_loss_normalization = False
     ):
         super().__init__()
         self.dim = dim
@@ -3348,8 +3350,9 @@ class DynamicsWorldModel(Module):
         prompt_proprio: Tensor | None = None,
         prompt_discrete_actions: Tensor | None = None,
         prompt_continuous_actions: Tensor | None = None,
-        prompt_rewards: Tensor | None = None
-
+        prompt_rewards: Tensor | None = None,
+        discrete_temperature = 1.,
+        continuous_temperature = 1.,
     ): # (b t n d) | (b c t h w)
 
         # handy flag for returning generations for rl
@@ -3403,6 +3406,8 @@ class DynamicsWorldModel(Module):
         # teacher forcing to start with
 
         if exists(prompt_latents):
+            prompt_latents = rearrange(prompt_latents, 'b t n d -> b t 1 n d') if prompt_latents.ndim == 4 else prompt_latents
+
             assert prompt_latents.shape[0] == batch_size
             latents = prompt_latents.clone()
         else:
@@ -3626,7 +3631,13 @@ class DynamicsWorldModel(Module):
 
                 # sample actions
 
-                sampled_discrete_actions, sampled_continuous_actions = self.action_embedder.sample(policy_embed, pred_head_index = 0, squeeze = True)
+                sampled_discrete_actions, sampled_continuous_actions = self.action_embedder.sample(
+                    policy_embed,
+                    pred_head_index = 0,
+                    squeeze = True,
+                    discrete_temperature = discrete_temperature,
+                    continuous_temperature = continuous_temperature
+                )
 
                 decoded_discrete_actions = safe_cat((decoded_discrete_actions, sampled_discrete_actions), dim = 1)
                 decoded_continuous_actions = safe_cat((decoded_continuous_actions, sampled_continuous_actions), dim = 1)
@@ -3725,10 +3736,10 @@ class DynamicsWorldModel(Module):
             gen.rewards = decoded_rewards
 
         if return_agent_actions:
-            gen.actions = (decoded_discrete_actions, decoded_continuous_actions)
+            gen.actions = Actions(decoded_discrete_actions, decoded_continuous_actions)
 
         if return_log_probs_and_values:
-            gen.log_probs = (decoded_discrete_log_probs, decoded_continuous_log_probs)
+            gen.log_probs = Actions(decoded_discrete_log_probs, decoded_continuous_log_probs)
 
             gen.values = decoded_values
 
@@ -4318,39 +4329,45 @@ class DynamicsWorldModel(Module):
         ):
             assert self.action_embedder.has_actions
 
-            # handle actions having time vs time - 1 length
-            # remove the first action if it is equal to time (as it would come from some agent token in the past)
+            # if shift_action_tokens, pad a sentinel at the front so that
+            # multi-token-prediction targets are shifted by one after creation
 
             has_discrete = exists(discrete_actions)
             has_continuous = exists(continuous_actions)
 
-            if has_discrete and discrete_actions.shape[1] == time and shift_action_tokens:
-                discrete_actions = discrete_actions[:, 1:]
+            if has_discrete and shift_action_tokens:
+                discrete_actions = pad_at_dim(discrete_actions, (1, 0), value = -1, dim = 1)
 
-            if has_continuous and continuous_actions.shape[1] == time and shift_action_tokens:
-                continuous_actions = continuous_actions[:, 1:]
+            if has_continuous and shift_action_tokens:
+                continuous_actions = pad_at_dim(continuous_actions, (1, 0), value = 0., dim = 1)
 
             first_has_action = discrete_actions if has_discrete else continuous_actions
             pred_len = first_has_action.shape[1]
 
             # only for 1 agent
 
-            agent_tokens = rearrange(agent_tokens, 'b t 1 d -> b t d')
-            policy_embed = self.policy_head(agent_tokens[:, :pred_len])
+            encoded_agent_tokens = rearrange(embeds.agent, 'b t 1 d -> b t d')
+            policy_embed = self.policy_head(encoded_agent_tokens[:, :pred_len])
 
             # constitute multi token prediction targets
+
+            def make_mtp_targets(actions):
+                targets, mask = create_multi_token_prediction_targets(actions, self.multi_token_pred_len)
+
+                if shift_action_tokens:
+                    targets, mask = targets[:, 1:], mask[:, 1:]
+
+                targets = rearrange(targets, 'b t mtp ... -> mtp b t ...')
+                mask = rearrange(mask, 'b t mtp -> mtp b t')
+                return targets, mask
 
             discrete_action_targets = continuous_action_targets = None
 
             if has_discrete:
-                discrete_action_targets, discrete_mask = create_multi_token_prediction_targets(discrete_actions, self.multi_token_pred_len)
-                discrete_action_targets = rearrange(discrete_action_targets, 'b t mtp ... -> mtp b t ...')
-                discrete_mask = rearrange(discrete_mask, 'b t mtp -> mtp b t')
+                discrete_action_targets, discrete_mask = make_mtp_targets(discrete_actions)
 
             if has_continuous:
-                continuous_action_targets, continuous_mask = create_multi_token_prediction_targets(continuous_actions, self.multi_token_pred_len)
-                continuous_action_targets = rearrange(continuous_action_targets, 'b t mtp ... -> mtp b t ...')
-                continuous_mask = rearrange(continuous_mask, 'b t mtp -> mtp b t')
+                continuous_action_targets, continuous_mask = make_mtp_targets(continuous_actions)
 
             discrete_log_probs, continuous_log_probs = self.action_embedder.log_probs(
                 policy_embed,
