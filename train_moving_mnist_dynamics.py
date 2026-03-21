@@ -34,12 +34,12 @@ from dreamer4.trainers import BehaviorCloneTrainer, save_video_grid_as_gif
 
 def random_action_collate(batch):
     use_continuous = random() > 0.5
-    
+
     for item in batch:
         if 'continuous_actions' in item and 'discrete_actions' in item:
             key_to_drop = 'discrete_actions' if use_continuous else 'continuous_actions'
             item.pop(key_to_drop, None)
-            
+
     return default_collate(batch)
 
 # custom 3x3 grid sample generation
@@ -85,7 +85,7 @@ def custom_3x3_grid_sample(trainer, batch_data):
         )
 
         generated_video = generated_video.clamp(0., 1.)
-        
+
         if not exists(trainer.results_folder):
             continue
 
@@ -150,18 +150,18 @@ def main(
     if checkpoint_path.is_dir():
         ema_checkpoints = list(checkpoint_path.glob('tokenizer-*-ema.pt'))
         assert ema_checkpoints, f"No EMA tokenizer checkpoints found in {checkpoint_path}"
-        
+
         def get_step(p):
             try:
                 return int(p.stem.split('-')[1])
             except ValueError:
                 return -1
-            
+
         checkpoint_path = max(ema_checkpoints, key = get_step)
-    
+
     assert checkpoint_path.exists(), f"Tokenizer checkpoint missing at {checkpoint_path}"
     print(f"Loading Tokenizer from: {checkpoint_path}")
-    
+
     tokenizer = VideoTokenizer.init_and_load(str(checkpoint_path), strict=False)
     tokenizer.eval().requires_grad_(False)
 

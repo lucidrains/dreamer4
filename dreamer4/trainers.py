@@ -444,7 +444,7 @@ class BehaviorCloneTrainer(Module):
         self.model = model
         self.dataset = dataset
         self.train_dataloader = DataLoader(dataset, batch_size = batch_size, drop_last = True, shuffle = True, collate_fn = collate_fn)
-        
+
         self.custom_sample_fn = custom_sample_fn
 
         self.grad_accum_every = grad_accum_every
@@ -651,7 +651,7 @@ class BehaviorCloneTrainer(Module):
             real_video = batch_data['video'][:self.sample_batch_size]
 
         image_size = prompt_video.shape[-1]
-        
+
         kwargs = dict()
         is_autoregressive = exists(self.sample_autoregressive_actions) and self.sample_autoregressive_actions
 
@@ -662,7 +662,7 @@ class BehaviorCloneTrainer(Module):
                     continue
 
                 actions = batch_data[action_key][:self.sample_batch_size]
-                
+
                 # sticky the last provided prompt action and extrapolate it for the rest of generation
 
                 if self.sample_sticky_action:
@@ -670,10 +670,10 @@ class BehaviorCloneTrainer(Module):
                     actions = repeat(actions, 'b 1 d -> b t d', t = self.sample_time_steps - 1)
                     kwargs[f'prompt_{action_key}'] = actions
                     continue
-                    
+
                 seq_len = actions.shape[1]
                 target_len = self.sample_time_steps - 1
-                
+
                 if seq_len < target_len and not is_autoregressive:
                     padding = actions[:, -1:]
                     padding = repeat(padding, 'b 1 d -> b t d', t = target_len - seq_len)

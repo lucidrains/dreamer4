@@ -3520,7 +3520,7 @@ class DynamicsWorldModel(Module):
                 if exists(decoded_discrete_actions) and not is_empty(decoded_discrete_actions):
                     curr_discrete = decoded_discrete_actions[:, :curr_time_steps]
                     curr_discrete = pad_right_at_dim_to(curr_discrete, curr_time_steps, dim = 1)
-                    
+
                 curr_continuous = None
                 if exists(decoded_continuous_actions) and not is_empty(decoded_continuous_actions):
                     curr_continuous = decoded_continuous_actions[:, :curr_time_steps]

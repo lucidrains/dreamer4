@@ -78,11 +78,11 @@ class MovingMNISTDataset(Dataset):
 
         if self.action_type in ('discrete', 'both'):
             bin_size = (self.max_velocity - self.min_velocity) / self.num_action_bins
-            
+
             disc_action = torch.tensor([vel_x, vel_y])
             disc_action = disc_action.sub_(self.min_velocity).div_(bin_size).long()
             disc_action = disc_action.clamp_(max = self.num_action_bins - 1)
-            
+
             res['discrete_actions'] = repeat(disc_action, 'd -> t d', t = action_seq_len)
 
         return res
