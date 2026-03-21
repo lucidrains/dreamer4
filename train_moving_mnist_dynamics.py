@@ -20,16 +20,81 @@
 # ///
 
 from pathlib import Path
-
 import fire
-from tqdm import tqdm
+import torch
+from torch.utils.data import default_collate
+from random import random
+from einops import repeat
 
 from dataset_moving_mnist import MovingMNISTDataset
-from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
-from dreamer4.trainers import BehaviorCloneTrainer
+from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel, exists
+from dreamer4.trainers import BehaviorCloneTrainer, save_video_grid_as_gif
+
+# dataset action collation
+
+def random_action_collate(batch):
+    use_continuous = random() > 0.5
+    
+    for item in batch:
+        if 'continuous_actions' in item and 'discrete_actions' in item:
+            key_to_drop = 'discrete_actions' if use_continuous else 'continuous_actions'
+            item.pop(key_to_drop, None)
+            
+    return default_collate(batch)
+
+# custom 3x3 grid sample generation
+
+def custom_3x3_grid_sample(trainer, batch_data):
+    device = trainer.device
+    dataset = trainer.dataset
+
+    velocities = torch.tensor([
+        [-2., -2.], [ 0., -2.], [ 2., -2.],
+        [-2.,  0.], [ 0.,  0.], [ 2.,  0.],
+        [-2.,  2.], [ 0.,  2.], [ 2.,  2.]
+    ], device = device)
+
+    # perfectly branch out from the same static origin
+    video = batch_data['video'][0:1, :, :1]
+    prompt_video = repeat(video, '1 c f h w -> b c f h w', b = 9)
+
+    bin_size = (dataset.max_velocity - dataset.min_velocity) / dataset.num_action_bins
+
+    for is_continuous in (True, False):
+        kwargs = dict()
+
+        if is_continuous:
+            actions = repeat(velocities, 'b d -> b t d', t = 15)
+            kwargs['prompt_continuous_actions'] = actions
+        else:
+            discrete_velocities = velocities.clone()
+            discrete_velocities.sub_(dataset.min_velocity).div_(bin_size)
+            discrete_velocities = discrete_velocities.long().clamp_(max = dataset.num_action_bins - 1)
+            actions = repeat(discrete_velocities, 'b d -> b t d', t = 15)
+            kwargs['prompt_discrete_actions'] = actions
+
+        generated_video = trainer.unwrap_model(trainer.model).generate(
+            prompt = prompt_video,
+            time_steps = 16,
+            num_steps = 8,
+            batch_size = 9,
+            image_height = video.shape[-1],
+            image_width = video.shape[-1],
+            return_decoded_video = True,
+            **kwargs
+        )
+
+        generated_video = generated_video.clamp(0., 1.)
+        
+        if not exists(trainer.results_folder):
+            continue
+
+        prefix = 'continuous' if is_continuous else 'discrete'
+        gif_path = trainer.results_folder / f'sample-{prefix}-conditioned-{trainer.step.item()}.gif'
+        save_video_grid_as_gif(generated_video, gif_path)
 
 def main(
-    tokenizer_checkpoint_path: str,
+    tokenizer_checkpoint_path: str = './checkpoints_mnist_tokenizer',
     num_frames = 5,
     image_size = 32,
     digit_size = 14,
@@ -50,16 +115,21 @@ def main(
     use_loss_normalization = False,
     multi_token_pred_len = 1,
     shortcut_loss_weight = 5e-2,
-    sample_prompt_frames = 2
+    sample_prompt_frames = None,
+    sample_autoregressive_actions = False,
+    condition_on_actions = False,
+    num_action_bins = 5
 ):
     import shutil
+
+    if sample_prompt_frames is None:
+        sample_prompt_frames = 1 if condition_on_actions else 2
 
     # clear old artifacts
 
     log_path = Path(log_dir)
     if log_path.exists():
         shutil.rmtree(log_path)
-
     log_path.mkdir(exist_ok = True, parents = True)
 
     # instantiate the dataset
@@ -67,7 +137,10 @@ def main(
     dataset = MovingMNISTDataset(
         num_frames = num_frames,
         image_size = image_size,
-        digit_size = digit_size
+        digit_size = digit_size,
+        condition_on_actions = condition_on_actions,
+        action_type = 'both',
+        num_action_bins = num_action_bins
     )
 
     # Load frozen tokenizer
@@ -76,16 +149,20 @@ def main(
 
     if checkpoint_path.is_dir():
         ema_checkpoints = list(checkpoint_path.glob('tokenizer-*-ema.pt'))
-        assert len(ema_checkpoints) > 0, f"No EMA tokenizer checkpoints found in {tokenizer_checkpoint_path}"
-
-        # Sort by step number (e.g. tokenizer-15000-ema.pt -> 15000)
-        get_step = lambda p: int(p.stem.split('-')[1])
-        checkpoint_path = max(ema_checkpoints, key=get_step)
-
+        assert ema_checkpoints, f"No EMA tokenizer checkpoints found in {checkpoint_path}"
+        
+        def get_step(p):
+            try:
+                return int(p.stem.split('-')[1])
+            except ValueError:
+                return -1
+            
+        checkpoint_path = max(ema_checkpoints, key = get_step)
+    
     assert checkpoint_path.exists(), f"Tokenizer checkpoint missing at {checkpoint_path}"
     print(f"Loading Tokenizer from: {checkpoint_path}")
-
-    tokenizer = VideoTokenizer.init_and_load(str(checkpoint_path))
+    
+    tokenizer = VideoTokenizer.init_and_load(str(checkpoint_path), strict=False)
     tokenizer.eval().requires_grad_(False)
 
     # initialize world model
@@ -100,6 +177,8 @@ def main(
         use_loss_normalization = use_loss_normalization,
         multi_token_pred_len = multi_token_pred_len,
         shortcut_loss_weight = shortcut_loss_weight,
+        num_continuous_actions = 2 if condition_on_actions else 0,
+        num_discrete_actions = (num_action_bins, num_action_bins) if condition_on_actions else 0,
     )
 
     # initialize trainer
@@ -119,7 +198,12 @@ def main(
         use_tensorboard_logger = True,
         log_video = True,
         sample_prompt_frames = sample_prompt_frames,
+        sample_sticky_action = condition_on_actions and not sample_autoregressive_actions,
+        sample_autoregressive_actions = sample_autoregressive_actions,
+        sample_filename_prefix = 'sample-baseline',
         grad_accum_every = grad_accum_every,
+        collate_fn = random_action_collate if condition_on_actions else None,
+        custom_sample_fn = custom_3x3_grid_sample if condition_on_actions else None
     )
 
     # Train dynamics model

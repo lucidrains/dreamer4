@@ -3431,8 +3431,8 @@ class DynamicsWorldModel(Module):
             num_continuous_action_types = self.action_embedder.num_continuous_action_types
             decoded_continuous_actions = prompt_continuous_actions.clone() if exists(prompt_continuous_actions) else empty((batch_size, 0, num_continuous_action_types), device = self.device, dtype = torch.float)
         else:
-            decoded_discrete_actions = None
-            decoded_continuous_actions = None
+            decoded_discrete_actions = prompt_discrete_actions
+            decoded_continuous_actions = prompt_continuous_actions
 
         # policy optimization related
 
@@ -3514,6 +3514,20 @@ class DynamicsWorldModel(Module):
 
                 signal_levels_with_context = F.pad(signal_levels, (curr_time_steps, 0), value = self.max_steps - 1)
 
+                # action conditioning
+
+                curr_discrete = None
+                if exists(decoded_discrete_actions) and not is_empty(decoded_discrete_actions):
+                    curr_discrete = decoded_discrete_actions[:, :curr_time_steps]
+                    curr_discrete = pad_right_at_dim_to(curr_discrete, curr_time_steps, dim = 1)
+                    
+                curr_continuous = None
+                if exists(decoded_continuous_actions) and not is_empty(decoded_continuous_actions):
+                    curr_continuous = decoded_continuous_actions[:, :curr_time_steps]
+                    curr_continuous = pad_right_at_dim_to(curr_continuous, curr_time_steps, dim = 1)
+
+                # forward for prediction
+
                 pred, (embeds, next_time_cache) = self.forward(
                     latents = noised_latent_with_context,
                     signal_levels = signal_levels_with_context,
@@ -3521,8 +3535,8 @@ class DynamicsWorldModel(Module):
                     rewards = decoded_rewards,
                     tasks = tasks,
                     latent_gene_ids = latent_gene_ids,
-                    discrete_actions = decoded_discrete_actions if exists(decoded_discrete_actions) and not is_empty(decoded_discrete_actions) else None,
-                    continuous_actions = decoded_continuous_actions if exists(decoded_continuous_actions) and not is_empty(decoded_continuous_actions) else None,
+                    discrete_actions = curr_discrete,
+                    continuous_actions = curr_continuous,
                     proprio = noised_proprio_with_context,
                     time_cache = time_cache,
                     latent_is_noised = True,

@@ -413,14 +413,19 @@ class BehaviorCloneTrainer(Module):
         sample_time_steps = 16,
         sample_batch_size = 25,
         sample_prompt_frames = 1,
+        sample_sticky_action = False,
+        sample_autoregressive_actions = None,
+        sample_filename_prefix = 'sample',
         use_ema = False,
         ema_decay = 0.999,
         grad_accum_every = 1,
         self_flow = False,
         self_flow_student_layer = -3,
-        self_flow_teacher_layer = -1,
+        self_flow_layer = -1,
         self_flow_loss_weight = 1.0,
-        self_flow_kwargs: dict = dict()
+        self_flow_kwargs: dict = dict(),
+        collate_fn = None,
+        custom_sample_fn = None
     ):
         super().__init__()
         batch_size = min(batch_size, len(dataset))
@@ -438,7 +443,9 @@ class BehaviorCloneTrainer(Module):
 
         self.model = model
         self.dataset = dataset
-        self.train_dataloader = DataLoader(dataset, batch_size = batch_size, drop_last = True, shuffle = True)
+        self.train_dataloader = DataLoader(dataset, batch_size = batch_size, drop_last = True, shuffle = True, collate_fn = collate_fn)
+        
+        self.custom_sample_fn = custom_sample_fn
 
         self.grad_accum_every = grad_accum_every
 
@@ -517,6 +524,9 @@ class BehaviorCloneTrainer(Module):
         self.sample_time_steps = sample_time_steps
         self.sample_batch_size = sample_batch_size
         self.sample_prompt_frames = sample_prompt_frames
+        self.sample_sticky_action = sample_sticky_action
+        self.sample_autoregressive_actions = sample_autoregressive_actions
+        self.sample_filename_prefix = sample_filename_prefix
 
         self.checkpoint_every = checkpoint_every
         self.checkpoint_folder = Path(checkpoint_folder)
@@ -641,6 +651,35 @@ class BehaviorCloneTrainer(Module):
             real_video = batch_data['video'][:self.sample_batch_size]
 
         image_size = prompt_video.shape[-1]
+        
+        kwargs = dict()
+        is_autoregressive = exists(self.sample_autoregressive_actions) and self.sample_autoregressive_actions
+
+        if not is_tensor(batch_data):
+            action_idx = max(0, self.sample_prompt_frames - 2)
+            for action_key in ('continuous_actions', 'discrete_actions'):
+                if action_key not in batch_data:
+                    continue
+
+                actions = batch_data[action_key][:self.sample_batch_size]
+                
+                # sticky the last provided prompt action and extrapolate it for the rest of generation
+
+                if self.sample_sticky_action:
+                    actions = actions[:, action_idx:(action_idx + 1)]
+                    actions = repeat(actions, 'b 1 d -> b t d', t = self.sample_time_steps - 1)
+                    kwargs[f'prompt_{action_key}'] = actions
+                    continue
+                    
+                seq_len = actions.shape[1]
+                target_len = self.sample_time_steps - 1
+                
+                if seq_len < target_len and not is_autoregressive:
+                    padding = actions[:, -1:]
+                    padding = repeat(padding, 'b 1 d -> b t d', t = target_len - seq_len)
+                    actions = torch.cat((actions, padding), dim = 1)
+
+                kwargs[f'prompt_{action_key}'] = actions
 
         generated_video = unwrapped.generate(
             prompt = prompt_video,
@@ -648,7 +687,9 @@ class BehaviorCloneTrainer(Module):
             batch_size = self.sample_batch_size,
             image_height = image_size,
             image_width = image_size,
-            return_decoded_video = True
+            return_decoded_video = True,
+            return_agent_actions = is_autoregressive,
+            **kwargs
         )
 
         generated_video = generated_video.clamp(0., 1.)
@@ -656,22 +697,28 @@ class BehaviorCloneTrainer(Module):
 
         if exists(self.results_folder):
             # Prepend the prompt to the generated video
-            generated_video = torch.cat((prompt_video, generated_video), dim=2)
+            generated_video = torch.cat((prompt_video, generated_video), dim = 2)
 
             gen_len = generated_video.shape[2]
             real_len = real_video.shape[2]
 
             # pad generated or real video so they match in time length for concat
+
             if gen_len < real_len:
-                padding = torch.zeros(shape_with_replace(generated_video, {2: real_len - gen_len}), device=generated_video.device)
-                generated_video = torch.cat((generated_video, padding), dim=2)
+                pad_shape = shape_with_replace(generated_video, {2: real_len - gen_len})
+                padding = generated_video.new_zeros(pad_shape)
+                generated_video = torch.cat((generated_video, padding), dim = 2)
             elif real_len < gen_len:
-                padding = torch.zeros(shape_with_replace(real_video, {2: gen_len - real_len}), device=real_video.device)
-                real_video = torch.cat((real_video, padding), dim=2)
+                pad_shape = shape_with_replace(real_video, {2: gen_len - real_len})
+                padding = real_video.new_zeros(pad_shape)
+                real_video = torch.cat((real_video, padding), dim = 2)
 
             combined_video = torch.cat((real_video, generated_video), dim = -1)
-            gif_path = self.results_folder / f'sample-{self.step.item()}.gif'
+            gif_path = self.results_folder / f'{self.sample_filename_prefix}-{self.step.item()}.gif'
             save_video_grid_as_gif(combined_video, gif_path)
+
+        if exists(self.custom_sample_fn):
+            self.custom_sample_fn(self, batch_data)
 
     def forward(
         self
@@ -774,6 +821,12 @@ class BehaviorCloneTrainer(Module):
 
             if total_reward_loss > 0.:
                 postfix['reward'] = f"{total_reward_loss:.4f}"
+
+            if total_discrete_action_loss > 0.:
+                postfix['disc_act'] = f"{total_discrete_action_loss:.4f}"
+
+            if total_continuous_action_loss > 0.:
+                postfix['cont_act'] = f"{total_continuous_action_loss:.4f}"
 
             pbar.set_postfix(ordered_dict = postfix)
 
