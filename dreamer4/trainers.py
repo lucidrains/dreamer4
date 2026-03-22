@@ -276,7 +276,8 @@ class VideoTokenizerTrainer(Module):
             total_loss = 0.
 
             for _ in range(self.grad_accum_every):
-                video = next(iter_train_dl)
+                data = next(iter_train_dl)
+                video = data if is_tensor(data) else data['video']
 
                 loss, (losses, recon_video) = self.model(
                     video,

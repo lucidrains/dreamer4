@@ -13,7 +13,6 @@ def exists(v):
 @param('num_spatial_tokens', (2, 8))
 @param('signal_and_step_passed_in', (False, True))
 @param('condition_on_actions', (False, True))
-@param('num_residual_streams', (1, 4))
 @param('add_reward_embed_to_agent_token', (False, True))
 @param('add_state_pred_head', (False, True))
 @param('use_time_cache', (False, True))
@@ -27,7 +26,6 @@ def test_e2e(
     num_spatial_tokens,
     signal_and_step_passed_in,
     condition_on_actions,
-    num_residual_streams,
     add_reward_embed_to_agent_token,
     add_state_pred_head,
     use_time_cache,
@@ -44,7 +42,6 @@ def test_e2e(
         patch_size = 16,
         attn_dim_head = 8,
         num_latent_tokens = 4,
-        num_residual_streams = num_residual_streams,
         encoder_add_decorr_aux_loss = True,
         decorr_sample_frac = 1.
     )
@@ -82,7 +79,6 @@ def test_e2e(
         add_reward_embed_to_agent_token = add_reward_embed_to_agent_token,
         add_state_pred_head = add_state_pred_head,
         agent_predicts_state = add_state_pred_head,
-        num_residual_streams = num_residual_streams,
         time_block_every = 1
     )
 
@@ -620,8 +616,7 @@ def test_dream_trainer():
         pred_orig_latent = True,
         num_discrete_actions = 4,
         attn_dim_head = 16,
-        prob_shortcut_train = 0.9,
-        num_residual_streams = 1
+        prob_shortcut_train = 0.9
     )
 
     # training from self-generations (dreams)
@@ -652,8 +647,7 @@ def test_cache_generate():
         pred_orig_latent = True,
         num_discrete_actions = 4,
         attn_dim_head = 16,
-        prob_shortcut_train = 0.9,
-        num_residual_streams = 1
+        prob_shortcut_train = 0.9
     )
 
     generated, time_cache = dynamics.generate(1, return_time_cache = True)
@@ -700,8 +694,7 @@ def test_online_rl(
         pred_orig_latent = True,
         num_discrete_actions = 4,
         attn_dim_head = 16,
-        prob_shortcut_train = 0.9,
-        num_residual_streams = 1
+        prob_shortcut_train = 0.9
     )
 
     from dreamer4.mocks import MockEnv
@@ -780,8 +773,7 @@ def test_proprioception(
         dim_proprio = 21,
         num_tasks = 2,
         num_video_views = num_video_views,
-        num_discrete_actions = 4,
-        num_residual_streams = 1
+        num_discrete_actions = 4
     )
 
     if num_video_views > 1:
@@ -840,8 +832,7 @@ def test_epo():
         dim_proprio = 21,
         num_tasks = 4,
         num_latent_genes = 16,
-        num_discrete_actions = 4,
-        num_residual_streams = 1
+        num_discrete_actions = 4
     )
 
     fitness = torch.randn(16,)
@@ -893,8 +884,7 @@ def test_interact_with_env_dict_obs(vectorized):
         dim_proprio=21,
         num_tasks=4,
         num_latent_genes=16,
-        num_discrete_actions=4,
-        num_residual_streams=1
+        num_discrete_actions=4
     )
 
     from dreamer4.mocks import MockDictEnv

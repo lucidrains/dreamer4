@@ -24,7 +24,6 @@ from adam_atan2_pytorch import MuonAdamAtan2
 from x_mlps_pytorch.ensemble import Ensemble
 from x_mlps_pytorch.normed_mlp import create_mlp
 
-from hyper_connections import mc_get_init_and_expand_reduce_stream_functions
 
 from vit_pytorch.vit_with_decorr import DecorrelationLoss
 
@@ -43,8 +42,10 @@ from torch_einops_utils import (
     masked_mean,
     safe_stack,
     safe_cat,
-    slice_right_at_dim
+    slice_right_at_dim,
+    tree_flatten_with_inverse
 )
+
 from torch_einops_utils.device import move_inputs_to_module_device
 from torch_einops_utils.save_load import save_load
 
@@ -1318,6 +1319,7 @@ class Attention(Module):
         query_heads = None,
         heads = 8,
         pre_rmsnorm = True,
+        pre_context_rmsnorm = False,
         gate_values = True,
         rmsnorm_query = False, # a paper claims that it is better to just norm only the keys https://openreview.net/forum?id=HkztQWZfl2
         rmsnorm_key = True,
@@ -1325,6 +1327,7 @@ class Attention(Module):
     ):
         super().__init__()
         self.norm = RMSNorm(dim) if pre_rmsnorm else Identity()
+        self.norm_context = RMSNorm(dim) if pre_context_rmsnorm else Identity()
 
         # setup grouped query attention
 
@@ -1379,6 +1382,7 @@ class Attention(Module):
     def forward(
         self,
         tokens, # (b n d)
+        context = None,
         kv_cache = None,
         return_intermediates = False,
         rotary_pos_emb = None,
@@ -1389,7 +1393,17 @@ class Attention(Module):
 
         tokens = self.norm(tokens)
 
-        q, k, v = (self.to_q(tokens), self.to_k(tokens), self.to_v(tokens))
+        q = self.to_q(tokens)
+
+        # handle maybe context
+
+        if exists(context):
+            context, _ = pack_one(context, '* n d')
+            context = self.norm_context(context)
+        else:
+            context = tokens
+
+        k, v = self.to_k(context), self.to_v(context)
 
         # split heads
 
@@ -1505,6 +1519,61 @@ class GRULayer(Module):
 
         return x, hiddens
 
+# simple residual
+
+class Residual(Module):
+    def __init__(
+        self,
+        fn: Module
+    ):
+        super().__init__()
+        self.fn = fn
+
+    def forward(
+        self,
+        x,
+        *args,
+        **kwargs
+    ):
+        block_out = self.fn(x, *args, **kwargs)
+        (out, *rest), inverse_flatten = tree_flatten_with_inverse(block_out)
+        return inverse_flatten((out + x, *rest))
+
+# attention residual
+# https://arxiv.org/abs/2603.15031
+
+class AttentionResidual(Module):
+    def __init__(
+        self,
+        dim,
+        heads = 4,
+        dim_head = 64
+    ):
+        super().__init__()
+        self.attn = Attention(
+            dim = dim,
+            heads = heads,
+            dim_head = dim_head,
+            gate_values = False,
+            value_residual = False,
+            rmsnorm_key = True
+        )
+
+    def forward(
+        self,
+        x,
+        hiddens: list[Tensor] | None = None,
+        **kwargs
+    ):
+        assert exists(hiddens), 'hiddens must be passed to AttentionResidual'
+
+        context = stack(hiddens, dim = -2)
+        queries = rearrange(x, '... d -> ... 1 d')
+
+        out = self.attn(queries, context = context)
+
+        return rearrange(out, '... 1 d -> ... d')
+
 # axial space time transformer
 
 class AxialSpaceTimeTransformer(Module):
@@ -1518,7 +1587,7 @@ class AxialSpaceTimeTransformer(Module):
         time_block_every = 4,
         attn_kwargs: dict = dict(),
         ff_kwargs: dict = dict(),
-        num_residual_streams = 1,
+        attn_residual_kwargs: dict = dict(),
         num_special_spatial_tokens = 1,
         special_attend_only_itself = False,  # this is set to True for the video tokenizer decoder (latents can only attend to itself while spatial modalities attend to the latents and everything)
         final_norm = True,
@@ -1528,9 +1597,9 @@ class AxialSpaceTimeTransformer(Module):
         super().__init__()
         assert depth >= time_block_every, f'depth must be at least {time_block_every}'
 
-        # hyper connections
+        # attention residual
 
-        hyper_conn, self.expand_streams, self.reduce_streams = mc_get_init_and_expand_reduce_stream_functions(num_residual_streams, dim = dim)
+        self.layer_attn_residuals = ModuleList([AttentionResidual(dim, **attn_residual_kwargs) for _ in range(depth)])
 
         # attention
 
@@ -1579,11 +1648,11 @@ class AxialSpaceTimeTransformer(Module):
             layers.append(ModuleList([
                 rearrange_to_attend,
                 rearrange_from_attend,
-                hyper_conn(branch = Attention(dim = dim, heads = attn_heads, dim_head = attn_dim_head, value_residual = value_residual, **attn_kwargs)),
-                hyper_conn(branch = SwiGLUFeedforward(dim = dim, **ff_kwargs))
+                Residual(Attention(dim = dim, heads = attn_heads, dim_head = attn_dim_head, value_residual = value_residual, **attn_kwargs)),
+                Residual(SwiGLUFeedforward(dim = dim, **ff_kwargs))
             ]))
 
-            rnn_layers.append(hyper_conn(branch = GRULayer(dim, dim)) if is_time_block and rnn_time else None)
+            rnn_layers.append(Residual(GRULayer(dim, dim)) if is_time_block and rnn_time else None)
 
         self.layers = ModuleList(layers)
         self.rnn_layers = ModuleList(rnn_layers)
@@ -1677,11 +1746,10 @@ class AxialSpaceTimeTransformer(Module):
 
         # attention
 
-        tokens = self.expand_streams(tokens)
-
+        attn_residual_contexts = [tokens]
         hiddens = []
 
-        for (pre_attn_rearrange, post_attn_rearrange, attn, ff), maybe_rnn, layer_is_time in zip(self.layers, self.rnn_layers, self.is_time):
+        for (pre_attn_rearrange, post_attn_rearrange, attn, ff), maybe_rnn, layer_is_time, attn_res in zip(self.layers, self.rnn_layers, self.is_time, self.layer_attn_residuals):
 
             tokens = pre_attn_rearrange(tokens)
 
@@ -1696,6 +1764,10 @@ class AxialSpaceTimeTransformer(Module):
                 tokens = inverse_pack_batch(tokens)
 
                 rnn_hiddens.append(layer_rnn_hiddens)
+
+                # save for attn residual
+
+                attn_residual_contexts.append(post_attn_rearrange(tokens))
 
             # when is a axial time attention block, should be causal
 
@@ -1728,6 +1800,10 @@ class AxialSpaceTimeTransformer(Module):
 
             tokens = ff(tokens)
 
+            # save for attn residual
+
+            attn_residual_contexts.append(tokens)
+
             # save kv cache if is time layer
 
             if layer_is_time:
@@ -1741,7 +1817,9 @@ class AxialSpaceTimeTransformer(Module):
 
             hiddens.append(tokens)
 
-        tokens = self.reduce_streams(tokens)
+            # attention residual for next block or final norm
+
+            tokens = attn_res(tokens, attn_residual_contexts)
 
         out = self.final_norm(tokens)
 
@@ -1836,7 +1914,6 @@ class VideoTokenizer(Module):
         time_decorr_loss_weight = 4e-3,
         space_decorr_loss_weight = 4e-3,
         decorr_sample_frac = 0.25,
-        num_residual_streams = 1,
         use_loss_normalization = False,
         use_causal_conv3d = False,
         causal_conv3d_kernel_size = 3,
@@ -1854,10 +1931,6 @@ class VideoTokenizer(Module):
         self.dim_latent = dim_latent
         self.num_latent_tokens = num_latent_tokens
         self.latent_tokens = Parameter(randn(num_latent_tokens, dim) * 1e-2)
-
-        # hyper connections
-
-        hyper_conn, self.expand_streams, self.reduce_streams = mc_get_init_and_expand_reduce_stream_functions(num_residual_streams, dim = dim)
 
         # mae masking - Kaiming He paper from long ago
 
@@ -1913,7 +1986,6 @@ class VideoTokenizer(Module):
             attn_softclamp_value = attn_softclamp_value,
             time_block_every = time_block_every,
             num_special_spatial_tokens = num_latent_tokens,
-            num_residual_streams = num_residual_streams,
             attn_kwargs = attn_kwargs,
             ff_kwargs = ff_kwargs,
             final_norm = True
@@ -1952,7 +2024,6 @@ class VideoTokenizer(Module):
             attn_softclamp_value = attn_softclamp_value,
             time_block_every = time_block_every,
             num_special_spatial_tokens = num_latent_tokens,
-            num_residual_streams = num_residual_streams,
             special_attend_only_itself = True,
             attn_kwargs = attn_kwargs,
             ff_kwargs = ff_kwargs,
@@ -2423,7 +2494,6 @@ class DynamicsWorldModel(Module):
         discrete_action_loss_weight: float | list[float] = 1.,
         continuous_action_loss_weight: float | list[float] = 1.,
         num_latent_genes = 0,                       # for carrying out evolution within the dreams https://web3.arxiv.org/abs/2503.19037
-        num_residual_streams = 1,
         keep_reward_ema_stats = False,
         reward_ema_decay = 0.998,
         reward_quantile_filter = (0.05, 0.95),
@@ -2672,7 +2742,6 @@ class DynamicsWorldModel(Module):
             attn_softclamp_value = attn_softclamp_value,
             attn_kwargs = attn_kwargs,
             ff_kwargs = ff_kwargs,
-            num_residual_streams = num_residual_streams,
             num_special_spatial_tokens = num_agents,
             time_block_every = time_block_every,
             final_norm = False,

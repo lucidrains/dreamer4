@@ -99,7 +99,7 @@ def main(
         prompt_actions = actions_tensor[:, 0:1]
 
         # evaluate the prompt and generate 7 more steps
-        
+
         gen = model.generate(
             time_steps = 8,
             num_steps = 4,

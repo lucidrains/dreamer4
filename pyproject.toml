@@ -1,6 +1,6 @@
 [project]
 name = "dreamer4"
-version = "0.5.12"
+version = "0.6.0"
 description = "Dreamer 4"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -34,7 +34,6 @@ dependencies = [
     "einops>=0.8.1",
     "ema-pytorch",
     "hl-gauss-pytorch",
-    "hyper-connections>=0.3.12",
     "moviepy==1.0.3",
     "torch>=2.4",
     "torch_einops_utils>=0.0.20",
