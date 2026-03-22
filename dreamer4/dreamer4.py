@@ -1519,26 +1519,6 @@ class GRULayer(Module):
 
         return x, hiddens
 
-# simple residual
-
-class Residual(Module):
-    def __init__(
-        self,
-        fn: Module
-    ):
-        super().__init__()
-        self.fn = fn
-
-    def forward(
-        self,
-        x,
-        *args,
-        **kwargs
-    ):
-        block_out = self.fn(x, *args, **kwargs)
-        (out, *rest), inverse_flatten = tree_flatten_with_inverse(block_out)
-        return inverse_flatten((out + x, *rest))
-
 # attention residual
 # https://arxiv.org/abs/2603.15031
 
@@ -1573,7 +1553,6 @@ class AttentionResidual(Module):
         out = self.attn(queries, context = context)
 
         return rearrange(out, '... 1 d -> ... d')
-
 # axial space time transformer
 
 class AxialSpaceTimeTransformer(Module):
@@ -1596,10 +1575,6 @@ class AxialSpaceTimeTransformer(Module):
     ):
         super().__init__()
         assert depth >= time_block_every, f'depth must be at least {time_block_every}'
-
-        # attention residual
-
-        self.layer_attn_residuals = ModuleList([AttentionResidual(dim, **attn_residual_kwargs) for _ in range(depth)])
 
         # attention
 
@@ -1634,7 +1609,12 @@ class AxialSpaceTimeTransformer(Module):
         # transformer
 
         layers = []
+        rnn_layers = []
         is_time = []
+
+        rnn_attn_residuals = []
+        attn_attn_residuals = []
+        ff_attn_residuals = []
 
         for i in range(depth):
             layer_index = i + 1
@@ -1648,16 +1628,24 @@ class AxialSpaceTimeTransformer(Module):
             layers.append(ModuleList([
                 rearrange_to_attend,
                 rearrange_from_attend,
-                Residual(Attention(dim = dim, heads = attn_heads, dim_head = attn_dim_head, value_residual = value_residual, **attn_kwargs)),
-                Residual(SwiGLUFeedforward(dim = dim, **ff_kwargs))
+                Attention(dim = dim, heads = attn_heads, dim_head = attn_dim_head, value_residual = value_residual, **attn_kwargs),
+                SwiGLUFeedforward(dim = dim, **ff_kwargs)
             ]))
 
-            rnn_layers.append(Residual(GRULayer(dim, dim)) if is_time_block and rnn_time else None)
+            rnn_layers.append(GRULayer(dim, dim) if is_time_block and rnn_time else None)
+
+            rnn_attn_residuals.append(AttentionResidual(dim, **attn_residual_kwargs) if is_time_block and rnn_time else None)
+            attn_attn_residuals.append(AttentionResidual(dim, **attn_residual_kwargs))
+            ff_attn_residuals.append(AttentionResidual(dim, **attn_residual_kwargs))
 
         self.layers = ModuleList(layers)
         self.rnn_layers = ModuleList(rnn_layers)
 
         self.is_time = is_time
+
+        self.rnn_attn_residuals = ModuleList(rnn_attn_residuals)
+        self.attn_attn_residuals = ModuleList(attn_attn_residuals)
+        self.ff_attn_residuals = ModuleList(ff_attn_residuals)
 
         # final norm
 
@@ -1746,16 +1734,18 @@ class AxialSpaceTimeTransformer(Module):
 
         # attention
 
-        attn_residual_contexts = [tokens]
+        layer_hiddens = [tokens]
         hiddens = []
 
-        for (pre_attn_rearrange, post_attn_rearrange, attn, ff), maybe_rnn, layer_is_time, attn_res in zip(self.layers, self.rnn_layers, self.is_time, self.layer_attn_residuals):
+        for (pre_attn_rearrange, post_attn_rearrange, attn, ff), maybe_rnn, layer_is_time, rnn_attn_res, attn_attn_res, ff_attn_res in zip(self.layers, self.rnn_layers, self.is_time, self.rnn_attn_residuals, self.attn_attn_residuals, self.ff_attn_residuals):
 
-            tokens = pre_attn_rearrange(tokens)
-
-            # maybe rnn for time
+            # rnn block
 
             if layer_is_time and exists(maybe_rnn):
+
+                tokens = rnn_attn_res(tokens, layer_hiddens)
+
+                tokens = pre_attn_rearrange(tokens)
 
                 tokens, inverse_pack_batch = pack_one(tokens, '* t d')
 
@@ -1765,9 +1755,15 @@ class AxialSpaceTimeTransformer(Module):
 
                 rnn_hiddens.append(layer_rnn_hiddens)
 
-                # save for attn residual
+                tokens = post_attn_rearrange(tokens)
 
-                attn_residual_contexts.append(post_attn_rearrange(tokens))
+                layer_hiddens.append(tokens)
+
+            # attention block
+
+            tokens = attn_attn_res(tokens, layer_hiddens)
+
+            tokens = pre_attn_rearrange(tokens)
 
             # when is a axial time attention block, should be causal
 
@@ -1796,13 +1792,7 @@ class AxialSpaceTimeTransformer(Module):
 
             tokens = post_attn_rearrange(tokens)
 
-            # feedforward layer
-
-            tokens = ff(tokens)
-
-            # save for attn residual
-
-            attn_residual_contexts.append(tokens)
+            layer_hiddens.append(tokens)
 
             # save kv cache if is time layer
 
@@ -1815,11 +1805,15 @@ class AxialSpaceTimeTransformer(Module):
 
             space_or_time_inputs.append(attn_intermediates.normed_inputs)
 
+            # feedforward block
+
+            tokens = ff_attn_res(tokens, layer_hiddens)
+
+            tokens = ff(tokens)
+
+            layer_hiddens.append(tokens)
+
             hiddens.append(tokens)
-
-            # attention residual for next block or final norm
-
-            tokens = attn_res(tokens, attn_residual_contexts)
 
         out = self.final_norm(tokens)
 
