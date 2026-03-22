@@ -1647,6 +1647,8 @@ class AxialSpaceTimeTransformer(Module):
         self.attn_attn_residuals = ModuleList(attn_attn_residuals)
         self.ff_attn_residuals = ModuleList(ff_attn_residuals)
 
+        self.final_attn_residual = AttentionResidual(dim, **attn_residual_kwargs)
+
         # final norm
 
         self.final_norm = nn.RMSNorm(dim) if final_norm else nn.Identity()
@@ -1814,6 +1816,8 @@ class AxialSpaceTimeTransformer(Module):
             layer_hiddens.append(tokens)
 
             hiddens.append(tokens)
+
+        tokens = self.final_attn_residual(tokens, layer_hiddens)
 
         out = self.final_norm(tokens)
 
