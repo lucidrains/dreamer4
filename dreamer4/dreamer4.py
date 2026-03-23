@@ -385,6 +385,12 @@ def create_multi_token_prediction_targets(
 
     return out, mask
 
+# helper modules
+
+class Identity(Module):
+    def forward(self, t, *args, **kwargs):
+        return t
+
 # loss related
 
 class LossNormalizer(Module):
@@ -1323,7 +1329,8 @@ class Attention(Module):
         gate_values = True,
         rmsnorm_query = False, # a paper claims that it is better to just norm only the keys https://openreview.net/forum?id=HkztQWZfl2
         rmsnorm_key = True,
-        value_residual = True
+        value_residual = True,
+        belief_attn = True
     ):
         super().__init__()
         self.norm = RMSNorm(dim) if pre_rmsnorm else Identity()
@@ -1371,6 +1378,15 @@ class Attention(Module):
             nn.Sigmoid()
         ) if value_residual else None
 
+        # beliefformer
+
+        self.belief_attn = belief_attn
+        self.head_repeat = Identity()
+
+        if belief_attn and query_heads > heads:
+            groups = query_heads // heads
+            self.head_repeat = Reduce('b h n d -> b (h g) n d', 'repeat', g = groups)
+
     def muon_parameters(self):
         # omit the queries and keys for now given what we learned from kimi 2 paper
 
@@ -1397,7 +1413,9 @@ class Attention(Module):
 
         # handle maybe context
 
-        if exists(context):
+        has_context = exists(context)
+
+        if has_context:
             context, _ = pack_one(context, '* n d')
             context = self.norm_context(context)
         else:
@@ -1431,6 +1449,11 @@ class Attention(Module):
             q = apply_rotations(rotary_pos_emb, q)
             k = apply_rotations(rotary_pos_emb, k)
 
+        # save values for calculating parallel component to output
+
+        if self.belief_attn and not has_context:
+            v_for_belief = v
+
         # caching
 
         if exists(kv_cache):
@@ -1443,6 +1466,17 @@ class Attention(Module):
         attend_fn = default(attend_fn, naive_attend)
 
         out = attend_fn(q, k, v)
+
+        # "beliefformer"
+        # orthogonal outputs wrt values
+        # Guoqiang Zhang - https://openreview.net/forum?id=Ard2QzPAUK
+
+        if self.belief_attn and not has_context:
+            v_normed = l2norm(v_for_belief)
+            v_normed = self.head_repeat(v_normed)
+
+            parallel = (out * v_normed).sum(dim = -1, keepdim = True) * v_normed
+            out = out - parallel
 
         # gate values
 

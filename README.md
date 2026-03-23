@@ -171,4 +171,13 @@ Passing `--condition_on_actions True` lets you explicitly prompt with velocity a
 }
 ```
 
+```bibtex
+@misc{zhang2026beliefformer,
+    title   = {BeliefFormer: Belief Attention in Transformer},
+    author  = {Guoqiang Zhang},
+    year    = {2026},
+    url     = {https://openreview.net/forum?id=Ard2QzPAUK}
+}
+```
+
 *the conquest of nature is to be achieved through number and measure - angels to Descartes in a dream*
