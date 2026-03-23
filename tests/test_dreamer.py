@@ -133,7 +133,7 @@ def test_e2e(
 
     # rl
 
-    rewards = torch.randn((2, 2)) * 100.
+    rewards = torch.randn((2, 4)) * 100.
 
     flow_loss = dynamics(
         **dynamics_input,

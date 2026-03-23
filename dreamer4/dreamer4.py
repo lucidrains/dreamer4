@@ -3329,6 +3329,9 @@ class DynamicsWorldModel(Module):
             delight_gate = (-log_probs * advantage).sigmoid().detach()
 
         # maybe pmpo
+        # pmpo - weighting the positive and negative advantages equally - ignoring magnitude of advantage and taking the sign
+        # seems to be weighted across batch and time, iiuc
+        # eq (10) in https://arxiv.org/html/2410.04166v1
 
         if use_pmpo:
 
@@ -3337,20 +3340,31 @@ class DynamicsWorldModel(Module):
             if use_delight_gating:
                 maybe_gated_log_prob = log_probs * delight_gate
 
-            # pmpo - weighting the positive and negative advantages equally - ignoring magnitude of advantage and taking the sign
-            # seems to be weighted across batch and time, iiuc
-            # eq (10) in https://arxiv.org/html/2410.04166v1
+            pos = pos_advantage_mask
+            neg = neg_advantage_mask
 
             if exists(mask):
-                pos_advantage_mask &= mask
-                neg_advantage_mask &= mask
+                pos = pos & mask
+                neg = neg & mask
+
+            scaled_action_log_probs = maybe_gated_log_prob * advantage.tanh().abs()
+
+            num_actions = scaled_action_log_probs.shape[-1]
+            pos = repeat(pos, 'b t -> b t na', na = num_actions)
+            neg = repeat(neg, 'b t -> b t na', na = num_actions)
+
+            pos_loss, neg_loss = 0., 0.
+
+            if pos.any():
+                pos_loss = scaled_action_log_probs[pos].sum()
+
+            if neg.any():
+                neg_loss = scaled_action_log_probs[neg].sum()
+
+            num_advantages = max(1, len(advantage))
 
             α = self.pmpo_pos_to_neg_weight
-
-            pos = masked_mean(maybe_gated_log_prob, pos_advantage_mask)
-            neg = -masked_mean(maybe_gated_log_prob, neg_advantage_mask)
-
-            policy_loss = -(α * pos + (1. - α) * neg)
+            policy_loss = -α * (pos_loss - neg_loss) / num_advantages
 
             # take care of kl
 
@@ -3888,7 +3902,7 @@ class DynamicsWorldModel(Module):
         step_sizes_log2 = None,          # () | (b)
         latent_gene_ids = None,          # (b)
         tasks = None,                    # (b)
-        rewards = None,                  # (b t)
+        rewards = None,                  # (b t) | (b t-1) during generation
         discrete_actions = None,         # (b t na) | (b t-1 na)
         continuous_actions = None,       # (b t na) | (b t-1 na)
         shift_action_tokens = True,      # set to False if actions already properly paired, which is different than the usual replay buffer pairing
@@ -3941,6 +3955,11 @@ class DynamicsWorldModel(Module):
         # variables
 
         batch, time, device = *latents.shape[:2], latents.device
+
+        if exists(rewards):
+            rewards_len = rewards.shape[1]
+            assert rewards_len in {time, time - 1}, f'rewards must have time length of either {time} or {time - 1}, but got {rewards_len}'
+            assert return_pred_only or rewards_len == time, f'during training, rewards must perfectly align with video length {time}, got {rewards_len}'
 
         # signal and step size related input conforming
 
