@@ -2535,6 +2535,7 @@ class DynamicsWorldModel(Module):
         pmpo_pos_to_neg_weight = 0.5, # pos and neg equal weight
         pmpo_reverse_kl = True,
         pmpo_kl_div_loss_weight = .3,
+        use_delight_gating = True,
         normalize_advantages = None,
         value_clip = 0.4,
         policy_entropy_weight = .01,
@@ -2796,6 +2797,10 @@ class DynamicsWorldModel(Module):
         self.pmpo_pos_to_neg_weight = pmpo_pos_to_neg_weight
         self.pmpo_kl_div_loss_weight = pmpo_kl_div_loss_weight
         self.pmpo_reverse_kl = pmpo_reverse_kl
+
+        # delight related
+
+        self.use_delight_gating = use_delight_gating
 
         # rewards related
 
@@ -3169,9 +3174,12 @@ class DynamicsWorldModel(Module):
         value_optim: Optimizer | None = None,
         only_learn_policy_value_heads = True, # in the paper, they do not finetune the entire dynamics model, they just learn the heads
         use_pmpo = True,
+        use_delight_gating = None,
         normalize_advantages = None,
         eps = 1e-6
     ):
+        use_delight_gating = default(use_delight_gating, self.use_delight_gating)
+
         assert isinstance(experience, Experience)
 
         experience = experience.to(self.device)
@@ -3314,7 +3322,21 @@ class DynamicsWorldModel(Module):
 
         advantage = rearrange(advantage, '... -> ... 1') # broadcast across all actions
 
+        # calculate delight
+        # Ian Osband - https://arxiv.org/abs/2603.14608v1
+
+        if use_delight_gating:
+            delight_gate = (-log_probs * advantage).sigmoid().detach()
+
+        # maybe pmpo
+
         if use_pmpo:
+
+            maybe_gated_log_prob = log_probs
+
+            if use_delight_gating:
+                maybe_gated_log_prob = log_probs * delight_gate
+
             # pmpo - weighting the positive and negative advantages equally - ignoring magnitude of advantage and taking the sign
             # seems to be weighted across batch and time, iiuc
             # eq (10) in https://arxiv.org/html/2410.04166v1
@@ -3325,8 +3347,8 @@ class DynamicsWorldModel(Module):
 
             α = self.pmpo_pos_to_neg_weight
 
-            pos = masked_mean(log_probs, pos_advantage_mask)
-            neg = -masked_mean(log_probs, neg_advantage_mask)
+            pos = masked_mean(maybe_gated_log_prob, pos_advantage_mask)
+            neg = -masked_mean(maybe_gated_log_prob, neg_advantage_mask)
 
             policy_loss = -(α * pos + (1. - α) * neg)
 
@@ -3359,12 +3381,18 @@ class DynamicsWorldModel(Module):
                 policy_loss = policy_loss + kl_div_loss * self.pmpo_kl_div_loss_weight
 
         else:
+
+            maybe_weighted_advantage = advantage
+
+            if use_delight_gating:
+                maybe_weighted_advantage = advantage * delight_gate
+
             # ppo clipped surrogate loss
 
             ratio = (log_probs - old_log_probs).exp()
             clipped_ratio = ratio.clamp(1. - self.ppo_eps_clip, 1. + self.ppo_eps_clip)
 
-            policy_loss = -torch.min(ratio * advantage, clipped_ratio * advantage)
+            policy_loss = -torch.min(ratio * maybe_weighted_advantage, clipped_ratio * maybe_weighted_advantage)
             policy_loss = reduce(policy_loss, 'b t na -> b t', 'sum')
 
             policy_loss = masked_mean(policy_loss, mask)

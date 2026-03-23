@@ -180,4 +180,16 @@ Passing `--condition_on_actions True` lets you explicitly prompt with velocity a
 }
 ```
 
+```bibtex
+@misc{osband2026delightfulpolicygradient,
+    title   = {Delightful Policy Gradient},
+    author  = {Ian Osband},
+    year    = {2026},
+    eprint  = {2603.14608},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2603.14608},
+}
+```
+
 *the conquest of nature is to be achieved through number and measure - angels to Descartes in a dream*
