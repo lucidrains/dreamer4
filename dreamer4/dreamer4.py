@@ -24,10 +24,11 @@ from adam_atan2_pytorch import MuonAdamAtan2
 from x_mlps_pytorch.ensemble import Ensemble
 from x_mlps_pytorch.normed_mlp import create_mlp
 
-
 from vit_pytorch.vit_with_decorr import DecorrelationLoss
 
 from assoc_scan import AssocScan
+
+from PoPE_pytorch import PoPE, flash_attn_with_pope
 
 from discrete_continuous_embed_readout import MultiCategorical
 
@@ -1383,7 +1384,7 @@ class Attention(Module):
         self.belief_attn = belief_attn
         self.head_repeat = Identity()
 
-        if belief_attn and query_heads > heads:
+        if query_heads > heads:
             groups = query_heads // heads
             self.head_repeat = Reduce('b h n d -> b (h g) n d', 'repeat', g = groups)
 
@@ -1402,6 +1403,7 @@ class Attention(Module):
         kv_cache = None,
         return_intermediates = False,
         rotary_pos_emb = None,
+        pope_pos_emb = None,
         residual_values = None,  # (b n h d)
         attend_fn: Callable | None = None
     ):
@@ -1463,9 +1465,11 @@ class Attention(Module):
 
         # attention
 
-        attend_fn = default(attend_fn, naive_attend)
-
-        out = attend_fn(q, k, v)
+        if exists(pope_pos_emb):
+            out = flash_attn_with_pope(q, k, v, pos_emb = pope_pos_emb, causal = True, head_dimension_at_first = True)
+        else:
+            attend_fn = default(attend_fn, naive_attend)
+            out = attend_fn(q, k, v)
 
         # "beliefformer"
         # orthogonal outputs wrt values
@@ -1605,7 +1609,8 @@ class AxialSpaceTimeTransformer(Module):
         special_attend_only_itself = False,  # this is set to True for the video tokenizer decoder (latents can only attend to itself while spatial modalities attend to the latents and everything)
         final_norm = True,
         value_residual = True,               # https://arxiv.org/abs/2410.17897 - but with learned mixing from OSS
-        rnn_time = True
+        rnn_time = True,
+        time_attention_use_pope = False
     ):
         super().__init__()
         assert depth >= time_block_every, f'depth must be at least {time_block_every}'
@@ -1620,7 +1625,13 @@ class AxialSpaceTimeTransformer(Module):
 
         # time rotary embedding
 
-        self.time_rotary = Rotary1D(attn_dim_head)
+        self.time_attention_use_pope = time_attention_use_pope
+
+        if time_attention_use_pope:
+            query_heads = attn_kwargs.get('query_heads', attn_heads)
+            self.time_rotary = PoPE(attn_dim_head, heads = query_heads)
+        else:
+            self.time_rotary = Rotary1D(attn_dim_head)
 
         # project initial for value residuals
 
@@ -1752,9 +1763,9 @@ class AxialSpaceTimeTransformer(Module):
 
         iter_rnn_prev_hiddens = iter(rnn_prev_hiddens)
 
-        # rotary
+        # positional embs
 
-        rotary_pos_emb = self.time_rotary(rotary_seq_len, offset = rotary_pos_offset)
+        time_pos_emb = self.time_rotary(rotary_seq_len, offset = rotary_pos_offset)
 
         # value residual
 
@@ -1801,11 +1812,11 @@ class AxialSpaceTimeTransformer(Module):
 
             tokens = pre_attn_rearrange(tokens)
 
-            # when is a axial time attention block, should be causal
-
             attend_fn = time_attend if layer_is_time else space_attend
 
-            layer_rotary_pos_emb = rotary_pos_emb if layer_is_time else None
+            is_pope = layer_is_time and self.time_attention_use_pope
+            layer_rotary_pos_emb = time_pos_emb if layer_is_time and not is_pope else None
+            layer_pope_pos_emb = time_pos_emb if is_pope else None
 
             # maybe past kv cache
 
@@ -1820,6 +1831,7 @@ class AxialSpaceTimeTransformer(Module):
             tokens, attn_intermediates = attn(
                 tokens,
                 rotary_pos_emb = layer_rotary_pos_emb,
+                pope_pos_emb = layer_pope_pos_emb,
                 attend_fn = attend_fn,
                 kv_cache = maybe_kv_cache,
                 residual_values = layer_residual_values,
@@ -1953,7 +1965,8 @@ class VideoTokenizer(Module):
         decoder_v_space_loss = True,
         latent_receive_grad_frac: Callable | None = None,
         latent_ar_loss_weight = 0.,
-        latent_ar_placement = 'encoder'
+        latent_ar_placement = 'encoder',
+        time_attention_use_pope = False
     ):
         super().__init__()
 
@@ -2020,7 +2033,8 @@ class VideoTokenizer(Module):
             num_special_spatial_tokens = num_latent_tokens,
             attn_kwargs = attn_kwargs,
             ff_kwargs = ff_kwargs,
-            final_norm = True
+            final_norm = True,
+            time_attention_use_pope = time_attention_use_pope
         )
 
         # latents
@@ -2059,7 +2073,8 @@ class VideoTokenizer(Module):
             special_attend_only_itself = True,
             attn_kwargs = attn_kwargs,
             ff_kwargs = ff_kwargs,
-            final_norm = True
+            final_norm = True,
+            time_attention_use_pope = time_attention_use_pope
         )
 
         # loss related
@@ -2540,7 +2555,8 @@ class DynamicsWorldModel(Module):
         value_clip = 0.4,
         policy_entropy_weight = .01,
         gae_use_accelerated = False,
-        use_loss_normalization = False
+        use_loss_normalization = False,
+        time_attention_use_pope = False
     ):
         super().__init__()
         self.dim = dim
@@ -2779,6 +2795,7 @@ class DynamicsWorldModel(Module):
             time_block_every = time_block_every,
             final_norm = False,
             rnn_time = use_time_rnn,
+            time_attention_use_pope = time_attention_use_pope,
             **transformer_kwargs
         )
 

@@ -17,6 +17,7 @@ def exists(v):
 @param('add_state_pred_head', (False, True))
 @param('use_time_cache', (False, True))
 @param('var_len', (False, True))
+@param('time_attention_use_pope', (False, True))
 def test_e2e(
     pred_orig_latent,
     grouped_query_attn,
@@ -29,7 +30,8 @@ def test_e2e(
     add_reward_embed_to_agent_token,
     add_state_pred_head,
     use_time_cache,
-    var_len
+    var_len,
+    time_attention_use_pope
 ):
     from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
 
@@ -43,7 +45,8 @@ def test_e2e(
         attn_dim_head = 8,
         num_latent_tokens = 4,
         encoder_add_decorr_aux_loss = True,
-        decorr_sample_frac = 1.
+        decorr_sample_frac = 1.,
+        time_attention_use_pope = time_attention_use_pope
     )
 
     video = torch.randn(2, 3, 4, 32, 32)

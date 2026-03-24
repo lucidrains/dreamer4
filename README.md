@@ -192,4 +192,16 @@ Passing `--condition_on_actions True` lets you explicitly prompt with velocity a
 }
 ```
 
+```bibtex
+@misc{gopalakrishnan2025decouplingwhatwherepolar,
+    title   = {Decoupling the "What" and "Where" With Polar Coordinate Positional Embeddings},
+    author  = {Anand Gopalakrishnan and Robert Csordás and Jürgen Schmidhuber and Michael C. Mozer},
+    year    = {2025},
+    eprint  = {2509.10534},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2509.10534},
+}
+```
+
 *the conquest of nature is to be achieved through number and measure - angels to Descartes in a dream*
