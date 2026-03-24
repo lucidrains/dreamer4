@@ -47,8 +47,7 @@ world_model = DynamicsWorldModel(
     dim = 512,
     dim_latent = 32,
     video_tokenizer = tokenizer,
-    num_discrete_actions = 4,
-    num_residual_streams = 1
+    num_discrete_actions = 4
 )
 
 # state, action, rewards
