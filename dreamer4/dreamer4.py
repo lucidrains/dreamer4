@@ -515,8 +515,8 @@ class LatentAutoregressiveLoss(Module):
 
         # slice sampling
 
-        A = torch.randn((num_slices, dim), device = device)
-        A = l2norm(A)
+        rand_projs = torch.randn((num_slices, dim), device = device)
+        rand_projs = l2norm(rand_projs)
 
         # integration points
 
@@ -524,12 +524,11 @@ class LatentAutoregressiveLoss(Module):
 
         # theoretical CF for N(0, 1) and Gauss. window
 
-        exp_f = (-0.5 * t ** 2).exp()
+        exp_f = (-0.5 * t.square()).exp()
 
         # empirical CF
 
-        x_t = einsum(x, A, '... d, m d -> ... m')
-        x_t = rearrange(x_t, '... m -> (...) m')
+        x_t = einx.dot('... d, m d -> (...) m', x, rand_projs)
 
         x_t = multiply('n m, t -> n m t', x_t, t)
         ecf = (1j * x_t).exp().mean(dim = 0)
