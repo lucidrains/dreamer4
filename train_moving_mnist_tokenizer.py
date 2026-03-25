@@ -89,6 +89,7 @@ def main(
     decoder_flow_steps = 4,
     latent_ar_loss_weight = 0.,
     latent_ar_placement = 'encoder',
+    latent_ar_sigreg_num_slices = 256,
     decoder_v_space_loss = True,
     time_attention_use_pope = False
 ):
@@ -137,6 +138,7 @@ def main(
         decoder_flow_steps = decoder_flow_steps,
         latent_ar_loss_weight = latent_ar_loss_weight,
         latent_ar_placement = latent_ar_placement,
+        latent_ar_sigreg_loss_kwargs = dict(num_slices = latent_ar_sigreg_num_slices),
         decoder_v_space_loss = decoder_v_space_loss,
         time_attention_use_pope = time_attention_use_pope
     )

@@ -203,4 +203,28 @@ Passing `--condition_on_actions True` lets you explicitly prompt with velocity a
 }
 ```
 
+```bibtex
+@misc{maes2026leworldmodelstableendtoendjointembedding,
+    title   = {LeWorldModel: Stable End-to-End Joint-Embedding Predictive Architecture from Pixels},
+    author  = {Lucas Maes and Quentin Le Lidec and Damien Scieur and Yann LeCun and Randall Balestriero},
+    year    = {2026},
+    eprint  = {2603.19312},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2603.19312},
+}
+```
+
+```bibtex
+@misc{balestriero2025lejepa,
+    title   = {LeJEPA: Provable and Scalable Self-Supervised Learning Without the Heuristics},
+    author  = {Randall Balestriero and Yann LeCun},
+    year    = {2025},
+    eprint  = {2511.08544},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2511.08544},
+}
+```
+
 *the conquest of nature is to be achieved through number and measure - angels to Descartes in a dream*

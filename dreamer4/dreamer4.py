@@ -93,7 +93,7 @@ LinearNoBias = partial(Linear, bias = False)
 
 VideoTokenizerIntermediates = namedtuple('VideoTokenizerIntermediates', ('losses', 'recon'))
 
-TokenizerLosses = namedtuple('TokenizerLosses', ('recon', 'lpips', 'time_decorr', 'space_decorr', 'latent_ar'))
+TokenizerLosses = namedtuple('TokenizerLosses', ('recon', 'lpips', 'time_decorr', 'space_decorr', 'latent_ar', 'latent_ar_sigreg'))
 
 WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'shortcut', 'rewards', 'discrete_actions', 'continuous_actions', 'state_pred', 'agent_state_pred'))
 
@@ -490,15 +490,55 @@ class LatentAutoregressiveLoss(Module):
         self,
         dim,
         use_rmsnorm = False,
-        target_detach = True
+        sigreg_lambda = 0.05,
+        sigreg_loss_kwargs: dict | None = None
     ):
         super().__init__()
-        self.target_detach = target_detach
+        self.sigreg_lambda = sigreg_lambda
+        self.sigreg_loss_kwargs = default(sigreg_loss_kwargs, dict())
 
         self.net = nn.Sequential(
             RMSNorm(dim) if use_rmsnorm else Identity(),
             Linear(dim, dim)
         )
+
+    @staticmethod
+    def sigreg_loss(
+        x,
+        num_slices = 1024,
+        domain = (-5, 5),
+        num_knots = 17
+    ):
+        # Randall Balestriero - https://arxiv.org/abs/2511.08544
+
+        dim, device = x.shape[-1], x.device
+
+        # slice sampling
+
+        A = torch.randn((num_slices, dim), device = device)
+        A = l2norm(A)
+
+        # integration points
+
+        t = torch.linspace(*domain, num_knots, device = device)
+
+        # theoretical CF for N(0, 1) and Gauss. window
+
+        exp_f = (-0.5 * t ** 2).exp()
+
+        # empirical CF
+
+        x_t = einsum(x, A, '... d, m d -> ... m')
+        x_t = rearrange(x_t, '... m -> (...) m')
+
+        x_t = multiply('n m, t -> n m t', x_t, t)
+        ecf = (1j * x_t).exp().mean(dim = 0)
+
+        # weighted L2 distance
+
+        err = ecf.sub(exp_f).abs().square().mul(exp_f)
+
+        return torch.trapz(err, t, dim = -1).mean()
 
     def forward(
         self,
@@ -510,15 +550,12 @@ class LatentAutoregressiveLoss(Module):
         pred_input = x[:, :-1]
         target = x[:, 1:]
 
-        if self.target_detach:
-            target = target.detach()
-
         pred = self.net(pred_input)
 
         if not return_loss:
             return pred
 
-        loss = F.l1_loss(pred, target, reduction = 'none')
+        loss = F.mse_loss(pred, target, reduction = 'none')
 
         if return_unreduced_loss:
             return loss, pred
@@ -527,7 +564,11 @@ class LatentAutoregressiveLoss(Module):
             mask = mask[:, 1:]
 
         loss = masked_mean(loss, mask)
-        return loss, pred
+
+        sigreg = self.sigreg_loss(target, **self.sigreg_loss_kwargs)
+        loss = loss * (1. - self.sigreg_lambda) + sigreg * self.sigreg_lambda
+
+        return loss, sigreg, pred
 
 def ramp_weight(times, slope = 0.9, intercept = 0.1):
     # equation (8) paper, their "ramp" loss weighting
@@ -1966,6 +2007,7 @@ class VideoTokenizer(Module):
         latent_receive_grad_frac: Callable | None = None,
         latent_ar_loss_weight = 0.,
         latent_ar_placement = 'encoder',
+        latent_ar_sigreg_loss_kwargs: dict | None = None,
         time_attention_use_pope = False
     ):
         super().__init__()
@@ -2111,7 +2153,12 @@ class VideoTokenizer(Module):
         if self.has_latent_ar:
             latent_ar_use_rmsnorm = self.latent_ar_in_encoder
             latent_ar_dim = dim if self.latent_ar_in_encoder else dim_latent
-            self.latent_ar = LatentAutoregressiveLoss(latent_ar_dim, use_rmsnorm = latent_ar_use_rmsnorm)
+
+            self.latent_ar = LatentAutoregressiveLoss(
+                latent_ar_dim,
+                use_rmsnorm = latent_ar_use_rmsnorm,
+                sigreg_loss_kwargs = dict(num_slices = 256)
+            )
 
         # loss normalizer
 
@@ -2334,10 +2381,10 @@ class VideoTokenizer(Module):
 
         tokens, latents = unpack(tokens, packed_latent_shape, 'b t * d')
 
-        latent_ar_loss = self.zero
+        latent_ar_loss = latent_ar_sigreg_loss = self.zero
 
         if self.has_latent_ar and self.latent_ar_in_encoder:
-            latent_ar_loss, _ = self.latent_ar(latents)
+            latent_ar_loss, latent_ar_sigreg_loss, _ = self.latent_ar(latents)
 
         latents = self.encoded_to_latents(latents)
 
@@ -2345,7 +2392,7 @@ class VideoTokenizer(Module):
             return latents
 
         if self.has_latent_ar and self.latent_ar_in_decoder:
-            latent_ar_loss, _ = self.latent_ar(latents)
+            latent_ar_loss, latent_ar_sigreg_loss, _ = self.latent_ar(latents)
 
         if self.has_flow:
 
@@ -2428,7 +2475,7 @@ class VideoTokenizer(Module):
         if not return_intermediates:
             return total_loss
 
-        losses = TokenizerLosses(recon_loss, lpips_loss, time_decorr_loss, space_decorr_loss, latent_ar_loss)
+        losses = TokenizerLosses(recon_loss, lpips_loss, time_decorr_loss, space_decorr_loss, latent_ar_loss, latent_ar_sigreg_loss)
 
         # handle returning of reconstructed, and image pretraining
 

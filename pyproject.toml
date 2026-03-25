@@ -1,6 +1,6 @@
 [project]
 name = "dreamer4"
-version = "0.6.8"
+version = "0.6.9"
 description = "Dreamer 4"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -17,7 +17,7 @@ keywords = [
     'world models'
 ]
 
-classifiers=[
+classifiers = [
     'Development Status :: 4 - Beta',
     'Intended Audience :: Developers',
     'Topic :: Scientific/Engineering :: Artificial Intelligence',
