@@ -118,7 +118,13 @@ def main(
     sample_prompt_frames = None,
     sample_autoregressive_actions = False,
     condition_on_actions = False,
-    num_action_bins = 5
+    num_action_bins = 5,
+    latent_ar = False,
+    latent_ar_action_conditioned = False,
+    latent_ar_layer = 0,
+    latent_ar_loss_weight = 0.,
+    latent_ar_sigreg_loss_weight = 0.05,
+    latent_ar_sigreg_num_slices = 256
 ):
     import shutil
 
@@ -179,6 +185,12 @@ def main(
         shortcut_loss_weight = shortcut_loss_weight,
         num_continuous_actions = 2 if condition_on_actions else 0,
         num_discrete_actions = (num_action_bins, num_action_bins) if condition_on_actions else 0,
+        latent_ar = latent_ar,
+        latent_ar_action_conditioned = latent_ar_action_conditioned,
+        latent_ar_layer = latent_ar_layer,
+        latent_ar_loss_weight = latent_ar_loss_weight,
+        latent_ar_sigreg_loss_weight = latent_ar_sigreg_loss_weight,
+        latent_ar_sigreg_loss_kwargs = dict(num_slices = latent_ar_sigreg_num_slices) if latent_ar else None
     )
 
     # initialize trainer

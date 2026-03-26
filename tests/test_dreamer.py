@@ -18,6 +18,8 @@ def exists(v):
 @param('use_time_cache', (False, True))
 @param('var_len', (False, True))
 @param('time_attention_use_pope', (False, True))
+@param('with_latent_ar_in_dynamics', (False, True))
+@param('with_latent_ar_action_conditioned', (False, True))
 def test_e2e(
     pred_orig_latent,
     grouped_query_attn,
@@ -31,7 +33,9 @@ def test_e2e(
     add_state_pred_head,
     use_time_cache,
     var_len,
-    time_attention_use_pope
+    time_attention_use_pope,
+    with_latent_ar_in_dynamics,
+    with_latent_ar_action_conditioned
 ):
     from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
 
@@ -82,7 +86,14 @@ def test_e2e(
         add_reward_embed_to_agent_token = add_reward_embed_to_agent_token,
         add_state_pred_head = add_state_pred_head,
         agent_predicts_state = add_state_pred_head,
-        time_block_every = 1
+        time_block_every = 1,
+        time_attention_use_pope = time_attention_use_pope,
+        latent_ar = with_latent_ar_in_dynamics,
+        latent_ar_action_conditioned = with_latent_ar_action_conditioned,
+        latent_ar_layer = 0 if with_latent_ar_in_dynamics else None,
+        latent_ar_loss_weight = 1. if with_latent_ar_in_dynamics else 0.,
+        latent_ar_sigreg_loss_weight = 0.05 if with_latent_ar_in_dynamics else 0.,
+        latent_ar_sigreg_loss_kwargs = dict(num_slices = 2) if with_latent_ar_in_dynamics else None
     )
 
     signal_levels = step_sizes_log2 = None

@@ -96,7 +96,7 @@ VideoTokenizerIntermediates = namedtuple('VideoTokenizerIntermediates', ('losses
 
 TokenizerLosses = namedtuple('TokenizerLosses', ('recon', 'lpips', 'time_decorr', 'space_decorr', 'latent_ar', 'latent_ar_sigreg'))
 
-WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'shortcut', 'rewards', 'discrete_actions', 'continuous_actions', 'state_pred', 'agent_state_pred'))
+WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'shortcut', 'rewards', 'discrete_actions', 'continuous_actions', 'state_pred', 'agent_state_pred', 'latent_ar', 'latent_ar_sigreg'))
 
 AttentionIntermediates = namedtuple('AttentionIntermediates', ('next_kv_cache', 'normed_inputs'))
 
@@ -490,19 +490,22 @@ class LatentAutoregressiveLoss(Module):
     def __init__(
         self,
         dim,
+        dim_in = None,
         use_rmsnorm = False,
-        sigreg_lambda = 0.05,
         sigreg_loss_kwargs: dict | None = None,
         net: Module | None = None
     ):
         super().__init__()
-        self.sigreg_lambda = sigreg_lambda
+        dim_in = default(dim_in, dim)
         self.sigreg_loss_kwargs = default(sigreg_loss_kwargs, dict())
 
         if not exists(net):
             norm = RMSNorm(dim) if use_rmsnorm else Identity()
 
+            project_in = nn.Linear(dim_in, dim) if dim_in != dim else Identity()
+
             net = nn.Sequential(
+                project_in,
                 norm,
                 MLP(dim, dim * 4, dim, activation = nn.SiLU())
             )
@@ -514,7 +517,8 @@ class LatentAutoregressiveLoss(Module):
         x,
         num_slices = 1024,
         domain = (-5, 5),
-        num_knots = 17
+        num_knots = 17,
+        mask = None
     ):
         # Randall Balestriero - https://arxiv.org/abs/2511.08544
 
@@ -538,7 +542,10 @@ class LatentAutoregressiveLoss(Module):
         x_t = einx.dot('... d, m d -> (...) m', x, rand_projs)
 
         x_t = multiply('n m, t -> n m t', x_t, t)
-        ecf = (1j * x_t).exp().mean(dim = 0)
+        ecf = (1j * x_t).exp()
+
+        mask_1d = rearrange(mask, '... -> (...)') if exists(mask) else None
+        ecf = masked_mean(ecf, mask_1d, dim = 0)
 
         # weighted L2 distance
 
@@ -551,10 +558,14 @@ class LatentAutoregressiveLoss(Module):
         x,
         return_loss = True,
         mask = None,
+        cond = None,
         return_unreduced_loss = False
     ):
         pred_input = x[:, :-1]
         target = x[:, 1:]
+
+        if exists(cond):
+            pred_input = torch.cat((pred_input, cond[:, :-1]), dim = -1)
 
         pred = self.net(pred_input)
 
@@ -571,9 +582,7 @@ class LatentAutoregressiveLoss(Module):
 
         loss = masked_mean(loss, mask)
 
-        sigreg = self.sigreg_loss(target, **self.sigreg_loss_kwargs)
-        loss = loss * (1. - self.sigreg_lambda) + sigreg * self.sigreg_lambda
-
+        sigreg = self.sigreg_loss(target, mask = mask, **self.sigreg_loss_kwargs)
         return loss, sigreg, pred
 
 def ramp_weight(times, slope = 0.9, intercept = 0.1):
@@ -2011,8 +2020,9 @@ class VideoTokenizer(Module):
         decoder_v_space_loss = True,
         latent_receive_grad_frac: Callable | None = None,
         latent_ar_loss_weight = 0.,
+        latent_ar_sigreg_loss_weight = 0.05,
         latent_ar_placement = 'encoder',
-        latent_ar_sigreg_loss_kwargs: dict | None = None,
+        latent_ar_sigreg_loss_kwargs = dict(num_slices = 256),
         time_attention_use_pope = False
     ):
         super().__init__()
@@ -2148,6 +2158,7 @@ class VideoTokenizer(Module):
         assert latent_ar_placement in ('encoder', 'decoder'), 'latent_ar_placement must be either "encoder" or "decoder"'
 
         self.latent_ar_loss_weight = latent_ar_loss_weight
+        self.latent_ar_sigreg_loss_weight = latent_ar_sigreg_loss_weight
         self.latent_ar_placement = latent_ar_placement
 
         self.latent_ar_in_encoder = latent_ar_placement == 'encoder'
@@ -2162,7 +2173,7 @@ class VideoTokenizer(Module):
             self.latent_ar = LatentAutoregressiveLoss(
                 latent_ar_dim,
                 use_rmsnorm = latent_ar_use_rmsnorm,
-                sigreg_loss_kwargs = dict(num_slices = 256)
+                sigreg_loss_kwargs = latent_ar_sigreg_loss_kwargs
             )
 
         # loss normalizer
@@ -2474,7 +2485,8 @@ class VideoTokenizer(Module):
             lpips_loss * self.lpips_loss_weight +
             time_decorr_loss * self.time_decorr_loss_weight +
             space_decorr_loss * self.space_decorr_loss_weight +
-            latent_ar_loss * self.latent_ar_loss_weight
+            latent_ar_loss * self.latent_ar_loss_weight +
+            latent_ar_sigreg_loss * self.latent_ar_sigreg_loss_weight
         )
 
         if not return_intermediates:
@@ -2608,11 +2620,19 @@ class DynamicsWorldModel(Module):
         policy_entropy_weight = .01,
         gae_use_accelerated = False,
         use_loss_normalization = False,
-        time_attention_use_pope = False
+        time_attention_use_pope = False,
+        latent_ar_layer: int | None = None,
+        latent_ar = False,
+        latent_ar_action_conditioned = False,
+        latent_ar_loss_weight = 0.,
+        latent_ar_sigreg_loss_weight = 0.05,
+        latent_ar_sigreg_loss_kwargs: dict = dict(num_slices = 256)
     ):
         super().__init__()
         self.dim = dim
         self.depth = depth
+
+        self.has_latent_ar = latent_ar
 
         # can accept raw video if tokenizer is passed in
 
@@ -2779,6 +2799,26 @@ class DynamicsWorldModel(Module):
             num_unembed_preds = multi_token_pred_len,
             squeeze_unembed_preds = False
         )
+
+        # latent autoregressive loss with sigreg
+
+        self.latent_ar_action_conditioned = latent_ar_action_conditioned and self.action_embedder.has_actions
+
+        self.latent_ar_layer = latent_ar_layer
+        self.latent_ar_loss_weight = latent_ar_loss_weight
+        self.latent_ar_sigreg_loss_weight = latent_ar_sigreg_loss_weight
+
+        self.latent_ar = None
+
+        if self.has_latent_ar:
+            assert exists(latent_ar_layer), '`latent_ar_layer` must be specified if `latent_ar` is True'
+            latent_ar_dim_in = dim * 2 if self.latent_ar_action_conditioned else dim
+
+            self.latent_ar = LatentAutoregressiveLoss(
+                dim_in = latent_ar_dim_in,
+                dim = dim,
+                sigreg_loss_kwargs = latent_ar_sigreg_loss_kwargs
+            )
 
         # agent predicting state
 
@@ -4203,6 +4243,8 @@ class DynamicsWorldModel(Module):
 
         # maybe create the action tokens
 
+        latent_ar_action_embed = None
+
         if exists(discrete_actions) or exists(continuous_actions):
             assert self.action_embedder.has_actions
             assert self.num_agents == 1, 'only one agent allowed for now'
@@ -4214,9 +4256,9 @@ class DynamicsWorldModel(Module):
                 continuous_action_types = continuous_action_types
             )
 
-            action_tokens = add('1 d, b t d', self.action_learned_embed, action_tokens)
-
             action_len = action_tokens.shape[1]
+
+            action_tokens = add('1 d, b t d', self.action_learned_embed, action_tokens)
 
             if action_len == time and shift_action_tokens:
                 # handle first timestep not having an associated past action
@@ -4231,6 +4273,11 @@ class DynamicsWorldModel(Module):
                 action_tokens = pad_at_dim(action_tokens, (1, 0), value = 0., dim = 1)
             else:
                 next_action_tokens = action_tokens
+
+            if self.latent_ar_action_conditioned:
+                latent_ar_action_embed = next_action_tokens
+                if next_action_tokens.shape[1] == (time - 1):
+                    latent_ar_action_embed = pad_at_dim(latent_ar_action_embed, (0, 1), value = 0., dim = 1)
 
         elif self.action_embedder.has_actions:
             action_tokens = torch.zeros_like(agent_tokens[:, :, 0:1])
@@ -4323,7 +4370,7 @@ class DynamicsWorldModel(Module):
             if not return_time_cache:
                 return predictions, embeds
 
-            return predictions, (embeds, intermediates)
+            return predictions, (embeds, intermediates, packed_tokens_shape)
 
         # curry into get_prediction what does not change during first call as well as the shortcut ones
 
@@ -4331,7 +4378,7 @@ class DynamicsWorldModel(Module):
 
         # forward the network
 
-        pred, (embeds, intermediates) = _get_prediction(noised_latents, noised_proprio, signal_levels, step_sizes_log2, return_agent_tokens = True, return_time_cache = True, return_intermediates = return_intermediates)
+        pred, (embeds, intermediates, packed_tokens_shape) = _get_prediction(noised_latents, noised_proprio, signal_levels, step_sizes_log2, return_agent_tokens = True, return_time_cache = True, return_intermediates = return_intermediates)
 
         if return_pred_only:
             if not return_intermediates:
@@ -4471,6 +4518,7 @@ class DynamicsWorldModel(Module):
         # handle variable lengths if needed
 
         is_var_len = exists(lens)
+        loss_mask = loss_mask_without_last = None
 
         if is_var_len:
 
@@ -4563,8 +4611,10 @@ class DynamicsWorldModel(Module):
 
             # only for 1 agent
 
+            num_targets = pred_len - 1 if shift_action_tokens else pred_len
+
             encoded_agent_tokens = rearrange(embeds.agent, 'b t 1 d -> b t d')
-            policy_embed = self.policy_head(encoded_agent_tokens[:, :pred_len])
+            policy_embed = self.policy_head(encoded_agent_tokens[:, :num_targets])
 
             # constitute multi token prediction targets
 
@@ -4650,8 +4700,6 @@ class DynamicsWorldModel(Module):
 
         # handle loss normalization
 
-        losses = WorldModelLosses(flow_loss, shortcut_flow_loss, reward_loss, discrete_action_loss, continuous_action_loss, state_pred_loss, agent_state_pred_loss)
-
         if exists(self.flow_loss_normalizer):
             flow_loss = self.flow_loss_normalizer(flow_loss, update_ema = update_loss_ema)
 
@@ -4667,6 +4715,26 @@ class DynamicsWorldModel(Module):
         if exists(continuous_actions) and exists(self.continuous_actions_loss_normalizer):
             continuous_action_loss = self.continuous_actions_loss_normalizer(continuous_action_loss, update_ema = update_loss_ema)
 
+        # latent autoregressive loss with sigreg
+
+        latent_ar_loss = latent_ar_sigreg_loss = self.zero
+
+        if self.has_latent_ar:
+            layer_hiddens = intermediates.layer_hiddens
+            hiddens = layer_hiddens[self.latent_ar_layer]
+
+            _, space_hiddens, *_ = unpack(hiddens, packed_tokens_shape, 'b t * d')
+
+            cond_action = None
+
+            if self.latent_ar_action_conditioned:
+                if not exists(latent_ar_action_embed):
+                    latent_ar_action_embed = torch.zeros((*latents.shape[:2], self.action_embedder.dim), device = self.device, dtype = torch.float32)
+
+                cond_action = repeat(latent_ar_action_embed, 'b t d -> b t n d', n = space_hiddens.shape[2])
+
+            latent_ar_loss, latent_ar_sigreg_loss, _ = self.latent_ar(space_hiddens, mask = loss_mask, cond = cond_action)
+
         # gather losses - they sum across the multi token prediction steps for rewards and actions - eq (9)
 
         total_loss = (
@@ -4676,8 +4744,12 @@ class DynamicsWorldModel(Module):
             (discrete_action_loss * self.discrete_action_loss_weight).sum() +
             (continuous_action_loss * self.continuous_action_loss_weight).sum() +
             (state_pred_loss * self.state_pred_loss_weight) +
-            (agent_state_pred_loss * self.agent_state_pred_loss_weight)
+            (agent_state_pred_loss * self.agent_state_pred_loss_weight) +
+            (latent_ar_loss * self.latent_ar_loss_weight) +
+            (latent_ar_sigreg_loss * self.latent_ar_sigreg_loss_weight)
         )
+
+        losses = WorldModelLosses(flow_loss, shortcut_flow_loss, reward_loss, discrete_action_loss, continuous_action_loss, state_pred_loss, agent_state_pred_loss, latent_ar_loss, latent_ar_sigreg_loss)
 
         if not (return_all_losses or return_intermediates):
             return total_loss
