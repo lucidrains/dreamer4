@@ -21,6 +21,7 @@ from torchvision.models import VGG16_Weights
 from torch.optim import Optimizer
 from adam_atan2_pytorch import MuonAdamAtan2
 
+from x_mlps_pytorch import MLP
 from x_mlps_pytorch.ensemble import Ensemble
 from x_mlps_pytorch.normed_mlp import create_mlp
 
@@ -491,16 +492,22 @@ class LatentAutoregressiveLoss(Module):
         dim,
         use_rmsnorm = False,
         sigreg_lambda = 0.05,
-        sigreg_loss_kwargs: dict | None = None
+        sigreg_loss_kwargs: dict | None = None,
+        net: Module | None = None
     ):
         super().__init__()
         self.sigreg_lambda = sigreg_lambda
         self.sigreg_loss_kwargs = default(sigreg_loss_kwargs, dict())
 
-        self.net = nn.Sequential(
-            RMSNorm(dim) if use_rmsnorm else Identity(),
-            Linear(dim, dim)
-        )
+        if not exists(net):
+            norm = RMSNorm(dim) if use_rmsnorm else Identity()
+
+            net = nn.Sequential(
+                norm,
+                MLP(dim, dim * 4, dim, activation = nn.SiLU())
+            )
+
+        self.net = net
 
     @staticmethod
     def sigreg_loss(
@@ -1122,7 +1129,6 @@ class Rotary1D(Module):
         freqs = einsum(t, self.inv_freq, 'i, j -> i j')
 
         return cat((freqs, freqs), dim = -1)
-
 
 def apply_rotations(
     rotations, # (h n d) | (n d)
