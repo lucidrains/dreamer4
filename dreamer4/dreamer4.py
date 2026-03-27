@@ -2626,6 +2626,7 @@ class DynamicsWorldModel(Module):
         pmpo_reverse_kl = True,
         pmpo_kl_div_loss_weight = .3,
         use_delight_gating = True,
+        delight_temperature = 1.,
         normalize_advantages = None,
         value_clip = 0.4,
         policy_entropy_weight = .01,
@@ -2921,6 +2922,7 @@ class DynamicsWorldModel(Module):
         # delight related
 
         self.use_delight_gating = use_delight_gating
+        self.delight_temperature = delight_temperature
 
         # rewards related
 
@@ -3295,10 +3297,12 @@ class DynamicsWorldModel(Module):
         only_learn_policy_value_heads = True, # in the paper, they do not finetune the entire dynamics model, they just learn the heads
         use_pmpo = True,
         use_delight_gating = None,
+        delight_temperature = None,
         normalize_advantages = None,
         eps = 1e-6
     ):
         use_delight_gating = default(use_delight_gating, self.use_delight_gating)
+        delight_temperature = default(delight_temperature, self.delight_temperature)
 
         assert isinstance(experience, Experience)
 
@@ -3446,7 +3450,7 @@ class DynamicsWorldModel(Module):
         # Ian Osband - https://arxiv.org/abs/2603.14608v1
 
         if use_delight_gating:
-            delight_gate = (-log_probs * advantage).sigmoid().detach()
+            delight_gate = ((-log_probs * advantage) / delight_temperature).sigmoid().detach()
 
         # maybe pmpo
         # pmpo - weighting the positive and negative advantages equally - ignoring magnitude of advantage and taking the sign
@@ -3516,17 +3520,16 @@ class DynamicsWorldModel(Module):
 
         else:
 
-            maybe_weighted_advantage = advantage
-
-            if use_delight_gating:
-                maybe_weighted_advantage = advantage * delight_gate
-
             # ppo clipped surrogate loss
 
             ratio = (log_probs - old_log_probs).exp()
             clipped_ratio = ratio.clamp(1. - self.ppo_eps_clip, 1. + self.ppo_eps_clip)
 
-            policy_loss = -torch.min(ratio * maybe_weighted_advantage, clipped_ratio * maybe_weighted_advantage)
+            policy_loss = -torch.min(ratio * advantage, clipped_ratio * advantage)
+
+            if use_delight_gating:
+                policy_loss = policy_loss * delight_gate
+
             policy_loss = reduce(policy_loss, 'b t na -> b t', 'sum')
 
             policy_loss = masked_mean(policy_loss, mask)
