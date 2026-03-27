@@ -556,23 +556,27 @@ class LatentAutoregressiveLoss(Module):
     def forward(
         self,
         x,
+        target = None,
         return_loss = True,
         mask = None,
         cond = None,
         return_unreduced_loss = False
     ):
+        is_same_layer = not exists(target) or x is target
+        target = default(target, x)
+
         pred_input = x[:, :-1]
-        target = x[:, 1:]
+        target_output = target[:, 1:]
 
         if exists(cond):
-            pred_input = torch.cat((pred_input, cond[:, :-1]), dim = -1)
+            pred_input = cat((pred_input, cond[:, :-1]), dim = -1)
 
         pred = self.net(pred_input)
 
         if not return_loss:
             return pred
 
-        loss = F.mse_loss(pred, target, reduction = 'none')
+        loss = F.mse_loss(pred, target_output, reduction = 'none')
 
         if return_unreduced_loss:
             return loss, pred
@@ -582,7 +586,14 @@ class LatentAutoregressiveLoss(Module):
 
         loss = masked_mean(loss, mask)
 
-        sigreg = self.sigreg_loss(target, mask = mask, **self.sigreg_loss_kwargs)
+        if is_same_layer:
+            sigreg_input = target_output
+            sigreg_mask = mask
+        else:
+            sigreg_input = cat((x[:, :-1], target_output), dim = 0)
+            sigreg_mask = cat((mask, mask), dim = 0) if exists(mask) else None
+
+        sigreg = self.sigreg_loss(sigreg_input, mask = sigreg_mask, **self.sigreg_loss_kwargs)
         return loss, sigreg, pred
 
 def ramp_weight(times, slope = 0.9, intercept = 0.1):
@@ -2621,7 +2632,7 @@ class DynamicsWorldModel(Module):
         gae_use_accelerated = False,
         use_loss_normalization = False,
         time_attention_use_pope = False,
-        latent_ar_layer: int | None = None,
+        latent_ar_layer: int | tuple[int, int] | None = None,
         latent_ar = False,
         latent_ar_action_conditioned = False,
         latent_ar_loss_weight = 0.,
@@ -4721,9 +4732,17 @@ class DynamicsWorldModel(Module):
 
         if self.has_latent_ar:
             layer_hiddens = intermediates.layer_hiddens
-            hiddens = layer_hiddens[self.latent_ar_layer]
 
-            _, space_hiddens, *_ = unpack(hiddens, packed_tokens_shape, 'b t * d')
+            if isinstance(self.latent_ar_layer, tuple):
+                source_layer, target_layer = self.latent_ar_layer
+            else:
+                source_layer = target_layer = self.latent_ar_layer
+
+            source_hiddens = layer_hiddens[source_layer]
+            target_hiddens = layer_hiddens[target_layer]
+
+            _, space_source_hiddens, *_ = unpack(source_hiddens, packed_tokens_shape, 'b t * d')
+            _, space_target_hiddens, *_ = unpack(target_hiddens, packed_tokens_shape, 'b t * d')
 
             cond_action = None
 
@@ -4731,9 +4750,9 @@ class DynamicsWorldModel(Module):
                 if not exists(latent_ar_action_embed):
                     latent_ar_action_embed = torch.zeros((*latents.shape[:2], self.action_embedder.dim), device = self.device, dtype = torch.float32)
 
-                cond_action = repeat(latent_ar_action_embed, 'b t d -> b t n d', n = space_hiddens.shape[2])
+                cond_action = repeat(latent_ar_action_embed, 'b t d -> b t n d', n = space_source_hiddens.shape[2])
 
-            latent_ar_loss, latent_ar_sigreg_loss, _ = self.latent_ar(space_hiddens, mask = loss_mask, cond = cond_action)
+            latent_ar_loss, latent_ar_sigreg_loss, _ = self.latent_ar(space_source_hiddens, target = space_target_hiddens, mask = loss_mask, cond = cond_action)
 
         # gather losses - they sum across the multi token prediction steps for rewards and actions - eq (9)
 
