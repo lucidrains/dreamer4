@@ -78,7 +78,7 @@ def main(
     log_video_every = 50,
     log_dir = './logs_mnist_tokenizer',
     checkpoint_every = 5000,
-    checkpoint_folder = './checkpoints_mnist_tokenizer',
+    checkpoint_folder = './logs_mnist_tokenizer/checkpoints',
     time_decorr_loss_weight = 4e-3,
     space_decorr_loss_weight = 4e-3,
     use_loss_normalization = False,
@@ -92,15 +92,31 @@ def main(
     latent_ar_placement = 'encoder',
     latent_ar_sigreg_num_slices = 256,
     decoder_v_space_loss = True,
-    time_attention_use_pope = False
+    time_attention_use_pope = False,
+    restrict_latent_grads_to_noise = True,
+    decoder_flow_times_beta_alpha = 1.,
+    decoder_flow_times_beta_beta = 1.
 ):
     import shutil
 
     # clear old artifacts
 
     log_path = Path(log_dir)
-    if log_path.exists():
+    ckpt_folder_path = Path(checkpoint_folder)
+    latest_checkpoint = None
+
+    if exists(checkpoint_path):
+        latest_checkpoint = Path(checkpoint_path)
+    elif ckpt_folder_path.exists():
+        checkpoints = list(ckpt_folder_path.glob('tokenizer-*.pt'))
+        checkpoints = [ckpt for ckpt in checkpoints if 'ema' not in ckpt.name]
+        if checkpoints:
+            latest_checkpoint = max(checkpoints, key=lambda p: int(p.stem.split('-')[1]))
+
+    if log_path.exists() and not latest_checkpoint:
         shutil.rmtree(log_path)
+
+    log_path.mkdir(exist_ok = True, parents = True)
 
     log_path.mkdir(exist_ok = True, parents = True)
 
@@ -142,7 +158,10 @@ def main(
         latent_ar_placement = latent_ar_placement,
         latent_ar_sigreg_loss_kwargs = dict(num_slices = latent_ar_sigreg_num_slices),
         decoder_v_space_loss = decoder_v_space_loss,
-        time_attention_use_pope = time_attention_use_pope
+        time_attention_use_pope = time_attention_use_pope,
+        latent_grad_only_at_noise = restrict_latent_grads_to_noise,
+        decoder_flow_times_beta_alpha = decoder_flow_times_beta_alpha,
+        decoder_flow_times_beta_beta = decoder_flow_times_beta_beta
     )
 
     # trainer
@@ -150,7 +169,7 @@ def main(
     trainer = VideoTokenizerTrainer(
         model = tokenizer,
         dataset = dataset,
-        checkpoint_path = checkpoint_path,
+        checkpoint_path = latest_checkpoint,
         optim_klass = MuonAdamAtan2,
         batch_size = batch_size,
         grad_accum_every = grad_accum_every,
@@ -167,8 +186,8 @@ def main(
         checkpoint_folder = checkpoint_folder,
     )
 
-    if exists(checkpoint_path):
-        trainer.load(checkpoint_path)
+    if exists(latest_checkpoint):
+        trainer.load(latest_checkpoint)
 
     trainer()
 

@@ -98,12 +98,12 @@ actor_loss, critic_loss = world_model.learn_from_experience(experience)
 
 ## Moving MNIST
 
-To train a simple tokenizer on Moving MNIST for 5000 steps and then use it to generate action-conditioned dynamics models (should not take more than an hour):
+To train a simple tokenizer on Moving MNIST for 20000 steps and then use it to generate action-conditioned dynamics models
 
 ```bash
-$ uv run train_moving_mnist_tokenizer.py --num_train_steps 5000
+$ uv run train_moving_mnist_tokenizer.py --num_train_steps 20000
 
-$ uv run train_moving_mnist_dynamics.py --num_train_steps 5000 --condition_on_actions True
+$ uv run train_moving_mnist_dynamics.py --num_train_steps 20000 --condition_on_actions True
 ```
 
 The baseline will synthesize unconditionally digits floating in a random direction (with 2 frame prompt to see if it has learnt to continue detected velocity).

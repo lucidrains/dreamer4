@@ -30,6 +30,9 @@ from dataset_moving_mnist import MovingMNISTDataset
 from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel, exists
 from dreamer4.trainers import BehaviorCloneTrainer, save_video_grid_as_gif
 
+def exists(v):
+    return v is not None
+
 # dataset action collation
 
 def random_action_collate(batch):
@@ -94,7 +97,8 @@ def custom_3x3_grid_sample(trainer, batch_data):
         save_video_grid_as_gif(generated_video, gif_path)
 
 def main(
-    tokenizer_checkpoint_path: str = './checkpoints_mnist_tokenizer',
+    tokenizer_checkpoint_path: str = './logs_mnist_tokenizer/checkpoints',
+    checkpoint_path: str = None,
     num_frames = 5,
     image_size = 32,
     digit_size = 14,
@@ -111,7 +115,7 @@ def main(
     log_video_every = 100,
     log_dir = './logs_mnist_dynamics',
     checkpoint_every = 5000,
-    checkpoint_folder = './checkpoints_mnist_dynamics',
+    checkpoint_folder = './logs_mnist_dynamics/checkpoints',
     use_loss_normalization = False,
     multi_token_pred_len = 1,
     shortcut_loss_weight = 5e-2,
@@ -134,7 +138,18 @@ def main(
     # clear old artifacts
 
     log_path = Path(log_dir)
-    if log_path.exists():
+    ckpt_folder_path = Path(checkpoint_folder)
+    latest_checkpoint = None
+
+    if exists(checkpoint_path):
+        latest_checkpoint = Path(checkpoint_path)
+    elif ckpt_folder_path.exists():
+        checkpoints = list(ckpt_folder_path.glob('dynamics-*.pt'))
+        checkpoints = [ckpt for ckpt in checkpoints if 'ema' not in ckpt.name]
+        if checkpoints:
+            latest_checkpoint = max(checkpoints, key=lambda p: int(p.stem.split('-')[1]))
+
+    if log_path.exists() and not latest_checkpoint:
         shutil.rmtree(log_path)
     log_path.mkdir(exist_ok = True, parents = True)
 
@@ -151,11 +166,11 @@ def main(
 
     # Load frozen tokenizer
 
-    checkpoint_path = Path(tokenizer_checkpoint_path)
+    tok_checkpoint_path = Path(tokenizer_checkpoint_path)
 
-    if checkpoint_path.is_dir():
-        ema_checkpoints = list(checkpoint_path.glob('tokenizer-*-ema.pt'))
-        assert ema_checkpoints, f"No EMA tokenizer checkpoints found in {checkpoint_path}"
+    if tok_checkpoint_path.is_dir():
+        ema_checkpoints = list(tok_checkpoint_path.glob('tokenizer-*-ema.pt'))
+        assert ema_checkpoints, f"No EMA tokenizer checkpoints found in {tok_checkpoint_path}"
 
         def get_step(p):
             try:
@@ -163,12 +178,12 @@ def main(
             except ValueError:
                 return -1
 
-        checkpoint_path = max(ema_checkpoints, key = get_step)
+        tok_checkpoint_path = max(ema_checkpoints, key = get_step)
 
-    assert checkpoint_path.exists(), f"Tokenizer checkpoint missing at {checkpoint_path}"
-    print(f"Loading Tokenizer from: {checkpoint_path}")
+    assert tok_checkpoint_path.exists(), f"Tokenizer checkpoint missing at {tok_checkpoint_path}"
+    print(f"Loading Tokenizer from: {tok_checkpoint_path}")
 
-    tokenizer = VideoTokenizer.init_and_load(str(checkpoint_path), strict=False)
+    tokenizer = VideoTokenizer.init_and_load(str(tok_checkpoint_path), strict=False)
     tokenizer.eval().requires_grad_(False)
 
     # initialize world model
@@ -219,6 +234,9 @@ def main(
     )
 
     # Train dynamics model
+
+    if exists(latest_checkpoint):
+        trainer.load(latest_checkpoint)
 
     trainer()
 

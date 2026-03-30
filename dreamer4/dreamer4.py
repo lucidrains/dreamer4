@@ -2030,11 +2030,14 @@ class VideoTokenizer(Module):
         decoder_flow_steps = 1,
         decoder_v_space_loss = True,
         latent_receive_grad_frac: Callable | None = None,
+        latent_grad_only_at_noise = False,
         latent_ar_loss_weight = 0.,
         latent_ar_sigreg_loss_weight = 0.05,
         latent_ar_placement = 'encoder',
         latent_ar_sigreg_loss_kwargs = dict(num_slices = 256),
-        time_attention_use_pope = False
+        time_attention_use_pope = False,
+        decoder_flow_times_beta_alpha = 1.,
+        decoder_flow_times_beta_beta = 1.
     ):
         super().__init__()
 
@@ -2079,7 +2082,17 @@ class VideoTokenizer(Module):
 
         self.decoder_flow_steps = decoder_flow_steps
         self.decoder_v_space_loss = decoder_v_space_loss
+
+        if latent_grad_only_at_noise:
+            assert not exists(latent_receive_grad_frac), 'cannot set both latent_grad_only_at_noise and latent_receive_grad_frac'
+            latent_receive_grad_frac = lambda time_frac: (time_frac == 0.).float()
+
         self.latent_receive_grad_frac = latent_receive_grad_frac
+
+        self.decoder_times_beta_distribution = None
+        if decoder_flow_times_beta_alpha != 1. or decoder_flow_times_beta_beta != 1.:
+            self.decoder_times_beta_distribution = Beta(tensor(decoder_flow_times_beta_alpha), tensor(decoder_flow_times_beta_beta))
+
         self.has_flow = decoder_flow_steps > 1
 
         if self.has_flow:
@@ -2423,7 +2436,11 @@ class VideoTokenizer(Module):
 
         if self.has_flow:
 
-            time_indices = torch.randint(0, self.decoder_flow_steps, (batch,), device = device)
+            if exists(self.decoder_times_beta_distribution):
+                u = self.decoder_times_beta_distribution.sample((batch,)).to(device)
+                time_indices = (u * self.decoder_flow_steps).clamp(0, self.decoder_flow_steps - 1).long()
+            else:
+                time_indices = torch.randint(0, self.decoder_flow_steps, (batch,), device = device)
 
             noise = torch.randn_like(video)
 
