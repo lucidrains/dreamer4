@@ -650,7 +650,7 @@ class SymExpTwoHot(Module):
     def bins_to_scalar_value(
         self,
         logits, # (... l)
-        normalize = False
+        normalize = True
     ):
         two_hot_encoding = logits.softmax(dim = -1) if normalize else logits
         return einsum(two_hot_encoding, self.bin_values, '... l, l -> ...')
@@ -3082,14 +3082,13 @@ class DynamicsWorldModel(Module):
         # if we are not a observation dict, we must be a raw image tensor
 
         if not isinstance(init_obs, dict):
-            assert isinstance(init_obs, torch.Tensor)
-            init_obs = {"image": init_obs}
+            assert is_tensor(init_obs)
+            init_obs = dict(image = init_obs)
 
         assert 'image' in init_obs
-        if self.has_proprio:
-            assert 'proprio' in init_obs
+        assert not self.has_proprio or 'proprio' in init_obs
 
-        proprio = init_obs.get('proprio')
+        proprio = init_obs.get('proprio', None)
 
         # setup accumulation of frames to video and proprio
 
@@ -3585,7 +3584,7 @@ class DynamicsWorldModel(Module):
         value_bins, return_bins, clipped_value_bins = tuple(rearrange(t, 'b t l -> b l t') for t in (value_bins, return_bins, clipped_value_bins))
 
         value_loss_1 = -(return_bins * value_bins.log_softmax(dim = 1)).sum(dim = 1)
-        value_loss_2 = -(return_bins * clipped_value_bins.log_softmax(dim = 1)).sum(dim = 1)
+        value_loss_2 = -(return_bins * log(clipped_value_bins)).sum(dim = 1)
 
         value_loss = torch.maximum(value_loss_1, value_loss_2)
 
@@ -3886,7 +3885,7 @@ class DynamicsWorldModel(Module):
                 one_agent_embed = agent_embed[:, -1:, agent_index]
 
                 reward_logits = self.to_reward_pred.forward_one(one_agent_embed, id = 0)
-                pred_reward = self.reward_encoder.bins_to_scalar_value(reward_logits, normalize = True)
+                pred_reward = self.reward_encoder.bins_to_scalar_value(reward_logits)
 
                 decoded_rewards = cat((decoded_rewards, pred_reward), dim = 1)
 
