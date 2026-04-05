@@ -166,6 +166,20 @@ def combine_experiences(
 
     all_field_values = list(zip(*values))
 
+    # normalize None vs empty tensor mismatches - if any field has an empty tensor and others have None, convert None to matching empty tensor
+
+    for i, field_values in enumerate(all_field_values):
+        has_tensor = [is_tensor(v) for v in field_values]
+        has_none = [v is None for v in field_values]
+
+        if any(has_tensor) and any(has_none):
+            tensors = [v for v in field_values if is_tensor(v)]
+
+            if all(is_empty(t) for t in tensors):
+                all_field_values[i] = tuple(
+                    None for _ in field_values
+                )
+
     # an assert to make sure all fields are either all tensors, or a single matching value (for step size, agent index etc) - can change this later
 
     assert all([
