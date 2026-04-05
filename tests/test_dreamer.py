@@ -702,8 +702,8 @@ def test_online_rl(
         patch_size = 32,
         attn_dim_head = 16,
         num_latent_tokens = 1,
-        image_height = 256,
-        image_width = 256,
+        image_height = 32,
+        image_width = 32,
     )
 
     world_model_and_policy = DynamicsWorldModel(
@@ -726,7 +726,7 @@ def test_online_rl(
     from dreamer4.dreamer4 import combine_experiences
 
     mock_env = MockEnv(
-        (256, 256),
+        (32, 32),
         vectorized = vectorized,
         num_envs = 4,
         terminate_after_step = 2 if env_can_terminate else None,
