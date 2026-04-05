@@ -634,6 +634,7 @@ class SymExpHLGauss(Module):
         learned_embedding = False,
         dim_embed = None,
         sigma = None,
+        sigma_to_bin_ratio = 0.5,
     ):
         super().__init__()
 
@@ -646,6 +647,7 @@ class SymExpHLGauss(Module):
             max_value = max_value,
             num_bins = num_bins,
             sigma = sigma,
+            sigma_to_bin_ratio = sigma_to_bin_ratio,
             transform = symlog,
             inverse_transform = symexp
         )
