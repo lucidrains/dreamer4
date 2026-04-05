@@ -72,7 +72,7 @@ from torch_einops_utils.save_load import save_load
 # v - video viewpoints
 
 import einx
-from einx import add, multiply
+from einx import add, multiply, equal, logical_and
 from einops import einsum, rearrange, repeat, reduce, pack, unpack
 from einops.layers.torch import Rearrange, Reduce
 
@@ -98,7 +98,7 @@ VideoTokenizerIntermediates = namedtuple('VideoTokenizerIntermediates', ('losses
 
 TokenizerLosses = namedtuple('TokenizerLosses', ('recon', 'lpips', 'time_decorr', 'space_decorr', 'latent_ar', 'latent_ar_sigreg'))
 
-WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'shortcut', 'rewards', 'discrete_actions', 'continuous_actions', 'state_pred', 'agent_state_pred', 'latent_ar', 'latent_ar_sigreg'))
+WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'shortcut', 'rewards', 'terminals', 'discrete_actions', 'continuous_actions', 'state_pred', 'agent_state_pred', 'latent_ar', 'latent_ar_sigreg'))
 
 AttentionIntermediates = namedtuple('AttentionIntermediates', ('next_kv_cache', 'normed_inputs'))
 
@@ -119,6 +119,7 @@ class Experience:
     proprio: MaybeTensor = None
     agent_embed: MaybeTensor = None
     rewards: Tensor | None = None
+    terminals: Tensor | None = None
     actions: Actions | None = None
     log_probs: Actions | None = None
     old_action_unembeds: tuple[MaybeTensor, MaybeTensor] | None = None
@@ -250,6 +251,10 @@ def is_power_two(num):
     return log2(num).is_integer()
 
 # tensor helpers
+
+def flags_to_sequence(flags, positions, seq_len):
+    seq = arange(seq_len, device = flags.device)
+    return logical_and('b t, b -> b t', equal('t, b -> b t', seq, positions), flags)
 
 def straight_through(src, tgt):
     return tgt + src - src.detach()
@@ -2747,6 +2752,8 @@ class DynamicsWorldModel(Module):
         latent_flow_loss_weight = 1.,
         shortcut_loss_weight = 1.,
         reward_loss_weight: float | list[float] = 1.,
+        predict_terminals: bool = True,
+        terminal_loss_weight: float | list[float] = 1.,
         discrete_action_loss_weight: float | list[float] = 1.,
         continuous_action_loss_weight: float | list[float] = 1.,
         num_latent_genes = 0,                       # for carrying out evolution within the dreams https://web3.arxiv.org/abs/2503.19037
@@ -3014,6 +3021,26 @@ class DynamicsWorldModel(Module):
             multi_token_pred_len
         )
 
+        # terminal prediction
+
+        self.predict_terminals = predict_terminals
+
+        if predict_terminals:
+            to_terminal_pred = Sequential(
+                create_mlp(
+                    dim_in = dim,
+                    dim = dim,
+                    dim_out = 1,
+                    depth = 1,
+                ),
+                Rearrange('... 1 -> ...')
+            )
+
+            self.to_terminal_pred = Ensemble(
+                to_terminal_pred,
+                multi_token_pred_len
+            )
+
         # value head
 
         self.value_head = create_mlp(
@@ -3077,6 +3104,7 @@ class DynamicsWorldModel(Module):
         self.flow_loss_normalizer = LossNormalizer() if use_loss_normalization else None
         self.shortcut_flow_loss_normalizer = LossNormalizer() if use_loss_normalization else None
         self.reward_loss_normalizer = LossNormalizer(multi_token_pred_len) if use_loss_normalization else None
+        self.terminal_loss_normalizer = LossNormalizer(multi_token_pred_len) if (use_loss_normalization and self.predict_terminals) else None
         self.discrete_actions_loss_normalizer = LossNormalizer(multi_token_pred_len) if (exists(num_discrete_actions) and use_loss_normalization) else None
         self.continuous_actions_loss_normalizer = LossNormalizer(multi_token_pred_len) if (exists(num_continuous_actions) and use_loss_normalization) else None
 
@@ -3084,6 +3112,7 @@ class DynamicsWorldModel(Module):
         self.shortcut_loss_weight = shortcut_loss_weight
 
         self.register_buffer('reward_loss_weight', tensor(reward_loss_weight))
+        self.register_buffer('terminal_loss_weight', tensor(terminal_loss_weight))
         self.register_buffer('discrete_action_loss_weight', tensor(discrete_action_loss_weight))
         self.register_buffer('continuous_action_loss_weight', tensor(continuous_action_loss_weight))
 
@@ -3239,6 +3268,7 @@ class DynamicsWorldModel(Module):
 
         is_terminated = full((batch,), False, device = device)
         is_truncated = full((batch,), False, device = device)
+        was_terminated = full((batch,), False, device = device)
 
         episode_lens = full((batch,), 0, device = device)
 
@@ -3368,6 +3398,7 @@ class DynamicsWorldModel(Module):
             # (2) - previous step is truncated (this step is for bootstrap value)
 
             is_terminated |= (terminated | is_truncated)
+            was_terminated |= terminated
 
             # update `is_truncated`
 
@@ -3409,6 +3440,7 @@ class DynamicsWorldModel(Module):
             latents = latents,
             video = video[:, :, :-1],
             rewards = rewards,
+            terminals = was_terminated,
             proprio=accumulated_proprio[:, :-1] if exists(accumulated_proprio) else None,
             actions = (discrete_actions, continuous_actions),
             log_probs = (discrete_log_probs, continuous_log_probs),
@@ -3474,10 +3506,6 @@ class DynamicsWorldModel(Module):
             rewards = rewards.masked_fill(~mask_for_gae, 0.)
             old_values = old_values.masked_fill(~mask_for_gae, 0.)
 
-        # calculate returns
-
-        returns = calc_gae(rewards, old_values, gamma = self.gae_discount_factor, lam = self.gae_lambda, use_accelerated = self.gae_use_accelerated)
-
         # handle variable lengths
 
         max_time = latents.shape[1]
@@ -3488,6 +3516,23 @@ class DynamicsWorldModel(Module):
         if is_var_len:
             learnable_lens = experience.lens - experience.is_truncated.long() # if is truncated, remove the last one, as it is bootstrapped value
             mask = lens_to_mask(learnable_lens, max_time)
+
+        # build continuation masks for gae from terminals
+
+        gae_masks = mask.clone().float() if exists(mask) else torch.ones_like(old_values)
+
+        if exists(experience.terminals):
+            terminals = experience.terminals
+
+            if terminals.ndim == 1:
+                last_step = (experience.lens - 1).clamp(min = 0) if is_var_len else full((batch,), time - 1, device = self.device)
+                terminals = flags_to_sequence(terminals, last_step, time)
+
+            gae_masks.masked_fill_(terminals.bool(), 0.)
+
+        # calculate returns
+
+        returns = calc_gae(rewards, old_values, masks = gae_masks, gamma = self.gae_discount_factor, lam = self.gae_lambda, use_accelerated = self.gae_use_accelerated)
 
         # determine whether to finetune entire transformer or just learn the heads
 
@@ -3739,6 +3784,7 @@ class DynamicsWorldModel(Module):
         time_cache: Tensor | None = None,
         use_time_cache = True,
         return_rewards_per_frame = False,
+        return_terminals = False,
         return_agent_actions = False,
         return_log_probs_and_values = False,
         return_for_policy_optimization = False,
@@ -3761,6 +3807,7 @@ class DynamicsWorldModel(Module):
             return_agent_actions |= True
             return_log_probs_and_values |= True
             return_rewards_per_frame |= True
+            return_terminals |= self.predict_terminals
 
         # more variables
 
@@ -3845,6 +3892,13 @@ class DynamicsWorldModel(Module):
         decoded_continuous_log_probs = None
         decoded_values = None
 
+        # maybe return terminals
+
+        decoded_terminals = torch.zeros((batch_size,), device = self.device, dtype = torch.bool)
+        decoded_lens = full((batch_size,), time_steps, device = self.device)
+
+        should_predict_terminals = return_terminals and self.predict_terminals
+
         # maybe store agent embed
 
         acc_agent_embed = None
@@ -3875,6 +3929,7 @@ class DynamicsWorldModel(Module):
             take_extra_step = (
                 use_time_cache or
                 return_rewards_per_frame or
+                should_predict_terminals or
                 store_agent_embed or
                 return_agent_actions
             )
@@ -3995,32 +4050,38 @@ class DynamicsWorldModel(Module):
             if has_proprio:
                 denoised_proprio = noised_proprio
 
-            # take care of the rewards by predicting on the agent token embedding on the last denoising step
+            # predictions off agent token embedding on the last denoising step
+
+            needs_agent_embed = return_rewards_per_frame or should_predict_terminals or store_agent_embed or return_agent_actions
+
+            if needs_agent_embed:
+                one_agent_embed = embeds.agent[:, -1:, agent_index]
 
             if return_rewards_per_frame:
-                agent_embed = embeds.agent
-
-                one_agent_embed = agent_embed[:, -1:, agent_index]
-
                 reward_logits = self.to_reward_pred.forward_one(one_agent_embed, id = 0)
                 pred_reward = self.reward_encoder.bins_to_scalar_value(reward_logits)
 
                 decoded_rewards = cat((decoded_rewards, pred_reward), dim = 1)
 
+            # maybe predict terminals
+
+            if should_predict_terminals:
+                terminal_logits = self.to_terminal_pred.forward_one(one_agent_embed, id = 0)
+                pred_terminal = torch.rand_like(terminal_logits) < terminal_logits.sigmoid()
+
+                just_terminated = pred_terminal[..., 0] & ~decoded_terminals
+                decoded_lens.masked_fill_(just_terminated, latents.shape[1] + 1)
+                decoded_terminals |= pred_terminal[..., 0]
+
             # maybe store agent embed
 
             if store_agent_embed:
-                agent_embed = embeds.agent
-
-                one_agent_embed = agent_embed[:, -1:, agent_index]
                 acc_agent_embed = safe_cat((acc_agent_embed, one_agent_embed), dim = 1)
 
             # decode the agent actions if needed
 
             if return_agent_actions:
                 assert self.action_embedder.has_actions
-
-                one_agent_embed = agent_embed[:, -1:, agent_index]
 
                 policy_embed = self.policy_head(one_agent_embed)
 
@@ -4073,6 +4134,11 @@ class DynamicsWorldModel(Module):
 
                 past_proprio_context_noise = cat((past_proprio_context_noise, randn_like(denoised_proprio)), dim = 1)
 
+            # maybe early break if entirely terminated
+
+            if should_predict_terminals and decoded_terminals.all():
+                break
+
         # restore state
 
         self.train(was_training)
@@ -4118,7 +4184,8 @@ class DynamicsWorldModel(Module):
         # returning agent actions, rewards, and log probs + values for policy optimization
 
         batch, device = latents.shape[0], latents.device
-        experience_lens = full((batch,), time_steps, device = device)
+
+        is_truncated = ~decoded_terminals
 
         gen = Experience(
             latents = latents,
@@ -4128,7 +4195,9 @@ class DynamicsWorldModel(Module):
             old_action_unembeds = self.action_embedder.unembed(acc_policy_embed, pred_head_index = 0) if exists(acc_policy_embed) and store_old_action_unembeds else None,
             step_size = step_size,
             agent_index = agent_index,
-            lens = experience_lens,
+            lens = decoded_lens,
+            is_truncated = is_truncated,
+            terminals = decoded_terminals,
             is_from_world_model = True
         )
 
@@ -4160,6 +4229,7 @@ class DynamicsWorldModel(Module):
         latent_gene_ids = None,          # (b)
         tasks = None,                    # (b)
         rewards = None,                  # (b t) | (b t-1) during generation
+        terminals = None,                # (b)
         discrete_actions = None,         # (b t na) | (b t-1 na)
         continuous_actions = None,       # (b t na) | (b t-1 na)
         shift_action_tokens = True,      # set to False if actions already properly paired, which is different than the usual replay buffer pairing
@@ -4683,15 +4753,20 @@ class DynamicsWorldModel(Module):
         # now take care of the agent token losses
 
         reward_loss = self.zero
+        terminal_loss = self.zero
 
-        if exists(rewards):
+        needs_agent_pred = exists(rewards) or (exists(terminals) and self.predict_terminals)
 
+        if needs_agent_pred:
             encoded_agent_tokens = embeds.agent
 
-            if rewards.ndim == 2: # (b t)
+            if encoded_agent_tokens.ndim == 4:
                 encoded_agent_tokens = reduce(encoded_agent_tokens, 'b t g d -> b t d', 'mean')
 
-            reward_pred = self.to_reward_pred(encoded_agent_tokens[:, :-1])
+            agent_tokens_shifted = encoded_agent_tokens[:, :-1]
+
+        if exists(rewards):
+            reward_pred = self.to_reward_pred(agent_tokens_shifted)
 
             reward_pred = rearrange(reward_pred, 'mtp b t l -> b l t mtp')
 
@@ -4708,6 +4783,29 @@ class DynamicsWorldModel(Module):
                 reward_loss = reward_losses[loss_mask_without_last].sum(dim = 0) / valid_mask.sum(dim = 0).clamp(min = 1)
             else:
                 reward_loss = reward_losses.sum(dim = tuple(range(reward_losses.ndim - 1))) / reward_loss_mask.sum(dim = tuple(range(reward_loss_mask.ndim - 1))).clamp(min = 1)
+
+        # terminal prediction loss
+
+        if exists(terminals) and self.predict_terminals:
+            terminal_pred = self.to_terminal_pred(agent_tokens_shifted)
+            terminal_pred = rearrange(terminal_pred, 'mtp b t -> b t mtp')
+
+            if terminals.ndim == 1:
+                last_transition = (lens - 2).clamp(min = 0) if is_var_len else full((batch,), max(time - 2, 0), device = device)
+                terminals_seq = flags_to_sequence(terminals, last_transition, max(time - 1, 0))
+            else:
+                terminals_seq = terminals[:, :-1]
+
+            terminal_targets, terminal_loss_mask = create_multi_token_prediction_targets(terminals_seq, self.multi_token_pred_len)
+
+            terminal_losses = F.binary_cross_entropy_with_logits(terminal_pred, terminal_targets.float(), reduction = 'none')
+            terminal_losses = terminal_losses.masked_fill(~terminal_loss_mask, 0.)
+
+            if is_var_len:
+                valid_mask = terminal_loss_mask[loss_mask_without_last]
+                terminal_loss = terminal_losses[loss_mask_without_last].sum(dim = 0) / valid_mask.sum(dim = 0).clamp(min = 1)
+            else:
+                terminal_loss = terminal_losses.sum(dim = tuple(range(terminal_losses.ndim - 1))) / terminal_loss_mask.sum(dim = tuple(range(terminal_loss_mask.ndim - 1))).clamp(min = 1)
 
         # maybe autoregressive state prediction loss
 
@@ -4864,6 +4962,9 @@ class DynamicsWorldModel(Module):
         if exists(rewards) and exists(self.reward_loss_normalizer):
             reward_loss = self.reward_loss_normalizer(reward_loss, update_ema = update_loss_ema)
 
+        if exists(terminals) and exists(self.terminal_loss_normalizer):
+            terminal_loss = self.terminal_loss_normalizer(terminal_loss, update_ema = update_loss_ema)
+
         if exists(discrete_actions) and exists(self.discrete_actions_loss_normalizer):
             discrete_action_loss = self.discrete_actions_loss_normalizer(discrete_action_loss, update_ema = update_loss_ema)
 
@@ -4904,6 +5005,7 @@ class DynamicsWorldModel(Module):
             flow_loss * self.latent_flow_loss_weight +
             shortcut_flow_loss * self.shortcut_loss_weight +
             (reward_loss * self.reward_loss_weight).sum() +
+            (terminal_loss * self.terminal_loss_weight).sum() +
             (discrete_action_loss * self.discrete_action_loss_weight).sum() +
             (continuous_action_loss * self.continuous_action_loss_weight).sum() +
             (state_pred_loss * self.state_pred_loss_weight) +
@@ -4912,7 +5014,7 @@ class DynamicsWorldModel(Module):
             (latent_ar_sigreg_loss * self.latent_ar_sigreg_loss_weight)
         )
 
-        losses = WorldModelLosses(flow_loss, shortcut_flow_loss, reward_loss, discrete_action_loss, continuous_action_loss, state_pred_loss, agent_state_pred_loss, latent_ar_loss, latent_ar_sigreg_loss)
+        losses = WorldModelLosses(flow_loss, shortcut_flow_loss, reward_loss, terminal_loss, discrete_action_loss, continuous_action_loss, state_pred_loss, agent_state_pred_loss, latent_ar_loss, latent_ar_sigreg_loss)
 
         if not (return_all_losses or return_intermediates):
             return total_loss

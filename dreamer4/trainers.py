@@ -1262,6 +1262,7 @@ class DreamerTrainer(Module):
         project_name = 'dreamer4',
         checkpoint_every = 1000,
         checkpoint_folder = './checkpoints',
+        start_step = 0,
     ):
         super().__init__()
 
@@ -1308,7 +1309,7 @@ class DreamerTrainer(Module):
         self.checkpoint_folder = Path(checkpoint_folder)
         self.checkpoint_folder.mkdir(exist_ok = True, parents = True)
 
-        self.register_buffer('step', tensor(0))
+        self.register_buffer('step', tensor(start_step))
 
         (
             self.model,
@@ -1361,11 +1362,12 @@ class DreamerTrainer(Module):
         """Slice an experience along the batch dimension."""
         video = experience.video[indices]
         rewards = experience.rewards[indices] if exists(experience.rewards) else None
+        terminals = experience.terminals[indices] if exists(experience.terminals) else None
         discrete_actions = experience.actions[0][indices] if exists(experience.actions[0]) else None
         continuous_actions = experience.actions[1][indices] if exists(experience.actions[1]) else None
         lens = experience.lens[indices] if exists(experience.lens) else None
 
-        return video, rewards, discrete_actions, continuous_actions, lens
+        return video, rewards, terminals, discrete_actions, continuous_actions, lens
 
     def _make_frame_batches(self, lens, max_frames):
         """Group episodes into batches respecting a frame budget. Returns list of index tensors."""
@@ -1408,11 +1410,12 @@ class DreamerTrainer(Module):
 
         for bi in batch_order:
             batch_indices = batches[bi]
-            video, rewards, discrete_actions, continuous_actions, lens = self._slice_experience(experience, batch_indices)
+            video, rewards, terminals, discrete_actions, continuous_actions, lens = self._slice_experience(experience, batch_indices)
 
             loss, losses = self.model(
                 video = video,
                 rewards = rewards,
+                terminals = terminals,
                 discrete_actions = discrete_actions,
                 continuous_actions = continuous_actions,
                 lens = lens,
@@ -1423,6 +1426,8 @@ class DreamerTrainer(Module):
                 flow_loss = losses.flow.item(),
                 shortcut_loss = losses.shortcut.item(),
                 reward_loss = losses.rewards.sum().item(),
+                terminal_loss = losses.terminals.sum().item(),
+                **getattr(self.unwrapped_model, '_cont_diagnostics', {}),
                 discrete_action_loss = losses.discrete_actions.sum().item(),
                 continuous_action_loss = losses.continuous_actions.sum().item(),
                 state_pred_loss = losses.state_pred.item(),
