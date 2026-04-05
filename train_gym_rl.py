@@ -47,9 +47,11 @@ def main(
     env_max_timesteps = 500,
     wm_collect_frames = 2048,
     wm_max_frames_per_batch = 128,
-    dream_train_steps_per_collect = 1,
+    dream_train_steps_per_collect = 12,
     wm_only_steps = 100,
+    predict_terminals = True,
     log_dir: str = None,
+    checkpoint_path: str = None,
     checkpoint_every = 100,
 ):
     assert reward_encoding in ('hl_gauss', 'two_hot')
@@ -60,7 +62,11 @@ def main(
         tokenizer_checkpoint_path = f'./logs_tokenizer_{env_name}/checkpoints'
 
     if log_dir is None:
-        log_dir = f'./logs_rl_{env_name}_{reward_encoding}'
+        # auto-increment run version
+        import glob
+        existing = glob.glob(f'./runs/{env_name}_{reward_encoding}_v*')
+        version = max([int(p.rstrip('/').split('_v')[-1]) for p in existing] + [0]) + 1
+        log_dir = f'./runs/{env_name}_{reward_encoding}_v{version}'
 
     checkpoint_folder = f'{log_dir}/checkpoints'
 
@@ -115,13 +121,27 @@ def main(
             num_bins = num_bins,
             reward_range = (-20., 20.),
         ),
+        predict_terminals = predict_terminals,
     )
+
+    # load checkpoint if provided
+
+    if checkpoint_path is not None:
+        ckpt = torch.load(checkpoint_path, map_location = 'cpu', weights_only = False)
+        missing, unexpected = model.load_state_dict(ckpt['model'], strict = False)
+        start_step = ckpt.get('step', 0)
+        print(f"Loaded checkpoint from {checkpoint_path} (step {start_step})")
+        if missing:
+            print(f"  New params (not in checkpoint): {missing}")
+    else:
+        start_step = 0
 
     # create trainer
 
     trainer = DreamerTrainer(
         model,
         learning_rate = lr,
+        start_step = start_step,
         dream_timesteps = dream_timesteps,
         env_max_timesteps = env_max_timesteps,
         wm_collect_frames = wm_collect_frames,
