@@ -33,6 +33,8 @@ from PoPE_pytorch import PoPE, flash_attn_with_pope
 
 from discrete_continuous_embed_readout import MultiCategorical
 
+from hl_gauss_pytorch import HLGaussLoss
+
 import einx
 from torch_einops_utils import (
     maybe,
@@ -618,6 +620,95 @@ def ramp_weight(times, slope = 0.9, intercept = 0.1):
 
 # rewards
 
+def symlog(x):
+    return x.sign() * torch.log(x.abs() + 1.)
+
+def symexp(x):
+    return x.sign() * (torch.exp(x.abs()) - 1.)
+
+class SymExpHLGauss(Module):
+    def __init__(
+        self,
+        reward_range = (-20., 20.),
+        num_bins = 255,
+        learned_embedding = False,
+        dim_embed = None,
+        sigma = None,
+    ):
+        super().__init__()
+
+        min_value, max_value = reward_range
+
+        self.num_bins = num_bins
+
+        self.hl_gauss = HLGaussLoss(
+            min_value = min_value,
+            max_value = max_value,
+            num_bins = num_bins,
+            sigma = sigma,
+            transform = symlog,
+            inverse_transform = symexp
+        )
+
+        # take care of a reward embedding
+        # for an improvisation where agent tokens can also see the past rewards - it makes sense that this information should not be thrown out, a la Decision Transformer
+
+        self.learned_embedding = learned_embedding
+
+        if learned_embedding:
+            assert exists(dim_embed)
+            self.bin_embeds = nn.Embedding(num_bins, dim_embed)
+
+    def embed(
+        self,
+        probs,
+    ):
+        assert self.learned_embedding, f'can only embed if `learned_embedding` is True'
+
+        return einsum(probs, self.bin_embeds.weight, '... l, l d -> ... d')
+
+    def bins_to_scalar_value(
+        self,
+        logits, # (... l)
+    ):
+        if is_empty(logits):
+            return logits[..., 0]
+
+        return self.hl_gauss(logits)
+
+    def loss(
+        self,
+        logits,
+        target = None,
+        target_probs = None,
+    ):
+        if is_empty(logits):
+            return logits[..., 0]
+
+        if not exists(target_probs):
+            target_probs = self.target_probs(target)
+
+        if logits.ndim > 2:
+            logits = rearrange(logits, 'b ... l -> b l ...')
+            target_probs = rearrange(target_probs, 'b ... l -> b l ...')
+
+        return F.cross_entropy(logits, target_probs, reduction = 'none')
+
+    def transform_to_logprobs(
+        self,
+        values
+    ):
+        return self.hl_gauss.transform_to_logprobs(values)
+
+    def target_probs(
+        self,
+        values
+    ):
+        if is_empty(values):
+            return values.unsqueeze(-1).expand(*values.shape, self.num_bins)
+
+        return self.hl_gauss.transform_to_probs(values)
+
 class SymExpTwoHot(Module):
     def __init__(
         self,
@@ -632,12 +723,8 @@ class SymExpTwoHot(Module):
         values = linspace(min_value, max_value, num_bins)
         values = values.sign() * (torch.exp(values.abs()) - 1.)
 
-        self.reward_range = reward_range
         self.num_bins = num_bins
         self.register_buffer('bin_values', values)
-
-        # take care of a reward embedding
-        # for an improvisation where agent tokens can also see the past rewards - it makes sense that this information should not be thrown out, a la Decision Transformer
 
         self.learned_embedding = learned_embedding
 
@@ -645,72 +732,85 @@ class SymExpTwoHot(Module):
             assert exists(dim_embed)
             self.bin_embeds = nn.Embedding(num_bins, dim_embed)
 
-    @property
-    def device(self):
-        return self.bin_values.device
-
     def embed(
         self,
-        two_hot_encoding,
+        probs,
     ):
         assert self.learned_embedding, f'can only embed if `learned_embedding` is True'
 
-        weights, bin_indices = two_hot_encoding.topk(k = 2, dim = -1)
-
+        weights, bin_indices = probs.topk(k = 2, dim = -1)
         two_embeds = self.bin_embeds(bin_indices)
-
         return einsum(two_embeds, weights, '... two d, ... two -> ... d')
 
     def bins_to_scalar_value(
         self,
         logits, # (... l)
-        normalize = True
     ):
-        two_hot_encoding = logits.softmax(dim = -1) if normalize else logits
-        return einsum(two_hot_encoding, self.bin_values, '... l, l -> ...')
+        if is_empty(logits):
+            return logits[..., 0]
 
-    def forward(
+        probs = logits.softmax(dim = -1)
+        return einsum(probs, self.bin_values, '... l, l -> ...')
+
+    def loss(
+        self,
+        logits,
+        target = None,
+        target_probs = None,
+    ):
+        if is_empty(logits):
+            return logits[..., 0]
+
+        if not exists(target_probs):
+            target_probs = self.target_probs(target)
+
+        if logits.ndim > 2:
+            logits = rearrange(logits, 'b ... l -> b l ...')
+            target_probs = rearrange(target_probs, 'b ... l -> b l ...')
+
+        return F.cross_entropy(logits, target_probs, reduction = 'none')
+
+    def target_probs(
         self,
         values
     ):
-        bin_values = self.bin_values
-        min_bin_value, max_bin_value = bin_values[0], bin_values[-1]
+        if is_empty(values):
+            return values.unsqueeze(-1).expand(*values.shape, self.num_bins)
 
+        bin_values = self.bin_values
         values, inverse_pack = pack_one(values, '*')
         num_values = values.shape[0]
 
-        values = values.clamp(min = min_bin_value, max = max_bin_value)
+        values = values.clamp(min = bin_values[0], max = bin_values[-1])
 
         indices = torch.searchsorted(bin_values, values)
-
-        # fetch the closest two indices (two-hot encoding)
 
         left_indices = (indices - 1).clamp(min = 0)
         right_indices = left_indices + 1
 
         left_indices, right_indices = tuple(rearrange(t, '... -> ... 1') for t in (left_indices, right_indices))
 
-        # fetch the left and right values for the consecutive indices
-
         left_values = bin_values[left_indices]
         right_values = bin_values[right_indices]
-
-        # calculate the left and right values by the distance to the left and right
 
         values = rearrange(values, '... -> ... 1')
         total_distance = right_values - left_values
 
-        left_logit_value = (right_values - values) / total_distance
-        right_logit_value = 1. - left_logit_value
+        left_weight = (right_values - values) / total_distance
+        right_weight = 1. - left_weight
 
-        # set the left and right values (two-hot)
-
-        encoded = torch.zeros((num_values, self.num_bins), device = self.device)
-
-        encoded.scatter_(-1, left_indices, left_logit_value)
-        encoded.scatter_(-1, right_indices, right_logit_value)
+        encoded = torch.zeros((num_values, self.num_bins), device = bin_values.device)
+        encoded.scatter_(-1, left_indices, left_weight)
+        encoded.scatter_(-1, right_indices, right_weight)
 
         return inverse_pack(encoded, '* l')
+
+    def transform_to_logprobs(
+        self,
+        values
+    ):
+        probs = self.target_probs(values)
+        return torch.log(probs.clamp(min = 1e-10))
 
 # action related
 
@@ -2614,6 +2714,7 @@ class DynamicsWorldModel(Module):
         num_tasks = 0,
         num_video_views = 1,
         dim_proprio = None,
+        reward_encoding: str = 'hl_gauss',  # 'hl_gauss' or 'two_hot'
         reward_encoder_kwargs: dict = dict(),
         depth = 4,
         pred_orig_latent = True,   # directly predicting the original x0 data yield better results, rather than velocity (x-space vs v-space)
@@ -2659,7 +2760,7 @@ class DynamicsWorldModel(Module):
         use_delight_gating = True,
         delight_temperature = 1.,
         normalize_advantages = None,
-        value_clip = 0.4,
+        value_clip = 0.,
         policy_entropy_weight = .01,
         gae_use_accelerated = False,
         use_loss_normalization = False,
@@ -2891,7 +2992,11 @@ class DynamicsWorldModel(Module):
         self.add_reward_embed_to_agent_token = add_reward_embed_to_agent_token
         self.add_reward_embed_dropout = add_reward_embed_dropout
 
-        self.reward_encoder = SymExpTwoHot(
+        assert reward_encoding in ('hl_gauss', 'two_hot'), f'unknown reward_encoding: {reward_encoding}'
+
+        RewardEncoderClass = SymExpHLGauss if reward_encoding == 'hl_gauss' else SymExpTwoHot
+
+        self.reward_encoder = RewardEncoderClass(
             **reward_encoder_kwargs,
             dim_embed = dim,
             learned_embedding = add_reward_embed_to_agent_token
@@ -3587,20 +3692,17 @@ class DynamicsWorldModel(Module):
 
         # value loss
 
-        value_bins = self.value_head(agent_embeds)
-        values = self.reward_encoder.bins_to_scalar_value(value_bins)
+        value_logits = self.value_head(agent_embeds)
+        return_probs = self.reward_encoder.target_probs(returns)
 
-        clipped_values = old_values + (values - old_values).clamp(-self.value_clip, self.value_clip)
-        clipped_value_bins = self.reward_encoder(clipped_values)
+        value_loss = self.reward_encoder.loss(value_logits, target_probs = return_probs)
 
-        return_bins = self.reward_encoder(returns)
-
-        value_bins, return_bins, clipped_value_bins = tuple(rearrange(t, 'b t l -> b l t') for t in (value_bins, return_bins, clipped_value_bins))
-
-        value_loss_1 = -(return_bins * value_bins.log_softmax(dim = 1)).sum(dim = 1)
-        value_loss_2 = -(return_bins * log(clipped_value_bins)).sum(dim = 1)
-
-        value_loss = torch.maximum(value_loss_1, value_loss_2)
+        if self.value_clip > 0.:
+            values = self.reward_encoder.bins_to_scalar_value(value_logits)
+            clipped_values = old_values + (values - old_values).clamp(-self.value_clip, self.value_clip)
+            clipped_value_logprobs = self.reward_encoder.transform_to_logprobs(clipped_values)
+            clipped_value_loss = -(return_probs * clipped_value_logprobs).sum(dim = -1)
+            value_loss = torch.maximum(value_loss, clipped_value_loss)
 
         # maybe variable length
 
@@ -4241,7 +4343,7 @@ class DynamicsWorldModel(Module):
         reward_tokens = empty_token
 
         if exists(rewards):
-            two_hot_encoding = self.reward_encoder(rewards)
+            reward_target_probs = self.reward_encoder.target_probs(rewards)
 
             if (
                 self.add_reward_embed_to_agent_token and
@@ -4249,7 +4351,7 @@ class DynamicsWorldModel(Module):
             ):
                 assert self.num_agents == 1
 
-                reward_tokens = self.reward_encoder.embed(two_hot_encoding)
+                reward_tokens = self.reward_encoder.embed(reward_target_probs)
 
                 pop_last_reward = int(reward_tokens.shape[1] == agent_tokens.shape[1]) # the last reward is popped off during training, during inference, it is not known yet, so need to handle this edge case
 
@@ -4591,18 +4693,19 @@ class DynamicsWorldModel(Module):
 
             reward_pred = rearrange(reward_pred, 'mtp b t l -> b l t mtp')
 
-            reward_targets, reward_loss_mask = create_multi_token_prediction_targets(two_hot_encoding[:, :-1], self.multi_token_pred_len)
+            reward_targets, reward_loss_mask = create_multi_token_prediction_targets(reward_target_probs[:, :-1], self.multi_token_pred_len)
 
             reward_targets = rearrange(reward_targets, 'b t mtp l -> b l t mtp')
 
-            reward_losses = -(reward_targets * reward_pred.log_softmax(dim = 1)).sum(dim = 1)
+            reward_losses = F.cross_entropy(reward_pred, reward_targets, reduction = 'none')
 
             reward_losses = reward_losses.masked_fill(~reward_loss_mask, 0.)
 
             if is_var_len:
-                reward_loss = reward_losses[loss_mask_without_last].mean(dim = 0)
+                valid_mask = reward_loss_mask[loss_mask_without_last]  # (valid_positions, mtp)
+                reward_loss = reward_losses[loss_mask_without_last].sum(dim = 0) / valid_mask.sum(dim = 0).clamp(min = 1)
             else:
-                reward_loss = reduce(reward_losses, '... mtp -> mtp', 'mean') # they sum across the prediction steps (mtp dimension) - eq(9)
+                reward_loss = reward_losses.sum(dim = tuple(range(reward_losses.ndim - 1))) / reward_loss_mask.sum(dim = tuple(range(reward_loss_mask.ndim - 1))).clamp(min = 1)
 
         # maybe autoregressive state prediction loss
 
@@ -4694,18 +4797,24 @@ class DynamicsWorldModel(Module):
 
                 if is_var_len:
                     discrete_action_losses = rearrange(-discrete_log_probs, 'mtp b t na -> b t na mtp')
-                    discrete_action_loss = reduce(discrete_action_losses[action_loss_mask], '... mtp -> mtp', 'mean')
+                    valid_losses = discrete_action_losses[action_loss_mask]  # (valid, na, mtp)
+                    valid_mask = rearrange(discrete_mask, 'mtp b t -> b t mtp')[action_loss_mask]  # (valid, mtp)
+                    discrete_action_loss = valid_losses.sum(dim = tuple(range(valid_losses.ndim - 1))) / valid_mask.sum(dim = 0).clamp(min = 1)
                 else:
-                    discrete_action_loss = reduce(-discrete_log_probs, 'mtp b t na -> mtp', 'mean')
+                    discrete_action_loss = reduce(-discrete_log_probs, 'mtp b t na -> mtp na', 'sum') / discrete_mask.sum(dim = (1, 2)).clamp(min = 1).unsqueeze(-1)
+                    discrete_action_loss = discrete_action_loss.mean(dim = -1)  # mean over action dims
 
             if exists(continuous_log_probs):
                 continuous_log_probs = continuous_log_probs.masked_fill(~continuous_mask[..., None], 0.)
 
                 if is_var_len:
                     continuous_action_losses = rearrange(-continuous_log_probs, 'mtp b t na -> b t na mtp')
-                    continuous_action_loss = reduce(continuous_action_losses[action_loss_mask], '... mtp -> mtp', 'mean')
+                    valid_losses = continuous_action_losses[action_loss_mask]
+                    valid_mask = rearrange(continuous_mask, 'mtp b t -> b t mtp')[action_loss_mask]
+                    continuous_action_loss = valid_losses.sum(dim = tuple(range(valid_losses.ndim - 1))) / valid_mask.sum(dim = 0).clamp(min = 1)
                 else:
-                    continuous_action_loss = reduce(-continuous_log_probs, 'mtp b t na -> mtp', 'mean')
+                    continuous_action_loss = reduce(-continuous_log_probs, 'mtp b t na -> mtp na', 'sum') / continuous_mask.sum(dim = (1, 2)).clamp(min = 1).unsqueeze(-1)
+                    continuous_action_loss = continuous_action_loss.mean(dim = -1)
 
         # maybe agent state prediction loss
 
