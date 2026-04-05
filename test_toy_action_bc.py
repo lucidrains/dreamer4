@@ -19,18 +19,18 @@ from dreamer4.dreamer4 import DynamicsWorldModel
 
 # helpers
 
-def exists(v):
+def exists(v) -> bool:
     return v is not None
 
-def divisible_by(num, den):
+def divisible_by(num: int, den) -> bool:
     return (num % den) == 0
 
 # main
 
 def main(
-    is_continuous = False,
-    cpu = False
-):
+    is_continuous: bool = False,
+    cpu: bool = False
+) -> None:
     accelerator = Accelerator(cpu = cpu)
     device = accelerator.device
     print = accelerator.print

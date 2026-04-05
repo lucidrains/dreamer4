@@ -35,22 +35,22 @@ from ema_pytorch import EMA
 
 # helpers
 
-def exists(v):
+def exists(v) -> bool:
     return v is not None
 
 def default(v, d):
     return v if exists(v) else d
 
-def divisible_by(num, den):
+def divisible_by(num: int, den) -> bool:
     return (num % den) == 0
 
 def video_tensor_to_gif(
     tensor,
-    path,
-    duration = 120,
-    loop = 0,
-    optimize = True
-):
+    path: str,
+    duration: int = 120,
+    loop: int = 0,
+    optimize: bool = True
+) -> None:
     tensor = tensor.clamp(0, 1)
     images = [T.ToPILImage()(img) for img in tensor.unbind(dim = 1)]
 
@@ -65,7 +65,7 @@ def video_tensor_to_gif(
         optimize = optimize
     )
 
-def save_video_grid_as_gif(video, path):
+def save_video_grid_as_gif(video, path: str) -> None:
     batch = video.shape[0]
     num_rows = int(math.sqrt(batch))
     num_keep = num_rows ** 2
@@ -73,7 +73,7 @@ def save_video_grid_as_gif(video, path):
     grid = rearrange(video, '(row col) c f h w -> c f (row h) (col w)', row = num_rows)
     video_tensor_to_gif(grid.cpu(), str(path))
 
-def cycle(dl):
+def cycle(dl) -> None:
     while True:
         for batch in dl:
             yield batch
@@ -88,25 +88,25 @@ class VideoTokenizerTrainer(Module):
         *,
         checkpoint_path: str | None = None,
         optim_klass = MuonAdamAtan2,
-        batch_size = 16,
-        learning_rate = 3e-4,
-        max_grad_norm = 0.5,
-        num_train_steps = 10_000,
-        grad_accum_every = 1,
-        weight_decay = 0.,
+        batch_size: int = 16,
+        learning_rate: float = 3e-4,
+        max_grad_norm: float = 0.5,
+        num_train_steps: int = 10_000,
+        grad_accum_every: int = 1,
+        weight_decay: float = 0.,
         accelerate_kwargs: dict = dict(),
         optim_kwargs: dict = dict(),
-        cpu = False,
-        use_ema = False,
-        ema_decay = 0.999,
-        use_tensorboard_logger = False,
+        cpu: bool = False,
+        use_ema: bool = False,
+        ema_decay: float = 0.999,
+        use_tensorboard_logger: bool = False,
         log_dir: str | None = None,
-        project_name = 'dreamer4',
-        log_video = False,
+        project_name: str = 'dreamer4',
+        log_video: bool = False,
         video_fps = -1,
-        log_video_every = 1000,
-        checkpoint_every = 2500,
-        checkpoint_folder = './checkpoints_tokenizer'
+        log_video_every: int = 1000,
+        checkpoint_every: int = 2500,
+        checkpoint_folder: str = './checkpoints_tokenizer'
     ):
         super().__init__()
         batch_size = min(batch_size, len(dataset))
@@ -211,13 +211,13 @@ class VideoTokenizerTrainer(Module):
     def unwrap_model(self):
         return self.accelerator.unwrap_model
 
-    def print(self, *args, **kwargs):
+    def print(self, *args: list, **kwargs: dict):
         return self.accelerator.print(*args, **kwargs)
 
-    def log(self, **data):
+    def log(self, **data: dict) -> None:
         self.accelerator.log(data, step = self.step.item())
 
-    def log_video(self, video, tag: str):
+    def log_video(self, video, tag: str) -> None:
         if exists(self.video_logger):
             self.video_logger(
                 tag,
@@ -226,7 +226,7 @@ class VideoTokenizerTrainer(Module):
                 self.fps
             )
 
-    def load(self, path):
+    def load(self, path: str) -> None:
         path = Path(path)
         assert path.exists(), f"checkpoint not found at {path}"
 
@@ -255,7 +255,7 @@ class VideoTokenizerTrainer(Module):
 
     def forward(
         self
-    ):
+    ) -> None:
         iter_train_dl = cycle(self.train_dataloader)
 
         if self.is_main_process and self.log_video_flag:
@@ -401,35 +401,35 @@ class BehaviorCloneTrainer(Module):
         model: DynamicsWorldModel,
         dataset: Dataset,
         optim_klass = MuonAdamAtan2,
-        batch_size = 16,
-        learning_rate = 3e-4,
-        max_grad_norm = 0.5,
-        num_train_steps = 10_000,
-        weight_decay = 0.,
+        batch_size: int = 16,
+        learning_rate: float = 3e-4,
+        max_grad_norm: float = 0.5,
+        num_train_steps: int = 10_000,
+        weight_decay: float = 0.,
         accelerate_kwargs: dict = dict(),
         optim_kwargs: dict = dict(),
-        cpu = False,
-        use_tensorboard_logger = False,
+        cpu: bool = False,
+        use_tensorboard_logger: bool = False,
         log_dir: str | None = None,
-        project_name = 'dreamer4',
-        log_video = True,
-        log_video_every = 100,
-        checkpoint_every = 5000,
-        checkpoint_folder = './checkpoints',
+        project_name: str = 'dreamer4',
+        log_video: bool = True,
+        log_video_every: int = 100,
+        checkpoint_every: int = 5000,
+        checkpoint_folder: str = './checkpoints',
         video_fps = -1,
-        sample_time_steps = 16,
-        sample_batch_size = 25,
-        sample_prompt_frames = 1,
-        sample_sticky_action = False,
+        sample_time_steps: int = 16,
+        sample_batch_size: int = 25,
+        sample_prompt_frames: int = 1,
+        sample_sticky_action: bool = False,
         sample_autoregressive_actions = None,
-        sample_filename_prefix = 'sample',
-        use_ema = False,
-        ema_decay = 0.999,
-        grad_accum_every = 1,
-        self_flow = False,
+        sample_filename_prefix: str = 'sample',
+        use_ema: bool = False,
+        ema_decay: float = 0.999,
+        grad_accum_every: int = 1,
+        self_flow: bool = False,
         self_flow_student_layer = -3,
         self_flow_layer = -1,
-        self_flow_loss_weight = 1.0,
+        self_flow_loss_weight: float = 1.0,
         self_flow_kwargs: dict = dict(),
         collate_fn = None,
         custom_sample_fn = None
@@ -566,7 +566,7 @@ class BehaviorCloneTrainer(Module):
     def device(self):
         return self.accelerator.device
 
-    def print(self, *args, **kwargs):
+    def print(self, *args: list, **kwargs: dict):
         return self.accelerator.print(*args, **kwargs)
 
     @property
@@ -577,10 +577,10 @@ class BehaviorCloneTrainer(Module):
     def unwrap_model(self):
         return self.accelerator.unwrap_model
 
-    def log(self, **data):
+    def log(self, **data: dict) -> None:
         self.accelerator.log(data, step = self.step.item())
 
-    def log_video(self, video, tag: str):
+    def log_video(self, video, tag: str) -> None:
         if exists(self.video_logger):
             self.video_logger(
                 tag,
@@ -589,7 +589,7 @@ class BehaviorCloneTrainer(Module):
                 self.fps
             )
 
-    def load(self, path):
+    def load(self, path: str) -> None:
         path = Path(path)
         assert path.exists(), f"checkpoint not found at {path}"
 
@@ -615,7 +615,7 @@ class BehaviorCloneTrainer(Module):
         ema_pkg = torch.load(str(ema_path), map_location = 'cpu', weights_only = True)
         ema_model.load_state_dict(ema_pkg.get('model', ema_pkg), strict = False)
 
-    def save_checkpoint(self):
+    def save_checkpoint(self) -> None:
         import pickle
         from torch_einops_utils.save_load import dehydrate_config
 
@@ -647,7 +647,7 @@ class BehaviorCloneTrainer(Module):
 
     @eval_decorator
     @torch.no_grad()
-    def sample(self, batch_data):
+    def sample(self, batch_data) -> None:
         unwrapped = self.unwrap_model(self.model)
 
         if is_tensor(batch_data):
@@ -730,7 +730,7 @@ class BehaviorCloneTrainer(Module):
 
     def forward(
         self
-    ):
+    ) -> None:
         iter_train_dl = cycle(self.train_dataloader)
 
         if self.is_main_process and self.log_video_flag:
@@ -858,18 +858,18 @@ class DreamTrainer(Module):
         self,
         model: DynamicsWorldModel,
         optim_klass = AdamW,
-        batch_size = 16,
-        generate_timesteps = 16,
-        learning_rate = 3e-4,
-        max_grad_norm = 0.5,
-        num_train_steps = 10_000,
-        weight_decay = 0.,
+        batch_size: int = 16,
+        generate_timesteps: int = 16,
+        learning_rate: float = 3e-4,
+        max_grad_norm: float = 0.5,
+        num_train_steps: int = 10_000,
+        weight_decay: float = 0.,
         accelerate_kwargs: dict = dict(),
         optim_kwargs: dict = dict(),
-        cpu = False,
-        use_tensorboard_logger = False,
+        cpu: bool = False,
+        use_tensorboard_logger: bool = False,
         log_dir: str | None = None,
-        project_name = 'dreamer4'
+        project_name: str = 'dreamer4'
     ):
         super().__init__()
 
@@ -926,15 +926,15 @@ class DreamTrainer(Module):
     def is_main_process(self):
         return self.accelerator.is_main_process
 
-    def print(self, *args, **kwargs):
+    def print(self, *args: list, **kwargs: dict):
         return self.accelerator.print(*args, **kwargs)
 
-    def log(self, **data):
+    def log(self, **data: dict) -> None:
         self.accelerator.log(data, step = self.step.item())
 
     def forward(
         self
-    ):
+    ) -> None:
         pbar = tqdm(range(self.num_train_steps), disable = not self.is_main_process)
 
         for _ in pbar:
@@ -993,18 +993,18 @@ class SimTrainer(Module):
         self,
         model: DynamicsWorldModel,
         optim_klass = AdamW,
-        batch_size = 16,
-        generate_timesteps = 16,
-        learning_rate = 3e-4,
+        batch_size: int = 16,
+        generate_timesteps: int = 16,
+        learning_rate: float = 3e-4,
         max_grad_norm = None,
-        epochs = 2,
-        weight_decay = 0.,
+        epochs: int = 2,
+        weight_decay: float = 0.,
         accelerate_kwargs: dict = dict(),
         optim_kwargs: dict = dict(),
-        cpu = False,
-        use_tensorboard_logger = False,
-        log_dir = None,
-        project_name = 'dreamer4'
+        cpu: bool = False,
+        use_tensorboard_logger: bool = False,
+        log_dir: str = None,
+        project_name: str = 'dreamer4'
     ):
         super().__init__()
 
@@ -1062,16 +1062,16 @@ class SimTrainer(Module):
     def is_main_process(self):
         return self.accelerator.is_main_process
 
-    def log(self, **data):
+    def log(self, **data: dict) -> None:
         self.accelerator.log(data, step = self.step.item())
 
-    def print(self, *args, **kwargs):
+    def print(self, *args: list, **kwargs: dict):
         return self.accelerator.print(*args, **kwargs)
 
     def learn(
         self,
         experience: Experience
-    ):
+    ) -> None:
 
         step_size = experience.step_size
         agent_index = experience.agent_index
@@ -1210,10 +1210,10 @@ class SimTrainer(Module):
     def forward(
         self,
         env,
-        num_episodes = 50000,
-        max_experiences_before_learn = 8,
-        env_is_vectorized = False
-    ):
+        num_episodes: int = 50000,
+        max_experiences_before_learn: int = 8,
+        env_is_vectorized: bool = False
+    ) -> None:
         pbar = tqdm(range(num_episodes), disable = not self.is_main_process)
 
         for _ in pbar:

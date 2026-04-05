@@ -9,7 +9,7 @@ from einops import repeat
 
 # helpers
 
-def exists(v):
+def exists(v) -> bool:
     return v is not None
 
 # mock env
@@ -18,13 +18,13 @@ class MockEnv(Module):
     def __init__(
         self,
         image_shape,
-        reward_range = (-100, 100),
-        num_envs = 1,
-        vectorized = False,
+        reward_range: tuple = (-100, 100),
+        num_envs: int = 1,
+        vectorized: bool = False,
         terminate_after_step = None,
-        rand_terminate_prob = 0.05,
-        can_truncate = False,
-        rand_truncate_prob = 0.05,
+        rand_terminate_prob: float = 0.05,
+        can_truncate: bool = False,
+        rand_truncate_prob: float = 0.05,
     ):
         super().__init__()
         self.image_shape = image_shape
@@ -101,8 +101,8 @@ class MockDictEnv(Module):
         self,
         image_shape,
         dim_proprio,
-        num_envs = 1,
-        vectorized = False,
+        num_envs: int = 1,
+        vectorized: bool = False,
         terminate_after_step = None,
     ):
         super().__init__()
@@ -114,7 +114,7 @@ class MockDictEnv(Module):
 
         self.register_buffer('_step', tensor(0))
 
-    def reset(self):
+    def reset(self) -> dict:
         self._step.zero_()
 
         image_shape = (self.num_envs, 3, *self.image_shape) if self.vectorized else (3, *self.image_shape)
@@ -125,7 +125,7 @@ class MockDictEnv(Module):
             'proprio': randn(proprio_shape)
         }
 
-    def step(self, actions):
+    def step(self, actions) -> tuple:
         self._step.add_(1)
 
         image_shape = (self.num_envs, 3, *self.image_shape) if self.vectorized else (3, *self.image_shape)
