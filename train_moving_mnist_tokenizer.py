@@ -39,7 +39,7 @@ from torch import tensor
 
 # helpers
 
-def exists(v):
+def exists(v) -> bool:
     return v is not None
 
 def default(v, d):
@@ -54,49 +54,49 @@ from dreamer4.trainers import VideoTokenizerTrainer
 # main
 
 def main(
-    num_frames = 5,
-    image_size = 32,
-    digit_size = 14,
-    checkpoint_path = None,
-    num_train_steps = 100_000,
-    num_latents = 32,
-    batch_size = 64,
-    grad_accum_every = 1,
+    num_frames: int = 5,
+    image_size: int = 32,
+    digit_size: int = 14,
+    checkpoint_path: str = None,
+    num_train_steps: int = 100_000,
+    num_latents: int = 32,
+    batch_size: int = 64,
+    grad_accum_every: int = 1,
     min_velocity = -2,
-    max_velocity = 3,
-    lr = 3e-4,
-    dim = 128,
-    dim_latent = 32,
-    patch_size = 4,
-    encoder_depth = 4,
-    decoder_depth = 4,
-    time_block_every = 4,
-    attn_dim_head = 32,
-    attn_heads = 8,
-    use_ema = True,
-    ema_decay = 0.99,
-    log_video_every = 50,
-    log_dir = './logs_mnist_tokenizer',
-    checkpoint_every = 5000,
-    checkpoint_folder = './logs_mnist_tokenizer/checkpoints',
-    time_decorr_loss_weight = 4e-3,
-    space_decorr_loss_weight = 4e-3,
-    use_loss_normalization = False,
-    encoder_add_decorr_aux_loss = True,
-    use_causal_conv3d = True,
-    causal_conv3d_kernel_size = 3,
-    lpips_loss_weight = 0.,
-    decoder_flow_steps = 4,
-    latent_ar_loss_weight = 0.,
-    latent_ar_sigreg_loss_weight = 0.05,
-    latent_ar_placement = 'encoder',
-    latent_ar_sigreg_num_slices = 256,
-    decoder_v_space_loss = True,
-    time_attention_use_pope = False,
-    restrict_latent_grads_to_noise = True,
-    decoder_flow_times_beta_alpha = 1.,
-    decoder_flow_times_beta_beta = 1.
-):
+    max_velocity: int = 3,
+    lr: float = 3e-4,
+    dim: int = 128,
+    dim_latent: int = 32,
+    patch_size: int = 4,
+    encoder_depth: int = 4,
+    decoder_depth: int = 4,
+    time_block_every: int = 4,
+    attn_dim_head: int = 32,
+    attn_heads: int = 8,
+    use_ema: bool = True,
+    ema_decay: float = 0.99,
+    log_video_every: int = 50,
+    log_dir: str = './logs_mnist_tokenizer',
+    checkpoint_every: int = 5000,
+    checkpoint_folder: str = './logs_mnist_tokenizer/checkpoints',
+    time_decorr_loss_weight: float = 4e-3,
+    space_decorr_loss_weight: float = 4e-3,
+    use_loss_normalization: bool = False,
+    encoder_add_decorr_aux_loss: bool = True,
+    use_causal_conv3d: bool = True,
+    causal_conv3d_kernel_size: int = 3,
+    lpips_loss_weight: float = 0.,
+    decoder_flow_steps: int = 4,
+    latent_ar_loss_weight: float = 0.,
+    latent_ar_sigreg_loss_weight: float = 0.05,
+    latent_ar_placement: str = 'encoder',
+    latent_ar_sigreg_num_slices: int = 256,
+    decoder_v_space_loss: bool = True,
+    time_attention_use_pope: bool = False,
+    restrict_latent_grads_to_noise: bool = True,
+    decoder_flow_times_beta_alpha: float = 1.,
+    decoder_flow_times_beta_beta: float = 1.
+) -> None:
     import shutil
 
     # clear old artifacts

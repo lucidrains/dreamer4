@@ -195,7 +195,7 @@ def combine_experiences(
 
 # helpers
 
-def exists(v):
+def exists(v) -> bool:
     return v is not None
 
 def default(v, d):
@@ -208,25 +208,25 @@ def cosine_distance(x, y, mask = None):
 def first(arr):
     return arr[0]
 
-def xnor(x, y):
+def xnor(x, y) -> bool:
     return x == y
 
-def has_at_least_one(*bools):
+def has_at_least_one(*bools) -> bool:
     return sum([*map(int, bools)]) > 0
 
 def ensure_tuple(t):
     return (t,) if not isinstance(t, tuple) else t
 
-def divisible_by(num, den):
+def divisible_by(num: int, den) -> bool:
     return (num % den) == 0
 
-def is_odd(n):
+def is_odd(n: int):
     return not divisible_by(n, 2)
 
-def sample_prob(prob):
+def sample_prob(prob) -> bool:
     return rand(1).item() < prob
 
-def is_power_two(num):
+def is_power_two(num: int):
     return log2(num).is_integer()
 
 # tensor helpers
@@ -238,7 +238,7 @@ def flags_to_sequence(flags, positions, seq_len):
 def straight_through(src, tgt):
     return tgt + src - src.detach()
 
-def frac_gradient(t, frac = 1.):
+def frac_gradient(t, frac: float = 1.):
     t_grad = t * frac
     return straight_through(t_grad, t.detach())
 
@@ -280,10 +280,10 @@ def with_seed(seed):
 
     return decorator
 
-def is_empty(t):
+def is_empty(t) -> bool:
     return t.numel() == 0
 
-def log(t, eps = 1e-20):
+def log(t, eps: float = 1e-20):
     return t.clamp(min = eps).log()
 
 def mean_log_var_to_distr(
@@ -297,12 +297,12 @@ def mean_log_var_to_distr(
 class BetaDist(Module):
     def __init__(
         self,
-        unimodal = True
+        unimodal: bool = True
     ):
         super().__init__()
         self.unimodal = unimodal
 
-    def forward(self, params):
+    def forward(self, params: dict):
         alpha, beta = params.unbind(dim = -1)
 
         offset = 1. if self.unimodal else 0.
@@ -312,7 +312,7 @@ class BetaDist(Module):
 
         return Beta(alpha, beta)
 
-def safe_squeeze_first(t):
+def safe_squeeze_first(t) -> None:
     if not exists(t):
         return None
 
@@ -327,15 +327,15 @@ def gumbel_noise(t):
 
 def gumbel_sample(
     t,
-    temperature = 1.,
+    temperature: float = 1.,
     dim = -1,
-    keepdim = False,
-    eps = 1e-10
+    keepdim: bool = False,
+    eps: float = 1e-10
 ):
     noised = (t / max(temperature, eps)) + gumbel_noise(t)
     return noised.argmax(dim = dim, keepdim = keepdim)
 
-def pack_one(t, pattern):
+def pack_one(t, pattern: str) -> tuple:
     packed, packed_shape = pack([t], pattern)
 
     def inverse(out, inv_pattern = None):
@@ -360,14 +360,14 @@ def pad_tensors_at_dim_to_max_len(
 def l2norm(t):
     return F.normalize(t, dim = -1, p = 2)
 
-def softclamp(t, value = 50.):
+def softclamp(t, value: float = 50.):
     return (t / value).tanh() * value
 
 def create_multi_token_prediction_targets(
     t, # (b t ...)
     steps_future,
 
-): # (b t-1 steps ...), (b t-1 steps) - targets and the mask, where mask is False for padding
+) -> tuple: # (b t-1 steps ...), (b t-1 steps) - targets and the mask, where mask is False for padding
 
     batch, seq_len, device = *t.shape[:2], t.device
 
@@ -390,7 +390,7 @@ def create_multi_token_prediction_targets(
 # helper modules
 
 class Identity(Module):
-    def forward(self, t, *args, **kwargs):
+    def forward(self, t, *args: list, **kwargs: dict):
         return t
 
 # loss related
@@ -401,9 +401,9 @@ class LossNormalizer(Module):
 
     def __init__(
         self,
-        num_losses = 1,
-        beta = 0.95,
-        eps = 1e-6
+        num_losses: int = 1,
+        beta: float = 0.95,
+        eps: float = 1e-6
     ):
         super().__init__()
         self.register_buffer('exp_avg_sq', torch.ones(num_losses))
@@ -442,7 +442,7 @@ class LPIPSLoss(Module):
         self,
         vgg: Module | None = None,
         vgg_weights: VGG16_Weights = VGG16_Weights.DEFAULT,
-        sampled_frames = 1
+        sampled_frames: int = 1
     ):
         super().__init__()
 
@@ -456,7 +456,7 @@ class LPIPSLoss(Module):
     def forward(
         self,
         pred,
-        data,
+        data: dict,
     ):
         batch, device, is_video = pred.shape[0], pred.device, pred.ndim == 5
 
@@ -491,7 +491,7 @@ class LatentAutoregressiveLoss(Module):
         self,
         dim,
         dim_in = None,
-        use_rmsnorm = False,
+        use_rmsnorm: bool = False,
         sigreg_loss_kwargs: dict | None = None,
         net: Module | None = None
     ):
@@ -515,9 +515,9 @@ class LatentAutoregressiveLoss(Module):
     @staticmethod
     def sigreg_loss(
         x,
-        num_slices = 1024,
-        domain = (-5, 5),
-        num_knots = 17,
+        num_slices: int = 1024,
+        domain: tuple = (-5, 5),
+        num_knots: int = 17,
         mask = None
     ):
         # Randall Balestriero - https://arxiv.org/abs/2511.08544
@@ -557,11 +557,11 @@ class LatentAutoregressiveLoss(Module):
         self,
         x,
         target = None,
-        return_loss = True,
+        return_loss: bool = True,
         mask = None,
         cond = None,
-        return_unreduced_loss = False
-    ):
+        return_unreduced_loss: bool = False
+    ) -> tuple:
         is_same_layer = not exists(target) or x is target
         target = default(target, x)
 
@@ -596,7 +596,7 @@ class LatentAutoregressiveLoss(Module):
         sigreg = self.sigreg_loss(sigreg_input, mask = sigreg_mask, **self.sigreg_loss_kwargs)
         return loss, sigreg, pred
 
-def ramp_weight(times, slope = 0.9, intercept = 0.1):
+def ramp_weight(times, slope: float = 0.9, intercept: float = 0.1):
     # equation (8) paper, their "ramp" loss weighting
     return slope * times + intercept
 
@@ -607,9 +607,9 @@ def ramp_weight(times, slope = 0.9, intercept = 0.1):
 class SymExpTwoHot(Module):
     def __init__(
         self,
-        reward_range = (-20., 20.),
-        num_bins = 255,
-        learned_embedding = False,
+        reward_range: tuple = (-20., 20.),
+        num_bins: int = 255,
+        learned_embedding: bool = False,
         dim_embed = None,
     ):
         super().__init__()
@@ -650,14 +650,14 @@ class SymExpTwoHot(Module):
     def bins_to_scalar_value(
         self,
         logits, # (... l)
-        normalize = True
+        normalize: bool = True
     ):
         two_hot_encoding = logits.softmax(dim = -1) if normalize else logits
         return einsum(two_hot_encoding, self.bin_values, '... l, l -> ...')
 
     def forward(
         self,
-        values
+        values: list
     ):
         bin_values = self.bin_values
         min_bin_value, max_bin_value = bin_values[0], bin_values[-1]
@@ -708,12 +708,12 @@ class ActionEmbedder(Module):
         dim,
         *,
         num_discrete_actions: int | tuple[int, ...] = 0,
-        num_continuous_actions  = 0,
+        num_continuous_actions: int  = 0,
         continuous_norm_stats: tuple[tuple[float, float], ...] | None = None,
-        can_unembed = False,
+        can_unembed: bool = False,
         unembed_dim = None,
-        num_unembed_preds = 1,
-        squeeze_unembed_preds = True # will auto-squeeze if prediction is just 1
+        num_unembed_preds: int = 1,
+        squeeze_unembed_preds: bool = True # will auto-squeeze if prediction is just 1
     ):
         super().__init__()
 
@@ -797,7 +797,7 @@ class ActionEmbedder(Module):
         return set([self.discrete_action_unembed, self.continuous_action_unembed])
 
     @property
-    def has_discrete_actions(self):
+    def has_discrete_actions(self) -> bool:
         return self.num_discrete_action_types > 0
 
     @property
@@ -805,7 +805,7 @@ class ActionEmbedder(Module):
         return self.dummy.device
 
     @property
-    def has_actions(self):
+    def has_actions(self) -> bool:
         return self.num_discrete_action_types > 0 or self.num_continuous_action_types > 0
 
     def cast_action_types(
@@ -825,10 +825,10 @@ class ActionEmbedder(Module):
         embeds,                          # (... d)
         discrete_action_types = None,    # (na)
         continuous_action_types = None,  # (na)
-        return_split_discrete = False,
+        return_split_discrete: bool = False,
         pred_head_index: int | Tensor | None = None
 
-    ):  # (... discrete_na), (... continuous_na 2)
+    ) -> tuple:  # (... discrete_na), (... continuous_na 2)
 
         device = embeds.device
 
@@ -900,14 +900,14 @@ class ActionEmbedder(Module):
     def sample(
         self,
         embed,
-        discrete_temperature = 1.,
-        continuous_temperature = 1.,
+        discrete_temperature: float = 1.,
+        continuous_temperature: float = 1.,
         inverse_norm_continuous = None,
         pred_head_index: int | Tensor | None = None,
-        parallel_discrete_calc = True,
-        squeeze = True,
-        **kwargs
-    ):
+        parallel_discrete_calc: bool = True,
+        squeeze: bool = True,
+        **kwargs: dict
+    ) -> tuple:
         inverse_norm_continuous = default(inverse_norm_continuous, self.continuous_need_norm)
 
         discrete_logits, continuous_mean_log_var = self.unembed(embed, return_split_discrete = True, pred_head_index = pred_head_index, **kwargs)
@@ -941,8 +941,8 @@ class ActionEmbedder(Module):
         continuous_action_types = None,  # (na)
         pred_head_index: int | Tensor | None = None,
         parallel_discrete_calc = None,
-        return_entropies = False
-    ):
+        return_entropies: bool = False
+    ) -> tuple:
         discrete_action_logits, continuous_action_mean_log_var = self.unembed(
             embeds,
             pred_head_index = pred_head_index,
@@ -998,7 +998,7 @@ class ActionEmbedder(Module):
         self,
         src: tuple[MaybeTensor, MaybeTensor],
         tgt: tuple[MaybeTensor, MaybeTensor],
-        reduce_across_num_actions = True
+        reduce_across_num_actions: bool = True
     ) -> tuple[MaybeTensor, MaybeTensor]:
 
         src_logits, src_params = src
@@ -1039,7 +1039,7 @@ class ActionEmbedder(Module):
         continuous_actions = None,       # (... na)
         discrete_action_types = None,    # (na)
         continuous_action_types = None,  # (na)
-        return_sum_pooled_embeds = True
+        return_sum_pooled_embeds: bool = True
     ):
 
         discrete_embeds = continuous_embeds = None
@@ -1100,11 +1100,11 @@ class ActionEmbedder(Module):
 @torch.no_grad()
 def calc_gae(
     rewards,
-    values,
+    values: list,
     masks = None,
-    gamma = 0.99,
-    lam = 0.95,
-    use_accelerated = None
+    gamma: float = 0.99,
+    lam: float = 0.95,
+    use_accelerated: bool = None
 ):
     assert values.shape[-1] == rewards.shape[-1]
     use_accelerated = default(use_accelerated, rewards.is_cuda)
@@ -1132,7 +1132,7 @@ class Rotary1D(Module):
     def __init__(
         self,
         dim_head,
-        theta = 10000.
+        theta: float = 10000.
     ):
         super().__init__()
         inv_freq = 1.0 / (theta ** (arange(0, dim_head, 2).float() / dim_head))
@@ -1141,7 +1141,7 @@ class Rotary1D(Module):
     def forward(
         self,
         seq_len,
-        offset = 0
+        offset: int = 0
     ):
         device, dtype = self.inv_freq.device, self.inv_freq.dtype
 
@@ -1191,7 +1191,7 @@ class MultiHeadRMSNorm(Module):
     def __init__(
         self,
         dim_head,
-        heads = 8
+        heads: int = 8
     ):
         super().__init__()
         self.scale = dim_head ** 0.5
@@ -1210,9 +1210,9 @@ class MultiHeadRMSNorm(Module):
 def naive_attend(
     q, k, v,
     softclamp_value = None,
-    scale = None,
-    causal = False,
-    causal_block_size = 1,
+    scale: float = None,
+    causal: bool = False,
+    causal_block_size: int = 1,
     mask = None
 ):
 
@@ -1275,7 +1275,7 @@ def naive_attend(
 
 # flex attention related and factory function for attend depending on whether on cuda + flex attention available
 
-def block_mask_causal(block_size):
+def block_mask_causal(block_size: int):
 
     def inner(b, h, q, k):
         bq = q // block_size
@@ -1284,7 +1284,7 @@ def block_mask_causal(block_size):
 
     return inner
 
-def special_token_mask(q, k, seq_len, num_tokens, special_attend_only_itself = False):
+def special_token_mask(q, k, seq_len, num_tokens, special_attend_only_itself: bool = False):
     bq = q % seq_len
     bk = k % seq_len
 
@@ -1303,7 +1303,7 @@ def special_token_mask(q, k, seq_len, num_tokens, special_attend_only_itself = F
 def block_mask_special_tokens_right(
     seq_len,
     num_tokens,
-    special_attend_only_itself = False
+    special_attend_only_itself: bool = False
 ):
     def inner(b, h, q, k):
         return special_token_mask(q, k, seq_len, num_tokens, special_attend_only_itself)
@@ -1324,7 +1324,7 @@ def eval_decorator(fn):
         return out
     return inner
 
-def block_mask_noop(b, h, q, k):
+def block_mask_noop(b, h, q, k) -> bool:
     return b >= 0
 
 def score_mod_softclamp(value):
@@ -1342,15 +1342,15 @@ def score_mod_softclamp(value):
 # factory for attend function
 
 def get_attend_fn(
-    use_flex,
+    use_flex: bool,
     seq_len,
     k_seq_len,
-    causal = False,
-    causal_block_size = 1,
-    softclamp_value = 50.,
-    num_special_tokens = 0,             # special tokens are latents / agents
+    causal: bool = False,
+    causal_block_size: int = 1,
+    softclamp_value: float = 50.,
+    num_special_tokens: int = 0,             # special tokens are latents / agents
     block_size_per_special = None,      # defaults to k_seq_len
-    special_attend_only_itself = False, # by default, modality only attends to itself while special sees everything, but if turned True, will be the inverse - special can only attend to itself but modality can attend everything
+    special_attend_only_itself: bool = False, # by default, modality only attends to itself while special sees everything, but if turned True, will be the inverse - special can only attend to itself but modality can attend everything
     device = None
 ):
     block_size_per_special = default(block_size_per_special, k_seq_len)
@@ -1388,16 +1388,16 @@ class Attention(Module):
     def __init__(
         self,
         dim,
-        dim_head = 64,
+        dim_head: int = 64,
         query_heads = None,
-        heads = 8,
-        pre_rmsnorm = True,
-        pre_context_rmsnorm = False,
-        gate_values = True,
-        rmsnorm_query = False, # a paper claims that it is better to just norm only the keys https://openreview.net/forum?id=HkztQWZfl2
-        rmsnorm_key = True,
-        value_residual = True,
-        belief_attn = True
+        heads: int = 8,
+        pre_rmsnorm: bool = True,
+        pre_context_rmsnorm: bool = False,
+        gate_values: bool = True,
+        rmsnorm_query: bool = False, # a paper claims that it is better to just norm only the keys https://openreview.net/forum?id=HkztQWZfl2
+        rmsnorm_key: bool = True,
+        value_residual: bool = True,
+        belief_attn: bool = True
     ):
         super().__init__()
         self.norm = RMSNorm(dim) if pre_rmsnorm else Identity()
@@ -1454,7 +1454,7 @@ class Attention(Module):
             groups = query_heads // heads
             self.head_repeat = Reduce('b h n d -> b (h g) n d', 'repeat', g = groups)
 
-    def muon_parameters(self):
+    def muon_parameters(self) -> list:
         # omit the queries and keys for now given what we learned from kimi 2 paper
 
         return [
@@ -1467,12 +1467,12 @@ class Attention(Module):
         tokens, # (b n d)
         context = None,
         kv_cache = None,
-        return_intermediates = False,
+        return_intermediates: bool = False,
         rotary_pos_emb = None,
         pope_pos_emb = None,
         residual_values = None,  # (b n h d)
         attend_fn: Callable | None = None
-    ):
+    ) -> tuple:
         tokens, inverse_packed_batch = pack_one(tokens, '* n d')
 
         tokens = self.norm(tokens)
@@ -1575,8 +1575,8 @@ class SwiGLUFeedforward(Module):
     def __init__(
         self,
         dim,
-        expansion_factor = 4,
-        pre_rmsnorm = True
+        expansion_factor: int = 4,
+        pre_rmsnorm: bool = True
     ):
         super().__init__()
         self.norm = RMSNorm(dim) if pre_rmsnorm else Identity()
@@ -1586,7 +1586,7 @@ class SwiGLUFeedforward(Module):
         self.proj_in = Linear(dim, dim_inner * 2)
         self.proj_out = Linear(dim_inner, dim)
 
-    def muon_parameters(self):
+    def muon_parameters(self) -> list:
         return [
             self.proj_in.weight,
             self.proj_out.weight,
@@ -1616,7 +1616,7 @@ class GRULayer(Module):
         self,
         x,
         prev_hiddens = None
-    ):
+    ) -> tuple:
         x = self.norm(x)
 
         x, hiddens = self.gru(x, prev_hiddens)
@@ -1630,8 +1630,8 @@ class AttentionResidual(Module):
     def __init__(
         self,
         dim,
-        heads = 4,
-        dim_head = 64
+        heads: int = 4,
+        dim_head: int = 64
     ):
         super().__init__()
         self.attn = Attention(
@@ -1647,7 +1647,7 @@ class AttentionResidual(Module):
         self,
         x,
         hiddens: list[Tensor] | None = None,
-        **kwargs
+        **kwargs: dict
     ):
         assert exists(hiddens), 'hiddens must be passed to AttentionResidual'
 
@@ -1663,20 +1663,20 @@ class AxialSpaceTimeTransformer(Module):
     def __init__(
         self,
         dim,
-        depth,
-        attn_heads = 8,
-        attn_dim_head = 64,
-        attn_softclamp_value = 50.,
-        time_block_every = 4,
+        depth: int,
+        attn_heads: int = 8,
+        attn_dim_head: int = 64,
+        attn_softclamp_value: float = 50.,
+        time_block_every: int = 4,
         attn_kwargs: dict = dict(),
         ff_kwargs: dict = dict(),
         attn_residual_kwargs: dict = dict(),
-        num_special_spatial_tokens = 1,
-        special_attend_only_itself = False,  # this is set to True for the video tokenizer decoder (latents can only attend to itself while spatial modalities attend to the latents and everything)
-        final_norm = True,
-        value_residual = True,               # https://arxiv.org/abs/2410.17897 - but with learned mixing from OSS
-        rnn_time = True,
-        time_attention_use_pope = False
+        num_special_spatial_tokens: int = 1,
+        special_attend_only_itself: bool = False,  # this is set to True for the video tokenizer decoder (latents can only attend to itself while spatial modalities attend to the latents and everything)
+        final_norm: bool = True,
+        value_residual: bool = True,               # https://arxiv.org/abs/2410.17897 - but with learned mixing from OSS
+        rnn_time: bool = True,
+        time_attention_use_pope: bool = False
     ):
         super().__init__()
         assert depth >= time_block_every, f'depth must be at least {time_block_every}'
@@ -1781,8 +1781,8 @@ class AxialSpaceTimeTransformer(Module):
         self,
         tokens, # (b t s d)
         cache: TransformerIntermediates | None = None,
-        return_intermediates = False
-    ): # (b t s d) | (y 2 b h t d)
+        return_intermediates: bool = False
+    ) -> tuple: # (b t s d) | (y 2 b h t d)
 
         batch, time, space_seq_len, _, device = *tokens.shape, tokens.device
 
@@ -1954,7 +1954,7 @@ class CausalDepthwiseConv3d(Module):
     def __init__(
         self,
         dim,
-        kernel_size = 3
+        kernel_size: int = 3
     ):
         super().__init__()
         assert is_odd(kernel_size), 'kernel size must be odd'
@@ -2003,41 +2003,41 @@ class VideoTokenizer(Module):
         self,
         dim,
         dim_latent,
-        patch_size,
+        patch_size: int,
         image_height = None,
         image_width = None,
-        num_latent_tokens = 64,
-        encoder_depth = 4,
-        decoder_depth = 4,
-        time_block_every = 4,
+        num_latent_tokens: int = 64,
+        encoder_depth: int = 4,
+        decoder_depth: int = 4,
+        time_block_every: int = 4,
         attn_kwargs: dict = dict(),
-        attn_dim_head = 64,
-        attn_heads = 8,
-        attn_softclamp_value = 50.,
+        attn_dim_head: int = 64,
+        attn_heads: int = 8,
+        attn_softclamp_value: float = 50.,
         ff_kwargs: dict = dict(),
-        decoder_pos_mlp_depth = 2,
-        channels = 3,
-        per_image_patch_mask_prob = (0., 0.9), # probability of patch masking appears to be per image probabilities drawn uniformly between 0. and 0.9 - if you are a phd student and think i'm mistakened, please open an issue
+        decoder_pos_mlp_depth: int = 2,
+        channels: int = 3,
+        per_image_patch_mask_prob: tuple = (0., 0.9), # probability of patch masking appears to be per image probabilities drawn uniformly between 0. and 0.9 - if you are a phd student and think i'm mistakened, please open an issue
         lpips_loss_network: Module | None = None,
-        lpips_loss_weight = 0.2,
-        encoder_add_decorr_aux_loss = False,
-        time_decorr_loss_weight = 4e-3,
-        space_decorr_loss_weight = 4e-3,
-        decorr_sample_frac = 0.25,
-        use_loss_normalization = False,
-        use_causal_conv3d = False,
-        causal_conv3d_kernel_size = 3,
-        decoder_flow_steps = 1,
-        decoder_v_space_loss = True,
+        lpips_loss_weight: float = 0.2,
+        encoder_add_decorr_aux_loss: bool = False,
+        time_decorr_loss_weight: float = 4e-3,
+        space_decorr_loss_weight: float = 4e-3,
+        decorr_sample_frac: float = 0.25,
+        use_loss_normalization: bool = False,
+        use_causal_conv3d: bool = False,
+        causal_conv3d_kernel_size: int = 3,
+        decoder_flow_steps: int = 1,
+        decoder_v_space_loss: bool = True,
         latent_receive_grad_frac: Callable | None = None,
-        latent_grad_only_at_noise = False,
-        latent_ar_loss_weight = 0.,
-        latent_ar_sigreg_loss_weight = 0.05,
-        latent_ar_placement = 'encoder',
+        latent_grad_only_at_noise: bool = False,
+        latent_ar_loss_weight: float = 0.,
+        latent_ar_sigreg_loss_weight: float = 0.05,
+        latent_ar_placement: str = 'encoder',
         latent_ar_sigreg_loss_kwargs = dict(num_slices = 256),
-        time_attention_use_pope = False,
-        decoder_flow_times_beta_alpha = 1.,
-        decoder_flow_times_beta_beta = 1.
+        time_attention_use_pope: bool = False,
+        decoder_flow_times_beta_alpha: float = 1.,
+        decoder_flow_times_beta_beta: float = 1.
     ):
         super().__init__()
 
@@ -2215,7 +2215,7 @@ class VideoTokenizer(Module):
     def device(self):
         return self.zero.device
 
-    def muon_parameters(self):
+    def muon_parameters(self) -> list:
         return [
             *self.encoder_transformer.muon_parameters(),
             *self.decoder_transformer.muon_parameters()
@@ -2234,8 +2234,8 @@ class VideoTokenizer(Module):
         latents, # (b t n d)
         noised_video = None,
         time_indices = None,
-        height = None,
-        width = None,
+        height: int = None,
+        width: int = None,
     ): # (b c t h w)
 
         height = default(height, self.image_height)
@@ -2307,8 +2307,8 @@ class VideoTokenizer(Module):
     def decode(
         self,
         latents, # (b t n d)
-        height = None,
-        width = None,
+        height: int = None,
+        width: int = None,
     ): # (b c t h w)
 
         height = default(height, self.image_height)
@@ -2345,11 +2345,11 @@ class VideoTokenizer(Module):
     def forward(
         self,
         video_or_image, # (b c t h w) | (b c h w)
-        return_latents = False,
+        return_latents: bool = False,
         mask_patches = None,
-        return_intermediates = False,
+        return_intermediates: bool = False,
         update_loss_ema = None
-    ):
+    ) -> tuple:
 
         # handle image pretraining
 
@@ -2592,71 +2592,71 @@ class DynamicsWorldModel(Module):
         dim,
         dim_latent,
         video_tokenizer: VideoTokenizer | None = None,
-        max_steps = 64,                # K_max in paper
-        num_register_tokens = 8,       # they claim register tokens led to better temporal consistency
-        num_spatial_tokens = 2,        # latents projected to greater number of spatial tokens
+        max_steps: int = 64,                # K_max in paper
+        num_register_tokens: int = 8,       # they claim register tokens led to better temporal consistency
+        num_spatial_tokens: int = 2,        # latents projected to greater number of spatial tokens
         num_latent_tokens = None,
-        num_agents = 1,
-        num_tasks = 0,
-        num_video_views = 1,
+        num_agents: int = 1,
+        num_tasks: int = 0,
+        num_video_views: int = 1,
         dim_proprio = None,
         reward_encoder_kwargs: dict = dict(),
-        depth = 4,
-        pred_orig_latent = True,   # directly predicting the original x0 data yield better results, rather than velocity (x-space vs v-space)
-        time_block_every = 4,      # every 4th block is time
+        depth: int = 4,
+        pred_orig_latent: bool = True,   # directly predicting the original x0 data yield better results, rather than velocity (x-space vs v-space)
+        time_block_every: int = 4,      # every 4th block is time
         attn_kwargs: dict = dict(),
         transformer_kwargs: dict = dict(),
-        attn_heads = 8,
-        attn_dim_head = 64,
-        attn_softclamp_value = 50.,
+        attn_heads: int = 8,
+        attn_dim_head: int = 64,
+        attn_softclamp_value: float = 50.,
         ff_kwargs: dict = dict(),
-        use_time_rnn = True,
+        use_time_rnn: bool = True,
         loss_weight_fn: Callable = ramp_weight,
         prob_shortcut_train = None,                  # probability of shortcut training, defaults to 1 - 1 / num_step_sizes
-        add_reward_embed_to_agent_token = False,
-        add_reward_embed_dropout = 0.1,
-        add_state_pred_head = False,
-        state_pred_loss_weight = 0.1,
-        state_entropy_bonus_weight = 0.05,
-        agent_predicts_state = False,
-        agent_state_pred_loss_weight = 0.1,
-        eps_latent_pred = 1e-6,
+        add_reward_embed_to_agent_token: bool = False,
+        add_reward_embed_dropout: float = 0.1,
+        add_state_pred_head: bool = False,
+        state_pred_loss_weight: float = 0.1,
+        state_entropy_bonus_weight: float = 0.05,
+        agent_predicts_state: bool = False,
+        agent_state_pred_loss_weight: float = 0.1,
+        eps_latent_pred: float = 1e-6,
         num_discrete_actions: int | tuple[int, ...] = 0,
-        num_continuous_actions = 0,
+        num_continuous_actions: int = 0,
         continuous_norm_stats = None,
-        multi_token_pred_len = 8,                   # they do multi-token prediction of 8 steps forward
-        value_head_mlp_depth = 3,
-        policy_head_mlp_depth = 3,
-        latent_flow_loss_weight = 1.,
-        shortcut_loss_weight = 1.,
+        multi_token_pred_len: int = 8,                   # they do multi-token prediction of 8 steps forward
+        value_head_mlp_depth: int = 3,
+        policy_head_mlp_depth: int = 3,
+        latent_flow_loss_weight: float = 1.,
+        shortcut_loss_weight: float = 1.,
         reward_loss_weight: float | list[float] = 1.,
         predict_terminals: bool = True,
         terminal_loss_weight: float | list[float] = 1.,
         discrete_action_loss_weight: float | list[float] = 1.,
         continuous_action_loss_weight: float | list[float] = 1.,
-        num_latent_genes = 0,                       # for carrying out evolution within the dreams https://web3.arxiv.org/abs/2503.19037
-        keep_reward_ema_stats = False,
-        reward_ema_decay = 0.998,
-        reward_quantile_filter = (0.05, 0.95),
-        gae_discount_factor = 0.997,
-        gae_lambda = 0.95,
-        ppo_eps_clip = 0.2,
-        pmpo_pos_to_neg_weight = 0.5, # pos and neg equal weight
-        pmpo_reverse_kl = True,
-        pmpo_kl_div_loss_weight = .3,
-        use_delight_gating = True,
-        delight_temperature = 1.,
+        num_latent_genes: int = 0,                       # for carrying out evolution within the dreams https://web3.arxiv.org/abs/2503.19037
+        keep_reward_ema_stats: bool = False,
+        reward_ema_decay: float = 0.998,
+        reward_quantile_filter: tuple = (0.05, 0.95),
+        gae_discount_factor: float = 0.997,
+        gae_lambda: float = 0.95,
+        ppo_eps_clip: float = 0.2,
+        pmpo_pos_to_neg_weight: float = 0.5, # pos and neg equal weight
+        pmpo_reverse_kl: bool = True,
+        pmpo_kl_div_loss_weight: float = .3,
+        use_delight_gating: bool = True,
+        delight_temperature: float = 1.,
         normalize_advantages = None,
-        value_clip = 0.4,
-        policy_entropy_weight = .01,
-        gae_use_accelerated = False,
-        use_loss_normalization = False,
-        time_attention_use_pope = False,
+        value_clip: float = 0.4,
+        policy_entropy_weight: float = .01,
+        gae_use_accelerated: bool = False,
+        use_loss_normalization: bool = False,
+        time_attention_use_pope: bool = False,
         latent_ar_layer: int | tuple[int, int] | None = None,
-        latent_ar = False,
-        latent_ar_action_conditioned = False,
-        latent_ar_loss_weight = 0.,
-        latent_ar_sigreg_loss_weight = 0.05,
+        latent_ar: bool = False,
+        latent_ar_action_conditioned: bool = False,
+        latent_ar_loss_weight: float = 0.,
+        latent_ar_sigreg_loss_weight: float = 0.05,
         latent_ar_sigreg_loss_kwargs: dict = dict(num_slices = 256)
     ):
         super().__init__()
@@ -3001,7 +3001,7 @@ class DynamicsWorldModel(Module):
     def muon_parameters(self):
         return self.transformer.muon_parameters()
 
-    def policy_head_parameters(self):
+    def policy_head_parameters(self) -> list:
         return [
             *self.policy_head.parameters(),
             *self.action_embedder.unembed_parameters() # includes the unembed from the action-embedder
@@ -3039,9 +3039,9 @@ class DynamicsWorldModel(Module):
     def evolve_(
         self,
         fitness,
-        select_frac = 0.5,
-        tournament_frac = 0.5
-    ):
+        select_frac: float = 0.5,
+        tournament_frac: float = 0.5
+    ) -> None:
         assert fitness.numel() == self.num_latent_genes
 
         pop = self.latent_genes
@@ -3087,13 +3087,13 @@ class DynamicsWorldModel(Module):
         self,
         env,
         seed = None,
-        agent_index = 0,
-        num_steps = 4,
-        max_timesteps = 16,
-        env_is_vectorized = False,
-        use_time_cache = True,
-        store_agent_embed = True,
-        store_old_action_unembeds = True,
+        agent_index: int = 0,
+        num_steps: int = 4,
+        max_timesteps: int = 16,
+        env_is_vectorized: bool = False,
+        use_time_cache: bool = True,
+        store_agent_embed: bool = True,
+        store_old_action_unembeds: bool = True,
     ):
         assert exists(self.video_tokenizer)
 
@@ -3333,13 +3333,13 @@ class DynamicsWorldModel(Module):
         experience: Experience,
         policy_optim: Optimizer | None = None,
         value_optim: Optimizer | None = None,
-        only_learn_policy_value_heads = True, # in the paper, they do not finetune the entire dynamics model, they just learn the heads
-        use_pmpo = True,
-        use_delight_gating = None,
+        only_learn_policy_value_heads: bool = True, # in the paper, they do not finetune the entire dynamics model, they just learn the heads
+        use_pmpo: bool = True,
+        use_delight_gating: bool = None,
         delight_temperature = None,
         normalize_advantages = None,
-        eps = 1e-6
-    ):
+        eps: float = 1e-6
+    ) -> tuple:
         use_delight_gating = default(use_delight_gating, self.use_delight_gating)
         delight_temperature = default(delight_temperature, self.delight_temperature)
 
@@ -3645,34 +3645,34 @@ class DynamicsWorldModel(Module):
     def generate(
         self,
         time_steps,
-        num_steps = 4,
-        batch_size = 1,
-        agent_index = 0,
+        num_steps: int = 4,
+        batch_size: int = 1,
+        agent_index: int = 0,
         tasks: int | Tensor | None = None,
         latent_gene_ids = None,
         image_height = None,
         image_width = None,
         return_decoded_video = None,
-        context_signal_noise = 0.1,       # they do a noising of the past, this was from an old diffusion world modeling paper from EPFL iirc
+        context_signal_noise: float = 0.1,       # they do a noising of the past, this was from an old diffusion world modeling paper from EPFL iirc
         time_cache: Tensor | None = None,
-        use_time_cache = True,
-        return_rewards_per_frame = False,
-        return_terminals = False,
-        return_agent_actions = False,
-        return_log_probs_and_values = False,
-        return_for_policy_optimization = False,
-        return_time_cache = False,
-        store_agent_embed = True,
-        store_old_action_unembeds = True,
+        use_time_cache: bool = True,
+        return_rewards_per_frame: bool = False,
+        return_terminals: bool = False,
+        return_agent_actions: bool = False,
+        return_log_probs_and_values: bool = False,
+        return_for_policy_optimization: bool = False,
+        return_time_cache: bool = False,
+        store_agent_embed: bool = True,
+        store_old_action_unembeds: bool = True,
         prompt: Tensor | None = None, # (b c t h w) or (b c h w)
         prompt_latents: Tensor | None = None, # (b t v n d)
         prompt_proprio: Tensor | None = None,
         prompt_discrete_actions: Tensor | None = None,
         prompt_continuous_actions: Tensor | None = None,
         prompt_rewards: Tensor | None = None,
-        discrete_temperature = 1.,
-        continuous_temperature = 1.,
-    ): # (b t n d) | (b c t h w)
+        discrete_temperature: float = 1.,
+        continuous_temperature: float = 1.,
+    ) -> tuple: # (b t n d) | (b c t h w)
 
         # handy flag for returning generations for rl
 
@@ -4104,22 +4104,22 @@ class DynamicsWorldModel(Module):
         terminals = None,                # (b)
         discrete_actions = None,         # (b t na) | (b t-1 na)
         continuous_actions = None,       # (b t na) | (b t-1 na)
-        shift_action_tokens = True,      # set to False if actions already properly paired, which is different than the usual replay buffer pairing
+        shift_action_tokens: bool = True,      # set to False if actions already properly paired, which is different than the usual replay buffer pairing
         discrete_action_types = None,    # (na)
         continuous_action_types = None,  # (na)
         proprio = None,                  # (b t dp)
         time_cache = None,
-        return_pred_only = False,
-        latent_is_noised = False,
-        return_all_losses = False,
-        return_intermediates = False,
-        add_autoregressive_action_loss = True,
+        return_pred_only: bool = False,
+        latent_is_noised: bool = False,
+        return_all_losses: bool = False,
+        return_intermediates: bool = False,
+        add_autoregressive_action_loss: bool = True,
         update_loss_ema = None,
-        latent_has_view_dim = False,
+        latent_has_view_dim: bool = False,
         seed = None,
         agent_token_cond = None,         # (b t d) optional conditioning to be summed to agent tokens
         time_modifier_fn: Callable | None = None
-    ):
+    ) -> tuple:
         # handle video or latents
 
         assert exists(video) ^ exists(latents)

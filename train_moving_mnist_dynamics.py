@@ -30,7 +30,7 @@ from dataset_moving_mnist import MovingMNISTDataset
 from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel, exists
 from dreamer4.trainers import BehaviorCloneTrainer, save_video_grid_as_gif
 
-def exists(v):
+def exists(v) -> bool:
     return v is not None
 
 # dataset action collation
@@ -47,7 +47,7 @@ def random_action_collate(batch):
 
 # custom 3x3 grid sample generation
 
-def custom_3x3_grid_sample(trainer, batch_data):
+def custom_3x3_grid_sample(trainer, batch_data) -> None:
     device = trainer.device
     dataset = trainer.dataset
 
@@ -99,37 +99,37 @@ def custom_3x3_grid_sample(trainer, batch_data):
 def main(
     tokenizer_checkpoint_path: str = './logs_mnist_tokenizer/checkpoints',
     checkpoint_path: str = None,
-    num_frames = 5,
-    image_size = 32,
-    digit_size = 14,
-    num_train_steps = 100_000,
-    batch_size = 64,
-    grad_accum_every = 1,
-    lr = 3e-4,
-    dim = 512,
-    depth = 6,
-    attn_dim_head = 64,
-    attn_heads = 8,
-    use_ema = True,
-    video_fps = 4,
-    log_video_every = 100,
-    log_dir = './logs_mnist_dynamics',
-    checkpoint_every = 5000,
-    checkpoint_folder = './logs_mnist_dynamics/checkpoints',
-    use_loss_normalization = False,
-    multi_token_pred_len = 1,
-    shortcut_loss_weight = 5e-2,
+    num_frames: int = 5,
+    image_size: int = 32,
+    digit_size: int = 14,
+    num_train_steps: int = 100_000,
+    batch_size: int = 64,
+    grad_accum_every: int = 1,
+    lr: float = 3e-4,
+    dim: int = 512,
+    depth: int = 6,
+    attn_dim_head: int = 64,
+    attn_heads: int = 8,
+    use_ema: bool = True,
+    video_fps: int = 4,
+    log_video_every: int = 100,
+    log_dir: str = './logs_mnist_dynamics',
+    checkpoint_every: int = 5000,
+    checkpoint_folder: str = './logs_mnist_dynamics/checkpoints',
+    use_loss_normalization: bool = False,
+    multi_token_pred_len: int = 1,
+    shortcut_loss_weight: float = 5e-2,
     sample_prompt_frames = None,
-    sample_autoregressive_actions = False,
-    condition_on_actions = False,
-    num_action_bins = 5,
-    latent_ar = False,
-    latent_ar_action_conditioned = False,
-    latent_ar_layer = 0,
-    latent_ar_loss_weight = 0.,
-    latent_ar_sigreg_loss_weight = 0.05,
-    latent_ar_sigreg_num_slices = 256
-):
+    sample_autoregressive_actions: bool = False,
+    condition_on_actions: bool = False,
+    num_action_bins: int = 5,
+    latent_ar: bool = False,
+    latent_ar_action_conditioned: bool = False,
+    latent_ar_layer: int = 0,
+    latent_ar_loss_weight: float = 0.,
+    latent_ar_sigreg_loss_weight: float = 0.05,
+    latent_ar_sigreg_num_slices: int = 256
+) -> None:
     import shutil
 
     if sample_prompt_frames is None:

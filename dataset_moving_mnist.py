@@ -8,16 +8,16 @@ from numpy.random import randint
 class MovingMNISTDataset(Dataset):
     def __init__(
         self,
-        root = './data',
-        num_frames = 10,
-        image_size = 64,
-        digit_size = 28,
+        root: str = './data',
+        num_frames: int = 10,
+        image_size: int = 64,
+        digit_size: int = 28,
         min_velocity = -2,
-        max_velocity = 3,
-        condition_on_actions = False,
-        action_type = 'both', # 'continuous', 'discrete', 'random', or 'both'
-        num_action_bins = 5,
-        download = True
+        max_velocity: int = 3,
+        condition_on_actions: bool = False,
+        action_type: str = 'both', # 'continuous', 'discrete', 'random', or 'both'
+        num_action_bins: int = 5,
+        download: bool = True
     ):
         super().__init__()
         from torchvision.datasets import MNIST
@@ -34,7 +34,7 @@ class MovingMNISTDataset(Dataset):
     def __len__(self):
         return len(self.mnist)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int):
         digit, _ = self.mnist[idx]
         digit = T.functional.to_tensor(digit)
 
