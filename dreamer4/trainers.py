@@ -7,7 +7,7 @@ import torch
 from torch import is_tensor, tensor
 from torch.nn import Module
 from torch.optim import AdamW
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, TensorDataset
 
 import torchvision.transforms as T
 
