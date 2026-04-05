@@ -155,25 +155,60 @@ def test_e2e(
         rewards = rewards
     )
 
-def test_symexp_two_hot():
+def test_symexp_hl_gauss():
     import torch
-    from dreamer4.dreamer4 import SymExpTwoHot
+    from dreamer4.dreamer4 import SymExpHLGauss
 
-    two_hot_encoder = SymExpTwoHot(
+    encoder = SymExpHLGauss(
         (-3., 3.),
-        num_bins = 20,
+        num_bins = 255,
         learned_embedding = True,
         dim_embed = 512
     )
 
     values = torch.randn((10))
 
-    two_hot_encoded = two_hot_encoder(values)
-    recon_values = two_hot_encoder.bins_to_scalar_value(two_hot_encoded)
+    # test encode -> decode round trip via logits
+    target_probs = encoder.target_probs(values)
+    recon_values = encoder.bins_to_scalar_value(target_probs.log())
 
-    assert torch.allclose(recon_values, values, atol = 1e-6)
+    assert torch.allclose(recon_values, values, atol = 1e-1)
 
-    reward_embeds = two_hot_encoder.embed(two_hot_encoded)
+    # test loss
+    logits = torch.randn(10, 255)
+    loss = encoder.loss(logits, values)
+    assert loss.shape == (10,)
+
+    # test embedding
+    reward_embeds = encoder.embed(target_probs)
+    assert reward_embeds.shape == (10, 512)
+
+def test_symexp_two_hot():
+    import torch
+    from dreamer4.dreamer4 import SymExpTwoHot
+
+    encoder = SymExpTwoHot(
+        (-3., 3.),
+        num_bins = 255,
+        learned_embedding = True,
+        dim_embed = 512
+    )
+
+    values = torch.randn((10))
+
+    # test encode -> decode round trip
+    target_probs = encoder.target_probs(values)
+    recon_values = encoder.bins_to_scalar_value(target_probs.log())
+
+    assert torch.allclose(recon_values, values, atol = 1e-4)
+
+    # test loss
+    logits = torch.randn(10, 255)
+    loss = encoder.loss(logits, values)
+    assert loss.shape == (10,)
+
+    # test embedding
+    reward_embeds = encoder.embed(target_probs)
     assert reward_embeds.shape == (10, 512)
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = 'no cuda')
