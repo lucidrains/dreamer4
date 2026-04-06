@@ -40,6 +40,7 @@ class GymPixelEnv(Module):
         self.seed = seed
 
         self.envs = [gym.make(env_id, render_mode = 'rgb_array', **env_kwargs) for _ in range(num_envs)]
+        self._needs_reset = [False] * num_envs
 
         action_space = self.envs[0].action_space
 
@@ -71,6 +72,7 @@ class GymPixelEnv(Module):
         return frames.to(self.device)
 
     def reset(self, seed = None):
+        self._needs_reset = [False] * self.num_envs
         frames = []
         for i, env in enumerate(self.envs):
             env.reset(seed = (seed or self.seed or 0) + i if exists(seed) or exists(self.seed) else None)
@@ -93,6 +95,10 @@ class GymPixelEnv(Module):
         truncateds = []
 
         for i, env in enumerate(self.envs):
+            if self._needs_reset[i]:
+                env.reset()
+                self._needs_reset[i] = False
+
             if self.is_discrete:
                 if self.vectorized:
                     action = discrete[i].squeeze().cpu().item()
@@ -112,13 +118,15 @@ class GymPixelEnv(Module):
                 _, reward, terminated, truncated, _ = env.step(action)
                 total_reward += reward
                 if terminated or truncated:
-                    env.reset()
                     break
 
             obs_list.append(self._render_one(env))
             rewards.append(total_reward)
             terminateds.append(terminated)
             truncateds.append(truncated)
+
+            if terminated or truncated:
+                self._needs_reset[i] = True
 
         obs = self._resize(torch.cat(obs_list, dim = 0))
         reward_t = tensor(rewards, dtype = torch.float32, device = self.device)
