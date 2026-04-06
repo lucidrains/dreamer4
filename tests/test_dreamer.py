@@ -1058,6 +1058,74 @@ def test_prompting_generation(
         if with_continuous_actions:
             assert continuous_actions.shape == (2, 8, 2)
 
+def test_prompted_policy_generation_drops_prompt_prefix():
+    from einops import rearrange
+    from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
+
+    tokenizer = VideoTokenizer(
+        128,
+        dim_latent = 16,
+        patch_size = 16,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        time_block_every = 1,
+        attn_heads = 2,
+        image_height = 32,
+        image_width = 32,
+    )
+
+    dynamics = DynamicsWorldModel(
+        128,
+        num_agents = 1,
+        video_tokenizer = tokenizer,
+        dim_latent = 16,
+        num_discrete_actions = 4,
+        depth = 1,
+        time_block_every = 1,
+        predict_terminals = False,
+    )
+
+    prompt_video = torch.randn(2, 3, 1, 32, 32)
+    prompt_latents = tokenizer.tokenize(prompt_video)
+
+    generations = dynamics.generate(
+        time_steps = 6,
+        batch_size = 2,
+        prompt_latents = rearrange(prompt_latents, 'b t n d -> b t 1 n d'),
+        prompt_rewards = torch.zeros(2, 1),
+        prompt_discrete_actions = torch.randint(0, 4, (2, 1, 1)),
+        return_for_policy_optimization = True,
+        return_decoded_video = False,
+        drop_prompt_from_experience = True,
+    )
+
+    assert generations.latents.shape[1] == 5
+    assert generations.rewards.shape == (2, 5)
+    assert generations.values.shape == (2, 5)
+    assert generations.lens.shape == (2,)
+    assert torch.equal(generations.lens, torch.full((2,), 5, device = generations.lens.device))
+
+def test_calc_gae_excludes_bootstrap_delta_for_truncated_tail():
+    from dreamer4.dreamer4 import calc_gae
+
+    rewards = torch.tensor([[1., 2., 99.]])
+    values = torch.tensor([[10., 20., 30.]])
+    continuation_masks = torch.tensor([[1., 1., 0.]])
+    learn_masks = torch.tensor([[True, True, False]])
+
+    returns = calc_gae(
+        rewards,
+        values,
+        continuation_masks = continuation_masks,
+        learn_masks = learn_masks,
+        gamma = 1.,
+        lam = 1.,
+        use_accelerated = False,
+    )
+
+    assert torch.allclose(returns[:, :2], torch.tensor([[33., 32.]]))
+    assert torch.allclose(returns[:, 2:], torch.tensor([[30.]]))
+
 @param('steps', (1, 2, 4))
 def test_rac_like_tokenizer(steps):
     from dreamer4.dreamer4 import VideoTokenizer
