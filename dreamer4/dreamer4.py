@@ -4677,7 +4677,14 @@ class DynamicsWorldModel(Module):
             else:
                 terminals_seq = terminals[:, 1:]
 
-            state_terminal_losses = F.binary_cross_entropy_with_logits(state_terminal_pred, terminals_seq.float(), reduction = 'none')
+            terminals_seq = terminals_seq.float()
+
+            # label smoothing trick from dreamerv3 - clamp targets to [1/H, 1 - 1/H] where H = 1 / (1 - γ)
+
+            eps = 1. - self.gae_discount_factor
+            terminals_seq = terminals_seq.clamp(min = eps, max = 1. - eps)
+
+            state_terminal_losses = F.binary_cross_entropy_with_logits(state_terminal_pred, terminals_seq, reduction = 'none')
 
             if is_var_len:
                 state_terminal_loss = state_terminal_losses[loss_mask_without_last].mean()
