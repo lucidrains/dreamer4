@@ -55,6 +55,7 @@ def main(
     log_dir = None,
     checkpoint_every = 1000,
     checkpoint_folder = None,
+    use_loss_normalization = False,
 ):
     env_name = env_id.split('-')[0].lower()
 
@@ -113,6 +114,7 @@ def main(
         time_block_every = time_block_every,
         attn_dim_head = attn_dim_head,
         attn_heads = attn_heads,
+        use_loss_normalization = use_loss_normalization,
     )
 
     # trainer

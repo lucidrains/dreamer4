@@ -44,6 +44,7 @@ def main(
     num_bins = 255,
     lr = 3e-4,
     dream_timesteps = 16,
+    dream_prompt_len = 1,
     env_max_timesteps = 500,
     wm_collect_frames = 2048,
     wm_max_frames_per_batch = 128,
@@ -52,7 +53,8 @@ def main(
     predict_terminals = True,
     log_dir: str = None,
     checkpoint_path: str = None,
-    checkpoint_every = 100,
+    checkpoint_every = 50,
+    log_video_every = 50,
 ):
     assert reward_encoding in ('hl_gauss', 'two_hot')
 
@@ -119,7 +121,11 @@ def main(
         reward_encoding = reward_encoding,
         reward_encoder_kwargs = dict(
             num_bins = num_bins,
-            reward_range = (-20., 20.),
+            reward_range = (-5., 5.),
+        ),
+        value_encoder_kwargs = dict(
+            num_bins = num_bins,
+            reward_range = (-1000., 1000.),
         ),
         predict_terminals = predict_terminals,
     )
@@ -143,6 +149,7 @@ def main(
         learning_rate = lr,
         start_step = start_step,
         dream_timesteps = dream_timesteps,
+        dream_prompt_len = dream_prompt_len,
         env_max_timesteps = env_max_timesteps,
         wm_collect_frames = wm_collect_frames,
         wm_max_frames_per_batch = wm_max_frames_per_batch,
@@ -153,6 +160,7 @@ def main(
         project_name = f'dreamer4_{env_name}_{reward_encoding}',
         checkpoint_every = checkpoint_every,
         checkpoint_folder = checkpoint_folder,
+        log_video_every = log_video_every,
     )
 
     # train
