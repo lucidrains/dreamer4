@@ -851,7 +851,7 @@ class BehaviorCloneTrainer(Module):
         self.accelerator.end_training()
         self.print('training complete')
 
-# training from dreams
+# full dreamer loop - collect from env, train world model, dream, train policy
 
 class DreamTrainer(Module):
     def __init__(
@@ -1251,6 +1251,7 @@ class DreamerTrainer(Module):
         max_grad_norm = 0.5,
         weight_decay = 0.,
         dream_timesteps = 16,
+        dream_prompt_len = 1,
         env_max_timesteps = 16,
         wm_collect_frames = 2048,
         dream_train_steps_per_collect = 1,
@@ -1263,6 +1264,7 @@ class DreamerTrainer(Module):
         checkpoint_every = 1000,
         checkpoint_folder = './checkpoints',
         start_step = 0,
+        log_video_every = 50,
     ):
         super().__init__()
 
@@ -1300,6 +1302,7 @@ class DreamerTrainer(Module):
         self.batch_size = batch_size
         self.wm_max_frames_per_batch = wm_max_frames_per_batch
         self.dream_timesteps = dream_timesteps
+        self.dream_prompt_len = dream_prompt_len
         self.env_max_timesteps = env_max_timesteps
         self.wm_collect_frames = wm_collect_frames
         self.dream_train_steps_per_collect = dream_train_steps_per_collect
@@ -1308,6 +1311,10 @@ class DreamerTrainer(Module):
         self.checkpoint_every = checkpoint_every
         self.checkpoint_folder = Path(checkpoint_folder)
         self.checkpoint_folder.mkdir(exist_ok = True, parents = True)
+
+        self.log_video_every = log_video_every
+        self.results_folder = Path(checkpoint_folder).parent / 'results'
+        self.results_folder.mkdir(exist_ok = True, parents = True)
 
         self.register_buffer('step', tensor(start_step))
 
@@ -1451,16 +1458,66 @@ class DreamerTrainer(Module):
 
         return tensor(avg_loss, device = self.device), wm_loss_breakdown
 
-    def train_policy_from_dreams(self):
+    def _sample_dream_prompts(self, experience: Experience):
+        if self.dream_prompt_len <= 0:
+            return {}
+
+        latents = experience.latents
+        lens = experience.lens
+
+        if not exists(latents) or not exists(lens):
+            return {}
+
+        valid_episode_mask = lens >= self.dream_prompt_len
+
+        if not valid_episode_mask.any():
+            return {}
+
+        valid_episode_indices = valid_episode_mask.nonzero(as_tuple = True)[0]
+        sampled_episode_indices = valid_episode_indices[torch.randint(len(valid_episode_indices), (self.batch_size,), device = latents.device)]
+
+        sampled_lens = lens[sampled_episode_indices]
+        max_start = sampled_lens - self.dream_prompt_len
+        start_offsets = (torch.rand((self.batch_size,), device = latents.device) * (max_start + 1).float()).floor().long()
+        time_offsets = torch.arange(self.dream_prompt_len, device = latents.device)
+        time_indices = start_offsets[:, None] + time_offsets
+
+        prompt_kwargs = dict(
+            prompt_latents = latents[sampled_episode_indices[:, None], time_indices]
+        )
+
+        if exists(experience.proprio):
+            prompt_kwargs['prompt_proprio'] = experience.proprio[sampled_episode_indices[:, None], time_indices]
+
+        if exists(experience.rewards):
+            prompt_kwargs['prompt_rewards'] = experience.rewards[sampled_episode_indices[:, None], time_indices]
+
+        if exists(experience.actions):
+            discrete_actions, continuous_actions = experience.actions
+
+            if exists(discrete_actions):
+                prompt_kwargs['prompt_discrete_actions'] = discrete_actions[sampled_episode_indices[:, None], time_indices]
+
+            if exists(continuous_actions):
+                prompt_kwargs['prompt_continuous_actions'] = continuous_actions[sampled_episode_indices[:, None], time_indices]
+
+        return prompt_kwargs
+
+    def train_policy_from_dreams(self, experience: Experience):
         """Generate dream rollouts and train policy/value heads."""
+
+        prompt_kwargs = self._sample_dream_prompts(experience)
+        prompt_len = self.dream_prompt_len if 'prompt_latents' in prompt_kwargs else 0
+        dream_time_steps = self.dream_timesteps + 1 + prompt_len
 
         for _ in range(self.dream_train_steps_per_collect):
             dreams = self.unwrapped_model.generate(
-                self.dream_timesteps + 1,
+                dream_time_steps,
                 batch_size = self.batch_size,
-                return_rewards_per_frame = True,
-                return_agent_actions = True,
-                return_log_probs_and_values = True
+                return_for_policy_optimization = True,
+                return_decoded_video = False,
+                drop_prompt_from_experience = True,
+                **prompt_kwargs,
             )
 
             policy_loss, value_loss = self.model.learn_from_experience(dreams)
@@ -1482,6 +1539,51 @@ class DreamerTrainer(Module):
             self.value_head_optim.zero_grad()
 
         return policy_loss, value_loss
+
+    @torch.no_grad()
+    def save_visualizations(self, env, env_is_vectorized = False):
+        """Save dream rollout and policy episode GIFs to results folder."""
+        step = self.step.item()
+        model = self.unwrapped_model
+        was_training = model.training
+        model.eval()
+
+        # dream rollout
+        try:
+            dreams = model.generate(
+                self.dream_timesteps + 1,
+                batch_size = 1,
+                return_decoded_video = True,
+                return_rewards_per_frame = True,
+                return_agent_actions = True,
+            )
+
+            if exists(dreams.video):
+                dream_video = dreams.video.clamp(0., 1.)
+                gif_path = self.results_folder / f'dream-{step}.gif'
+                save_video_grid_as_gif(dream_video, gif_path)
+        except Exception as e:
+            self.print(f'warning: dream visualization failed: {e}')
+
+        # policy episode in real env
+        try:
+            experience = model.interact_with_env(
+                env,
+                max_timesteps = min(self.env_max_timesteps, 200),
+                env_is_vectorized = env_is_vectorized,
+            )
+
+            video = experience.video[:1].clamp(0., 1.)  # first env only
+            ep_len = experience.lens[0].item() if exists(experience.lens) else video.shape[2]
+            video = video[:, :, :ep_len]
+
+            gif_path = self.results_folder / f'policy-{step}.gif'
+            save_video_grid_as_gif(video, gif_path)
+        except Exception as e:
+            self.print(f'warning: policy visualization failed: {e}')
+
+        if was_training:
+            model.train()
 
     def forward(
         self,
@@ -1532,7 +1634,7 @@ class DreamerTrainer(Module):
             # 3. train policy/value from dream rollouts (skip during WM warmup)
 
             if self.step.item() >= self.wm_only_steps:
-                policy_loss, value_loss = self.train_policy_from_dreams()
+                policy_loss, value_loss = self.train_policy_from_dreams(combined)
             else:
                 policy_loss = value_loss = tensor(0., device = self.device)
 
@@ -1550,6 +1652,8 @@ class DreamerTrainer(Module):
 
             if exists(wm_loss_breakdown):
                 log_data.update(wm_loss_breakdown)
+
+            log_data.update(getattr(self.unwrapped_model, '_rl_diagnostics', {}))
 
             self.log(**log_data)
 
@@ -1574,6 +1678,9 @@ class DreamerTrainer(Module):
                     postfix['cont_act'] = f"{wm_loss_breakdown['continuous_action_loss']:.4f}"
 
             pbar.set_postfix(ordered_dict = postfix)
+
+            if self.log_video_every > 0 and self.is_main_process and divisible_by(self.step.item(), self.log_video_every):
+                self.save_visualizations(env, env_is_vectorized)
 
             self.step += 1
 
