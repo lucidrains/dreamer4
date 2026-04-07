@@ -1256,6 +1256,7 @@ class DreamerTrainer(Module):
         wm_collect_frames = 2048,
         dream_train_steps_per_collect = 1,
         wm_only_steps = 0,
+        use_pmpo = True,
         accelerate_kwargs: dict = dict(),
         cpu = False,
         use_tensorboard_logger = False,
@@ -1307,6 +1308,7 @@ class DreamerTrainer(Module):
         self.wm_collect_frames = wm_collect_frames
         self.dream_train_steps_per_collect = dream_train_steps_per_collect
         self.wm_only_steps = wm_only_steps
+        self.use_pmpo = use_pmpo
 
         self.checkpoint_every = checkpoint_every
         self.checkpoint_folder = Path(checkpoint_folder)
@@ -1520,7 +1522,7 @@ class DreamerTrainer(Module):
                 **prompt_kwargs,
             )
 
-            policy_loss, value_loss = self.model.learn_from_experience(dreams)
+            policy_loss, value_loss = self.model.learn_from_experience(dreams, use_pmpo = self.use_pmpo)
 
             self.accelerator.backward(policy_loss)
 
