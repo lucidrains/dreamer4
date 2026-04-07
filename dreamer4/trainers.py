@@ -1286,7 +1286,7 @@ class DreamerTrainer(Module):
 
         optim_kwargs = dict(lr = learning_rate, weight_decay = weight_decay)
 
-        model_params = list(model.parameters())
+        model_params = list(model.parameter())
         muon_params = list(model.muon_parameters()) if hasattr(model, 'muon_parameters') else []
 
         if optim_klass is MuonAdamAtan2:

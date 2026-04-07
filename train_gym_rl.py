@@ -62,7 +62,7 @@ def main(
     env_name = env_id.split('-')[0].lower()
 
     if tokenizer_checkpoint_path is None:
-        tokenizer_checkpoint_path = f'./logs_tokenizer_{env_name}/checkpoints'
+        tokenizer_checkpoint_path = f'./runs/tokenizer_loss_norm/checkpoints'
 
     if log_dir is None:
         # auto-increment run version
@@ -129,6 +129,8 @@ def main(
             reward_range = (-1000., 1000.),
         ),
         predict_terminals = predict_terminals,
+        discrete_action_loss_weight = 0.,
+        continuous_action_loss_weight = 0.,
     )
 
     # load checkpoint if provided
