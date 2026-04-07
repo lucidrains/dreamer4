@@ -1106,7 +1106,8 @@ class ActionEmbedder(Module):
 def calc_gae(
     rewards,
     values,
-    masks = None,
+    continuation_masks = None,
+    learn_masks = None,
     gamma = 0.99,
     lam = 0.95,
     use_accelerated = None
@@ -1114,18 +1115,25 @@ def calc_gae(
     assert values.shape[-1] == rewards.shape[-1]
     use_accelerated = default(use_accelerated, rewards.is_cuda)
 
-    if not exists(masks):
-        masks = torch.ones_like(values)
+    if not exists(continuation_masks):
+        continuation_masks = torch.ones_like(values)
 
-    values = F.pad(values, (0, 1), value = 0.)
-    values, values_next = values[..., :-1], values[..., 1:]
+    if not exists(learn_masks):
+        learn_masks = torch.ones_like(values, dtype = torch.bool)
 
-    delta = rewards + gamma * values_next * masks - values
-    gates = gamma * lam * masks
+    continuation_masks = continuation_masks.float()
+    learn_masks = learn_masks.bool()
 
-    scan = AssocScan(reverse = True, use_accelerated = use_accelerated)
+    values_next = F.pad(values[..., 1:], (0, 1), value = 0.)
 
-    gae = scan(gates, delta)
+    gae = torch.zeros_like(values)
+    running_gae = torch.zeros_like(values[..., 0])
+
+    for t in reversed(range(values.shape[-1])):
+        delta = rewards[..., t] + gamma * values_next[..., t] * continuation_masks[..., t] - values[..., t]
+        running_gae = delta + gamma * lam * continuation_masks[..., t] * running_gae
+        running_gae = torch.where(learn_masks[..., t], running_gae, torch.zeros_like(running_gae))
+        gae[..., t] = torch.where(learn_masks[..., t], running_gae, torch.zeros_like(delta))
 
     returns = gae + values
 
@@ -3375,26 +3383,36 @@ class DynamicsWorldModel(Module):
         if not exists(experience.is_truncated):
             experience.is_truncated = full((batch,), True, device = latents.device)
 
-        if exists(experience.lens):
-            mask_for_gae = lens_to_mask(experience.lens, time)
+        full_mask = None
 
-            rewards = rewards.masked_fill(~mask_for_gae, 0.)
-            old_values = old_values.masked_fill(~mask_for_gae, 0.)
+        if exists(experience.lens):
+            full_mask = lens_to_mask(experience.lens, time)
+            old_values = old_values.masked_fill(~full_mask, 0.)
+
+        else:
+            full_mask = torch.ones_like(old_values, dtype = torch.bool)
 
         # handle variable lengths
 
         max_time = latents.shape[1]
         is_var_len = exists(experience.lens)
 
-        mask = None
+        learn_mask = None
 
         if is_var_len:
             learnable_lens = experience.lens - experience.is_truncated.long() # if is truncated, remove the last one, as it is bootstrapped value
-            mask = lens_to_mask(learnable_lens, max_time)
+            learn_mask = lens_to_mask(learnable_lens, max_time)
+        else:
+            learn_mask = torch.ones_like(old_values, dtype = torch.bool)
 
-        # build continuation masks for gae from predicted terminals
+        rewards = rewards.masked_fill(~learn_mask, 0.)
 
-        gae_masks = mask.clone().float() if exists(mask) else torch.ones_like(old_values)
+        # build continuation masks for gae from terminals
+
+        if is_var_len:
+            continuation_masks = lens_to_mask((experience.lens - 1).clamp(min = 0), max_time).float()
+        else:
+            continuation_masks = F.pad(torch.ones_like(old_values[..., :-1]), (0, 1), value = 0.).float()
 
         if exists(experience.terminals):
             terminals = experience.terminals
@@ -3403,11 +3421,19 @@ class DynamicsWorldModel(Module):
                 last_step = (experience.lens - 1).clamp(min = 0) if is_var_len else full((batch,), time - 1, device = self.device)
                 terminals = flags_to_sequence(terminals, last_step, time)
 
-            gae_masks.masked_fill_(terminals.bool(), 0.)
+            continuation_masks.masked_fill_(terminals.bool(), 0.)
 
         # calculate returns
 
-        returns = calc_gae(rewards, old_values, masks = gae_masks, gamma = self.gae_discount_factor, lam = self.gae_lambda, use_accelerated = self.gae_use_accelerated)
+        returns = calc_gae(
+            rewards,
+            old_values,
+            continuation_masks = continuation_masks,
+            learn_masks = learn_mask,
+            gamma = self.gae_discount_factor,
+            lam = self.gae_lambda,
+            use_accelerated = self.gae_use_accelerated
+        )
 
         # determine whether to finetune entire transformer or just learn the heads
 
