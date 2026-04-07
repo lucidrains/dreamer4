@@ -3556,15 +3556,13 @@ class DynamicsWorldModel(Module):
             pos_loss, neg_loss = 0., 0.
 
             if pos.any():
-                pos_loss = scaled_action_log_probs[pos].sum()
+                pos_loss = scaled_action_log_probs[pos].mean()
 
             if neg.any():
-                neg_loss = scaled_action_log_probs[neg].sum()
-
-            num_advantages = max(1, len(advantage))
+                neg_loss = scaled_action_log_probs[neg].mean()
 
             α = self.pmpo_pos_to_neg_weight
-            policy_loss = -α * (pos_loss - neg_loss) / num_advantages
+            policy_loss = -α * pos_loss + (1 - α) * neg_loss
 
             # take care of kl
 
