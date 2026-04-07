@@ -2763,7 +2763,7 @@ class DynamicsWorldModel(Module):
         reward_loss_weight: float | list[float] = 1.,
         predict_terminals: bool = True,
         predict_terminal_mlp_kwargs: dict = dict(depth = 1),
-        terminal_loss_weight: float | list[float] = 1.,
+        terminal_loss_weight: float = 1.,
         discrete_action_loss_weight: float | list[float] = 1.,
         continuous_action_loss_weight: float | list[float] = 1.,
         num_latent_genes = 0,                       # for carrying out evolution within the dreams https://web3.arxiv.org/abs/2503.19037
@@ -3452,7 +3452,6 @@ class DynamicsWorldModel(Module):
             latents = latents,
             video = video[:, :, :-1],
             rewards = rewards,
-            terminals = was_terminated,
             proprio=accumulated_proprio[:, :-1] if exists(accumulated_proprio) else None,
             actions = Actions(discrete_actions, continuous_actions),
             log_probs = Actions(discrete_log_probs, continuous_log_probs),
@@ -5088,7 +5087,7 @@ class DynamicsWorldModel(Module):
             flow_loss * self.latent_flow_loss_weight +
             shortcut_flow_loss * self.shortcut_loss_weight +
             (reward_loss * self.reward_loss_weight).sum() +
-            (state_terminal_loss * self.terminal_loss_weight).sum() +
+            (state_terminal_loss * self.terminal_loss_weight) +
             (discrete_action_loss * self.discrete_action_loss_weight).sum() +
             (continuous_action_loss * self.continuous_action_loss_weight).sum() +
             (state_pred_loss * self.state_pred_loss_weight) +
