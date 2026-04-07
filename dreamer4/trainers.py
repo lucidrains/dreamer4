@@ -483,7 +483,7 @@ class BehaviorCloneTrainer(Module):
             weight_decay = weight_decay
         )
 
-        model_params = list(model.parameters())
+        model_params = list(model.parameter())
         muon_params = list(model.muon_parameters()) if hasattr(model, 'muon_parameters') else []
 
         if exists(self.self_flow_module):
