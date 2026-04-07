@@ -3800,7 +3800,7 @@ class DynamicsWorldModel(Module):
 
         # maybe take value optimizer step
 
-        if exists(policy_optim):
+        if exists(value_optim):
             value_loss.backward()
 
             value_optim.step()
