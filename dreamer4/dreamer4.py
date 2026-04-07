@@ -38,6 +38,7 @@ from torch_einops_utils import (
     maybe,
     align_dims_left,
     pad_at_dim,
+    pad_right_at_dim,
     pad_right_at_dim_to,
     pad_right_ndim_to,
     lens_to_mask,
@@ -1107,6 +1108,7 @@ def calc_gae(
     rewards,
     values,
     masks = None,
+    learn_masks = None,
     gamma = 0.99,
     lam = 0.95,
     use_accelerated = None
@@ -1117,10 +1119,16 @@ def calc_gae(
     if not exists(masks):
         masks = torch.ones_like(values)
 
+    masks = masks.float()
+
     values = F.pad(values, (0, 1), value = 0.)
     values, values_next = values[..., :-1], values[..., 1:]
 
     delta = rewards + gamma * values_next * masks - values
+
+    if exists(learn_masks):
+        delta = delta.masked_fill(~learn_masks, 0.)
+
     gates = gamma * lam * masks
 
     scan = AssocScan(reverse = True, use_accelerated = use_accelerated)
@@ -3015,8 +3023,8 @@ class DynamicsWorldModel(Module):
     def value_head_parameters(self):
         return self.value_head.parameters()
 
-    def parameter(self):
-        params = super().parameters()
+    def parameters(self, *args, **kwargs):
+        params = super().parameters(*args, **kwargs)
 
         if not exists(self.video_tokenizer):
             return params
@@ -3394,7 +3402,10 @@ class DynamicsWorldModel(Module):
 
         # build continuation masks for gae from predicted terminals
 
-        gae_masks = mask.clone().float() if exists(mask) else torch.ones_like(old_values)
+        if is_var_len:
+            gae_masks = lens_to_mask((experience.lens - 1).clamp(min = 0), max_time)
+        else:
+            gae_masks = pad_right_at_dim(torch.ones_like(old_values[..., :-1]), 1, value = 0., dim = -1)
 
         if exists(experience.terminals):
             terminals = experience.terminals
@@ -3407,7 +3418,15 @@ class DynamicsWorldModel(Module):
 
         # calculate returns
 
-        returns = calc_gae(rewards, old_values, masks = gae_masks, gamma = self.gae_discount_factor, lam = self.gae_lambda, use_accelerated = self.gae_use_accelerated)
+        returns = calc_gae(
+            rewards,
+            old_values,
+            masks = gae_masks,
+            learn_masks = mask,
+            gamma = self.gae_discount_factor,
+            lam = self.gae_lambda,
+            use_accelerated = self.gae_use_accelerated
+        )
 
         # determine whether to finetune entire transformer or just learn the heads
 
@@ -4717,7 +4736,10 @@ class DynamicsWorldModel(Module):
         discrete_action_loss = self.zero
         continuous_action_loss = self.zero
 
+        has_action_loss_weight = (self.discrete_action_loss_weight.sum() + self.continuous_action_loss_weight.sum()) > 0
+
         if (
+            has_action_loss_weight and
             self.num_agents == 1 and
             add_autoregressive_action_loss and
             time > 1 and
