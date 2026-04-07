@@ -2029,7 +2029,7 @@ class VideoTokenizer(Module):
         time_decorr_loss_weight = 4e-3,
         space_decorr_loss_weight = 4e-3,
         decorr_sample_frac = 0.25,
-        use_loss_normalization = False,
+        use_loss_normalization = True,
         use_causal_conv3d = False,
         causal_conv3d_kernel_size = 3,
         decoder_flow_steps = 1,
