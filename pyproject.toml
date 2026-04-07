@@ -1,6 +1,6 @@
 [project]
 name = "dreamer4"
-version = "0.6.26"
+version = "0.6.27"
 description = "Dreamer 4"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
