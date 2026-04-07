@@ -4833,7 +4833,7 @@ class DynamicsWorldModel(Module):
         # now take care of the agent token losses
 
         reward_loss = self.zero
-        terminal_loss = self.zero
+        state_terminal_loss = self.zero
 
         needs_agent_pred = exists(rewards) or (exists(terminals) and self.predict_terminals)
 
@@ -4886,9 +4886,9 @@ class DynamicsWorldModel(Module):
             state_terminal_losses = F.binary_cross_entropy_with_logits(state_terminal_pred, terminals_seq, reduction = 'none')
 
             if is_var_len:
-                terminal_loss = state_terminal_losses[loss_mask_without_last].mean()
+                state_terminal_loss = state_terminal_losses[loss_mask_without_last].mean()
             else:
-                terminal_loss = state_terminal_losses.mean()
+                state_terminal_loss = state_terminal_losses.mean()
 
         # maybe autoregressive state prediction loss
 
@@ -5046,7 +5046,7 @@ class DynamicsWorldModel(Module):
             reward_loss = self.reward_loss_normalizer(reward_loss, update_ema = update_loss_ema)
 
         if exists(terminals) and exists(self.state_terminal_loss_normalizer):
-            terminal_loss = self.state_terminal_loss_normalizer(terminal_loss, update_ema = update_loss_ema)
+            state_terminal_loss = self.state_terminal_loss_normalizer(state_terminal_loss, update_ema = update_loss_ema)
 
         if exists(discrete_actions) and exists(self.discrete_actions_loss_normalizer):
             discrete_action_loss = self.discrete_actions_loss_normalizer(discrete_action_loss, update_ema = update_loss_ema)
@@ -5088,7 +5088,7 @@ class DynamicsWorldModel(Module):
             flow_loss * self.latent_flow_loss_weight +
             shortcut_flow_loss * self.shortcut_loss_weight +
             (reward_loss * self.reward_loss_weight).sum() +
-            (terminal_loss * self.terminal_loss_weight).sum() +
+            (state_terminal_loss * self.terminal_loss_weight).sum() +
             (discrete_action_loss * self.discrete_action_loss_weight).sum() +
             (continuous_action_loss * self.continuous_action_loss_weight).sum() +
             (state_pred_loss * self.state_pred_loss_weight) +
@@ -5097,7 +5097,7 @@ class DynamicsWorldModel(Module):
             (latent_ar_sigreg_loss * self.latent_ar_sigreg_loss_weight)
         )
 
-        losses = WorldModelLosses(flow_loss, shortcut_flow_loss, reward_loss, terminal_loss, discrete_action_loss, continuous_action_loss, state_pred_loss, agent_state_pred_loss, latent_ar_loss, latent_ar_sigreg_loss)
+        losses = WorldModelLosses(flow_loss, shortcut_flow_loss, reward_loss, state_terminal_loss, discrete_action_loss, continuous_action_loss, state_pred_loss, agent_state_pred_loss, latent_ar_loss, latent_ar_sigreg_loss)
 
         if not (return_all_losses or return_intermediates):
             return total_loss
