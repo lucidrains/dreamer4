@@ -1448,7 +1448,7 @@ class DreamerTrainer(Module):
             self.accelerator.backward(loss)
 
             if exists(self.max_grad_norm):
-                self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                self.accelerator.clip_grad_norm_(self.unwrapped_model.parameter(), self.max_grad_norm)
 
             self.world_model_optim.step()
             self.world_model_optim.zero_grad()
