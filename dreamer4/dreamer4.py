@@ -1165,7 +1165,7 @@ class ActionEmbedder(Module):
 
         discrete_embeds = continuous_embeds = None
 
-        if exists(discrete_actions):
+        if exists(discrete_actions) and discrete_actions.shape[-1] > 0:
 
             discrete_action_types = default(discrete_action_types, self.default_discrete_action_types)
 
@@ -1180,7 +1180,7 @@ class ActionEmbedder(Module):
             discrete_actions_offsetted = add('... na, na', discrete_actions, offsets)
             discrete_embeds = self.discrete_action_embed(discrete_actions_offsetted)
 
-        if exists(continuous_actions):
+        if exists(continuous_actions) and continuous_actions.shape[-1] > 0:
             continuous_action_types = default(continuous_action_types, self.default_continuous_action_types)
 
             continuous_action_types = self.cast_action_types(continuous_action_types)
@@ -3280,7 +3280,7 @@ class DynamicsWorldModel(Module):
 
         is_terminated = full((batch,), False, device = device)
         is_truncated = full((batch,), False, device = device)
-        was_terminated = full((batch,), False, device = device)
+        was_terminated = full((batch,), False, device = device) # tracks whether episode ended due to actual termination (not truncation)
 
         episode_lens = full((batch,), 0, device = device)
 
@@ -3307,7 +3307,7 @@ class DynamicsWorldModel(Module):
                 rewards = rewards,
                 discrete_actions = discrete_actions,
                 continuous_actions = continuous_actions,
-                proprio=accumulated_proprio,
+                proprio = accumulated_proprio,
                 time_cache = time_cache,
                 latent_is_noised = True,
                 return_pred_only = True,
@@ -3454,14 +3454,15 @@ class DynamicsWorldModel(Module):
             rewards = rewards,
             terminals = was_terminated,
             proprio=accumulated_proprio[:, :-1] if exists(accumulated_proprio) else None,
-            actions = (discrete_actions, continuous_actions),
-            log_probs = (discrete_log_probs, continuous_log_probs),
+            actions = Actions(discrete_actions, continuous_actions),
+            log_probs = Actions(discrete_log_probs, continuous_log_probs),
             values = values,
             old_action_unembeds = self.action_embedder.unembed(acc_policy_embed, pred_head_index = 0) if exists(acc_policy_embed) and store_old_action_unembeds else None,
             agent_embed = acc_agent_embed if store_agent_embed else None,
             step_size = step_size,
             agent_index = agent_index,
             is_truncated = is_truncated,
+            terminals = was_terminated,
             lens = episode_lens,
             is_from_world_model = False
         )
@@ -3968,6 +3969,13 @@ class DynamicsWorldModel(Module):
             elif prompt_len == 0:
                 decoded_rewards = empty((batch_size, 0), device = self.device, dtype = torch.float32)
 
+        # maybe return terminals
+
+        decoded_terminals = torch.zeros((batch_size,), device = self.device, dtype = torch.bool)
+        decoded_lens = full((batch_size,), time_steps, device = self.device)
+
+        should_predict_terminals = return_terminals and self.predict_terminals
+
         # while all the frames of the video (per latent) is not generated
 
         while latents.shape[1] < time_steps:
@@ -4104,7 +4112,7 @@ class DynamicsWorldModel(Module):
 
             # predictions off agent token embedding on the last denoising step
 
-            needs_agent_embed = return_rewards_per_frame or store_agent_embed or return_agent_actions
+            needs_agent_embed = return_rewards_per_frame or should_predict_terminals or store_agent_embed or return_agent_actions
 
             if needs_agent_embed:
                 one_agent_embed = embeds.agent[:, -1:, agent_index]
@@ -4868,7 +4876,14 @@ class DynamicsWorldModel(Module):
             else:
                 terminals_seq = terminals[:, 1:]
 
-            state_terminal_losses = F.binary_cross_entropy_with_logits(state_terminal_pred, terminals_seq.float(), reduction = 'none')
+            terminals_seq = terminals_seq.float()
+
+            # label smoothing trick from dreamerv3 - clamp targets to [1/H, 1 - 1/H] where H = 1 / (1 - γ)
+
+            eps = 1. - self.gae_discount_factor
+            terminals_seq = terminals_seq.clamp(min = eps, max = 1. - eps)
+
+            state_terminal_losses = F.binary_cross_entropy_with_logits(state_terminal_pred, terminals_seq, reduction = 'none')
 
             if is_var_len:
                 terminal_loss = state_terminal_losses[loss_mask_without_last].mean()

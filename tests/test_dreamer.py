@@ -20,6 +20,7 @@ def exists(v):
 @param('time_attention_use_pope', (False, True))
 @param('with_latent_ar_in_dynamics', (False, True))
 @param('with_latent_ar_action_conditioned', (False, True))
+@param('predict_terminals', (False, True))
 def test_e2e(
     pred_orig_latent,
     grouped_query_attn,
@@ -35,7 +36,8 @@ def test_e2e(
     var_len,
     time_attention_use_pope,
     with_latent_ar_in_dynamics,
-    with_latent_ar_action_conditioned
+    with_latent_ar_action_conditioned,
+    predict_terminals
 ):
     from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
 
@@ -93,7 +95,8 @@ def test_e2e(
         latent_ar_layer = 0 if with_latent_ar_in_dynamics else None,
         latent_ar_loss_weight = 1. if with_latent_ar_in_dynamics else 0.,
         latent_ar_sigreg_loss_weight = 0.05 if with_latent_ar_in_dynamics else 0.,
-        latent_ar_sigreg_loss_kwargs = dict(num_slices = 2) if with_latent_ar_in_dynamics else None
+        latent_ar_sigreg_loss_kwargs = dict(num_slices = 2) if with_latent_ar_in_dynamics else None,
+        predict_terminals = predict_terminals
     )
 
     signal_levels = step_sizes_log2 = None
@@ -119,10 +122,15 @@ def test_e2e(
     if var_len:
         lens = torch.randint(1, 4, (2,))
 
+    terminals = None
+    if predict_terminals:
+        terminals = (torch.randn(2) > 0.).bool()
+
     flow_loss = dynamics(
         **dynamics_input,
         lens = lens,
         tasks = tasks,
+        terminals = terminals,
         signal_levels = signal_levels,
         step_sizes_log2 = step_sizes_log2,
         discrete_actions = actions,
@@ -139,6 +147,7 @@ def test_e2e(
         image_width = 32,
         batch_size = 2,
         return_rewards_per_frame = True,
+        return_terminals = predict_terminals,
         use_time_cache = use_time_cache
     )
 
@@ -298,7 +307,7 @@ def test_action_with_world_model():
     discrete_actions, continuous_actions = gen.actions
 
     assert discrete_actions.shape == (4, 16, 1)
-    assert continuous_actions is None
+    assert continuous_actions is None or continuous_actions.numel() == 0
 
     discrete_log_probs, _ = gen.log_probs
 
@@ -708,12 +717,14 @@ def test_cache_generate():
 @param('env_can_terminate', (False, True))
 @param('env_can_truncate', (False, True))
 @param('store_agent_embed', (False, True))
+@param('predict_terminals', (False, True))
 def test_online_rl(
     vectorized,
     use_pmpo,
     env_can_terminate,
     env_can_truncate,
-    store_agent_embed
+    store_agent_embed,
+    predict_terminals
 ):
     from dreamer4.dreamer4 import DynamicsWorldModel, VideoTokenizer
 
@@ -726,8 +737,8 @@ def test_online_rl(
         patch_size = 32,
         attn_dim_head = 16,
         num_latent_tokens = 1,
-        image_height = 256,
-        image_width = 256,
+        image_height = 32,
+        image_width = 32,
     )
 
     world_model_and_policy = DynamicsWorldModel(
@@ -750,7 +761,7 @@ def test_online_rl(
     from dreamer4.dreamer4 import combine_experiences
 
     mock_env = MockEnv(
-        (256, 256),
+        (32, 32),
         vectorized = vectorized,
         num_envs = 4,
         terminate_after_step = 2 if env_can_terminate else None,
@@ -760,7 +771,7 @@ def test_online_rl(
 
     # manually
 
-    dream_experience = world_model_and_policy.generate(10, batch_size = 1, store_agent_embed = store_agent_embed, return_for_policy_optimization = True)
+    dream_experience = world_model_and_policy.generate(10, batch_size = 1, store_agent_embed = store_agent_embed, return_terminals = predict_terminals, return_for_policy_optimization = True)
 
     one_experience = world_model_and_policy.interact_with_env(mock_env, max_timesteps = 8, env_is_vectorized = vectorized, store_agent_embed = store_agent_embed)
     another_experience = world_model_and_policy.interact_with_env(mock_env, max_timesteps = 16, env_is_vectorized = vectorized, store_agent_embed = store_agent_embed)
