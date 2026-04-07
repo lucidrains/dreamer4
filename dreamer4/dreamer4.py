@@ -3638,7 +3638,7 @@ class DynamicsWorldModel(Module):
 
         # maybe take value optimizer step
 
-        if exists(policy_optim):
+        if exists(value_optim):
             value_loss.backward()
 
             value_optim.step()
@@ -3952,7 +3952,7 @@ class DynamicsWorldModel(Module):
                 is_terminal = rearrange(is_terminal, 'b 1 -> b')
 
                 just_terminated = is_terminal & ~decoded_terminals
-                decoded_lens.masked_fill_(just_terminated, curr_time_steps)
+                decoded_lens.masked_fill_(just_terminated, curr_time_steps + 1)
                 decoded_terminals |= is_terminal
 
             # maybe store agent embed
