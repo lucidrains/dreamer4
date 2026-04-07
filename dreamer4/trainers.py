@@ -791,7 +791,7 @@ class BehaviorCloneTrainer(Module):
                 total_continuous_action_loss += (losses.continuous_actions.sum().item() / self.grad_accum_every)
 
             if exists(self.max_grad_norm):
-                self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                self.accelerator.clip_grad_norm_(self.model.parameter(), self.max_grad_norm)
 
             self.optim.step()
             self.optim.zero_grad()
