@@ -130,7 +130,7 @@ class ActorCritic(nn.Module):
         dim_encoded = 2048
 
         self.actor = Feedforwards(dim_hidden, depth = 2, dim_in = dim_encoded, dim_out = num_actions)
-        
+
         dim_critic_in = dim_state if asymmetric_critic else dim_encoded
         self.critic = Feedforwards(dim_hidden, depth = 2, dim_in = dim_critic_in, dim_out = 1)
 
@@ -142,7 +142,7 @@ class ActorCritic(nn.Module):
         action = default(action, dist.sample())
         log_prob = dist.log_prob(action)
         entropy = dist.entropy()
-        
+
         critic_in = state if self.asymmetric_critic else features
         value = rearrange(self.critic(critic_in), '... 1 -> ...')
 
@@ -375,7 +375,7 @@ def main(
         while not is_done:
             with torch.no_grad():
                 obs_t = rearrange(torch.tensor(obs, dtype = torch.uint8, device = device), '... -> 1 ...')
-                
+
                 action, _, _, _ = agent(obs_t, state = state_t)
 
             action = action.item()

@@ -1070,8 +1070,9 @@ def test_rac_like_tokenizer(steps):
 
     assert recon_video.shape == (batch, channels, time, height, width)
 
+@param('use_time_rnn', (False, True))
 @param('use_causal_conv3d', (False, True))
-def test_e2e_sequential_parallel_cache(use_causal_conv3d):
+def test_e2e_sequential_parallel_cache(use_time_rnn, use_causal_conv3d):
     import torch
     from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
 
@@ -1101,7 +1102,8 @@ def test_e2e_sequential_parallel_cache(use_causal_conv3d):
         policy_head_mlp_depth = 2,
         value_head_mlp_depth = 2,
         attn_heads = 4,
-        attn_dim_head = 16
+        attn_dim_head = 16,
+        use_time_rnn = use_time_rnn
     ).eval()
 
     video = torch.randn(1, 3, 4, 64, 64)
@@ -1109,8 +1111,8 @@ def test_e2e_sequential_parallel_cache(use_causal_conv3d):
 
     with torch.no_grad():
         latents_parallel, tokenizer_cache_parallel = tokenizer(
-            video, 
-            return_latents = True, 
+            video,
+            return_latents = True,
             return_time_cache = True
         )
 
@@ -1125,7 +1127,7 @@ def test_e2e_sequential_parallel_cache(use_causal_conv3d):
             return_pred_only = True,
             return_intermediates = True
         )
-        
+
         policy_embed_parallel = dynamics.policy_head(embeds_parallel.agent)
 
         tokenizer_cache_sequential = dynamics_cache_sequential = None
@@ -1149,7 +1151,7 @@ def test_e2e_sequential_parallel_cache(use_causal_conv3d):
                 return_pred_only = True,
                 return_intermediates = True
             )
-            
+
             policy_embed_sequential.append(dynamics.policy_head(intermediates_sequential.agent))
 
         policy_embed_sequential = torch.cat(policy_embed_sequential, dim = 1)

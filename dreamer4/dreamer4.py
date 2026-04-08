@@ -6,7 +6,7 @@ from random import random
 from contextlib import nullcontext
 from collections import namedtuple
 from functools import partial, wraps
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields
 
 import torch
 import torch.nn.functional as F
@@ -134,7 +134,7 @@ class Experience:
         return self.to(torch.device('cpu'))
 
     def to(self, device):
-        experience_dict = asdict(self)
+        experience_dict = {f.name: getattr(self, f.name) for f in fields(self)}
         experience_dict = tree_map(lambda t: t.to(device) if is_tensor(t) else t, experience_dict)
         return Experience(**experience_dict)
 
@@ -161,7 +161,7 @@ def combine_experiences(
 
     # convert to dictionary
 
-    exps_dict = [asdict(exp) for exp in exps]
+    exps_dict = [{f.name: getattr(exp, f.name) for f in fields(exp)} for exp in exps]
 
     values, tree_specs = zip(*[tree_flatten(exp_dict) for exp_dict in exps_dict])
 
@@ -1237,13 +1237,12 @@ def naive_attend(
     causal_block_size = 1,
     mask = None
 ):
+    groups = q.shape[1] // k.shape[1]
 
     if not exists(scale):
         scale = q.shape[-1] ** -0.5
 
     # grouped query attention
-
-    groups = q.shape[1] // k.shape[1]
 
     q = rearrange(q, 'b (h g) ... -> b h g ...', g = groups)
 
@@ -1701,7 +1700,8 @@ class AxialSpaceTimeTransformer(Module):
         final_norm = True,
         value_residual = True,               # https://arxiv.org/abs/2410.17897 - but with learned mixing from OSS
         rnn_time = True,
-        time_attention_use_pope = False
+        time_attention_use_pope = False,
+        use_attn_pool = True
     ):
         super().__init__()
         assert depth >= time_block_every, f'depth must be at least {time_block_every}'
@@ -1775,7 +1775,9 @@ class AxialSpaceTimeTransformer(Module):
 
         self.is_time = is_time
 
-        self.final_attn_pool = AttentionPool(dim, **attn_residual_kwargs)
+        self.use_attn_pool = use_attn_pool
+        if use_attn_pool:
+            self.final_attn_pool = AttentionPool(dim, **attn_residual_kwargs)
 
         # final norm
 
@@ -1809,12 +1811,12 @@ class AxialSpaceTimeTransformer(Module):
 
         kv_cache = rnn_prev_hiddens = None
 
+        token_count = 0
+
         if exists(cache):
             kv_cache = cache.next_kv_cache
             rnn_prev_hiddens = cache.next_rnn_hiddens
             token_count = cache.token_count
-        else:
-            token_count = 0
 
         # attend functions for space and time
 
@@ -1894,7 +1896,7 @@ class AxialSpaceTimeTransformer(Module):
                 tokens = post_attn_rearrange(tokens)
 
                 tokens = tokens + residual
-                
+
                 layer_hiddens.append(tokens)
 
             # attention block
@@ -1932,7 +1934,7 @@ class AxialSpaceTimeTransformer(Module):
             tokens = post_attn_rearrange(tokens_out)
 
             tokens = tokens + residual
-            
+
             layer_hiddens.append(tokens)
 
             # save kv cache if is time layer
@@ -1953,16 +1955,17 @@ class AxialSpaceTimeTransformer(Module):
             tokens = ff(tokens)
 
             tokens = tokens + residual
-            
+
             layer_hiddens.append(tokens)
 
             hiddens.append(tokens)
 
         out = self.final_norm(tokens)
-        
+
         # apply attention pool post norm
 
-        out = self.final_attn_pool(out, layer_hiddens)
+        if self.use_attn_pool:
+            out = self.final_attn_pool(out, layer_hiddens) + out
 
         if has_kv_cache:
             # just concat the past tokens back on for now, todo - clean up the logic
@@ -2038,7 +2041,7 @@ class CausalDepthwiseConv3d(Module):
         x = self.proj(x)
 
         out = x + res
-        
+
         if return_time_cache:
             return out, next_time_cache
         return out
@@ -2494,7 +2497,7 @@ class VideoTokenizer(Module):
 
         if return_latents:
             next_time_cache = (next_pre_causal_conv_cache, next_transformer_cache, next_post_causal_conv_cache)
-            
+
             if not return_time_cache:
                 return latents
             return latents, next_time_cache
@@ -3437,7 +3440,7 @@ class DynamicsWorldModel(Module):
         if not exists(latents):
             assert exists(self.video_tokenizer) and exists(experience.video)
             latents = self.video_tokenizer(experience.video, return_latents = True)
-        
+
         actions = experience.actions
         proprio = experience.proprio
         critic_state = experience.critic_state
@@ -3733,7 +3736,7 @@ class DynamicsWorldModel(Module):
             clipped_values = old_values + (values - old_values).clamp(-self.value_clip, self.value_clip)
             clipped_value_bins = self.reward_encoder(clipped_values)
             clipped_value_bins = rearrange(clipped_value_bins, 'b t l -> b l t')
-            
+
             clipped_value_loss = -(return_bins * log(clipped_value_bins)).sum(dim = 1)
             value_loss = torch.maximum(value_loss, clipped_value_loss)
 
