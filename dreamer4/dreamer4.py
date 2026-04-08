@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing import Callable
 
+import numpy as np
 from math import ceil, log2
 from random import random
 from contextlib import nullcontext
@@ -129,6 +130,7 @@ class Experience:
     is_truncated: MaybeTensor = None
     agent_index: int = 0
     is_from_world_model: bool | Tensor = True
+    episode_return: Tensor | None = None
 
     def cpu(self):
         return self.to(torch.device('cpu'))
@@ -157,7 +159,7 @@ def combine_experiences(
             exp.is_truncated = full((batch,), True, device = device)
 
         if isinstance(exp.is_from_world_model, bool):
-            exp.is_from_world_model = tensor(exp.is_from_world_model)
+            exp.is_from_world_model = full((batch,), exp.is_from_world_model, device = device, dtype = torch.bool)
 
     # convert to dictionary
 
@@ -207,6 +209,10 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+def cast_to_tensor(t, device, dtype = None):
+    t = (t if is_tensor(t) else tensor(t)).to(device)
+    return t.to(dtype) if exists(dtype) else t
 
 def cosine_distance(x, y, mask = None):
     dist = 1. - F.cosine_similarity(x, y, dim = -1)
@@ -687,7 +693,7 @@ class SymExpTwoHot(Module):
         # fetch the closest two indices (two-hot encoding)
 
         left_indices = (indices - 1).clamp(min = 0)
-        right_indices = left_indices + 1
+        right_indices = (left_indices + 1).clamp(max = self.num_bins - 1)
 
         left_indices, right_indices = tuple(rearrange(t, '... -> ... 1') for t in (left_indices, right_indices))
 
@@ -1699,7 +1705,7 @@ class AxialSpaceTimeTransformer(Module):
         special_attend_only_itself = False,  # this is set to True for the video tokenizer decoder (latents can only attend to itself while spatial modalities attend to the latents and everything)
         final_norm = True,
         value_residual = True,               # https://arxiv.org/abs/2410.17897 - but with learned mixing from OSS
-        rnn_time = True,
+        rnn_time = False,
         time_attention_use_pope = False,
         use_attn_pool = True
     ):
@@ -2671,6 +2677,7 @@ class DynamicsWorldModel(Module):
         num_tasks = 0,
         num_video_views = 1,
         dim_proprio = None,
+        dim_state = None,
         dim_critic_state = None,
         critic_state_embedder: Module | None = None,
         reward_encoder_kwargs: dict = dict(),
@@ -2683,7 +2690,7 @@ class DynamicsWorldModel(Module):
         attn_dim_head = 64,
         attn_softclamp_value = 50.,
         ff_kwargs: dict = dict(),
-        use_time_rnn = True,
+        use_time_rnn = False,
         loss_weight_fn: Callable = ramp_weight,
         prob_shortcut_train = None,                  # probability of shortcut training, defaults to 1 - 1 / num_step_sizes
         add_reward_embed_to_agent_token = False,
@@ -2810,6 +2817,18 @@ class DynamicsWorldModel(Module):
 
         self.has_proprio = exists(dim_proprio)
         self.dim_proprio = dim_proprio
+
+        # state
+
+        self.dim_state = dim_state
+
+        if exists(dim_state):
+            self.state_to_latents = Sequential(
+                LinearNoBias(dim_state, num_latent_tokens * dim_latent),
+                Rearrange('... (n d) -> ... n d', n = num_latent_tokens, d = dim_latent)
+            )
+        else:
+            self.state_to_latents = None
 
         # asymmetric critic state embedding
 
@@ -3183,34 +3202,54 @@ class DynamicsWorldModel(Module):
         use_time_cache = True,
         store_agent_embed = True,
         store_old_action_unembeds = True,
+        obs_to_latents_fn = None
     ):
-        assert exists(self.video_tokenizer)
+        device = self.device
 
-        init_obs = env.reset()
+        reset_kwargs = dict(seed = seed) if exists(seed) else dict()
+        init_obs = env.reset(**reset_kwargs)
 
-        # if we are not a observation dict, we must be a raw image tensor
+        if isinstance(init_obs, tuple):
+            init_obs = init_obs[0]
 
         if not isinstance(init_obs, dict):
-            assert is_tensor(init_obs)
-            init_obs = dict(image = init_obs)
+            if not is_tensor(init_obs):
+                init_obs = cast_to_tensor(init_obs, device, dtype = torch.float32)
+            if init_obs.ndim >= 3:
+                init_obs = dict(image = init_obs)
+            else:
+                init_obs = dict(state = init_obs)
 
-        assert 'image' in init_obs
+        assert 'image' in init_obs or 'state' in init_obs
         assert not self.has_proprio or 'proprio' in init_obs
 
         proprio = init_obs.get('proprio', None)
 
-        # setup accumulation of frames to video and proprio
-
         if env_is_vectorized:
-            video = rearrange(init_obs['image'], 'b c vh vw -> b c 1 vh vw')
-            accumulated_proprio = maybe(rearrange)(proprio, 'b d -> b 1 d')
+            image_frame = rearrange(cast_to_tensor(init_obs['image'], device), 'b c vh vw -> b c 1 vh vw') if 'image' in init_obs else None
+            accumulated_proprio = maybe(rearrange)(init_obs.get('proprio', None), 'b d -> b 1 d')
+            state_frame = init_obs.get('state', None)
+            if exists(state_frame):
+                state_frame = cast_to_tensor(state_frame, device, dtype = torch.float32)
         else:
-            video = rearrange(init_obs['image'], 'c vh vw -> 1 c 1 vh vw')
-            accumulated_proprio = maybe(rearrange)(proprio, 'd -> 1 1 d')
+            image_frame = rearrange(cast_to_tensor(init_obs['image'], device), 'c vh vw -> 1 c 1 vh vw') if 'image' in init_obs else None
+            accumulated_proprio = maybe(rearrange)(init_obs.get('proprio', None), 'd -> 1 1 d')
+            state_frame = init_obs.get('state', None)
+            if exists(state_frame):
+                state_frame = rearrange(cast_to_tensor(state_frame, device, dtype = torch.float32), 'd -> 1 d')
 
-        batch, device = video.shape[0], video.device
+        batch = image_frame.shape[0] if exists(image_frame) else state_frame.shape[0]
 
-        # accumulate
+        video_frames = []
+        if exists(image_frame):
+            video_frames.append(image_frame)
+
+        states = []
+        if exists(state_frame):
+            states.append(state_frame)
+
+        if exists(accumulated_proprio):
+            accumulated_proprio = cast_to_tensor(accumulated_proprio, device, dtype = torch.float32)
 
         rewards = None
         discrete_actions = None
@@ -3218,82 +3257,93 @@ class DynamicsWorldModel(Module):
         discrete_log_probs = None
         continuous_log_probs = None
         values = None
-        latents = None
-
+        
+        acc_latents = None
         acc_agent_embed = None
         acc_policy_embed = None
 
-        # keep track of termination, for setting the `is_truncated` field on Experience and for early stopping interaction with env
-
         is_terminated = full((batch,), False, device = device)
         is_truncated = full((batch,), False, device = device)
-        was_terminated = full((batch,), False, device = device) # tracks whether episode ended due to actual termination (not truncation)
+        was_terminated = full((batch,), False, device = device)
+        done_flag = full((batch,), False, device = device)
 
         episode_lens = full((batch,), 0, device = device)
-
-        # derive step size
 
         assert divisible_by(self.max_steps, num_steps)
         step_size = self.max_steps // num_steps
 
-        # maybe time kv cache
-
         time_cache = None
+        tokenizer_time_cache = None
 
         step_index = 0
+        
+        obs = init_obs
+        curr_image = image_frame
+        curr_state = state_frame
 
-        while not is_terminated.all():
+        while not done_flag.all():
             step_index += 1
 
-            latents = self.video_tokenizer(video, return_latents = True)
+            if exists(obs_to_latents_fn):
+                latents, next_tokenizer_time_cache = obs_to_latents_fn(self, obs, tokenizer_time_cache)
+            elif exists(curr_image):
+                assert exists(self.video_tokenizer), 'video_tokenizer must be defined to automatically parse image observations'
+                latents, next_tokenizer_time_cache = self.video_tokenizer(curr_image, return_latents = True, time_cache = tokenizer_time_cache, return_time_cache = True)
+            elif exists(curr_state):
+                assert exists(self.state_to_latents), 'DynamicsWorldModel must have dim_state defined to automatically parse state observations'
+                latents = self.state_to_latents(curr_state)
+                latents = rearrange(latents, 'b n d -> b 1 n d') if latents.ndim == 3 else latents
+                next_tokenizer_time_cache = tokenizer_time_cache
+            else:
+                raise ValueError('Observations must contain an image or state key, or provide a custom obs_to_latents_fn')
+
+            tokenizer_time_cache = next_tokenizer_time_cache
+            acc_latents = safe_cat((acc_latents, latents), dim=1)
+
+            past_discrete_actions = discrete_actions[:, -1:] if exists(discrete_actions) else None
+            past_continuous_actions = continuous_actions[:, -1:] if exists(continuous_actions) else None
+            past_proprio = accumulated_proprio[:, -1:] if exists(accumulated_proprio) else None
+            past_rewards = rewards[:, -1:] if exists(rewards) else None
 
             _, (embeds, next_time_cache) = self.forward(
                 latents = latents,
                 signal_levels = self.max_steps - 1,
                 step_sizes = step_size,
-                rewards = rewards,
-                discrete_actions = discrete_actions,
-                continuous_actions = continuous_actions,
-                proprio = accumulated_proprio,
+                rewards = past_rewards,
+                discrete_actions = past_discrete_actions,
+                continuous_actions = past_continuous_actions,
+                proprio = past_proprio,
                 time_cache = time_cache,
                 latent_is_noised = True,
                 return_pred_only = True,
                 return_intermediates = True
             )
 
-            # time kv cache
-
             if use_time_cache:
                 time_cache = next_time_cache
 
-            # get one agent
-
             agent_embed = embeds.agent
-
             one_agent_embed = agent_embed[..., -1:, agent_index, :]
 
-            # values
+            value_embed = one_agent_embed
 
-            value_bins = self.value_head(one_agent_embed)
+            if exists(self.critic_state_embedder) and exists(state_frame):
+                critic_embed = self.critic_state_embedder(state_frame.to(device))
+                value_embed = value_embed + rearrange(critic_embed, 'batch dim -> batch 1 dim')
+
+            value_bins = self.value_head(value_embed)
             value = self.reward_encoder.bins_to_scalar_value(value_bins)
-
             values = safe_cat((values, value), dim = 1)
-
-            # policy embed
 
             policy_embed = self.policy_head(one_agent_embed)
 
             if store_old_action_unembeds:
                 acc_policy_embed = safe_cat((acc_policy_embed, policy_embed), dim = 1)
 
-            # sample actions
-
             sampled_discrete_actions, sampled_continuous_actions = self.action_embedder.sample(policy_embed, pred_head_index = 0, squeeze = True)
 
             discrete_actions = safe_cat((discrete_actions, sampled_discrete_actions), dim = 1)
             continuous_actions = safe_cat((continuous_actions, sampled_continuous_actions), dim = 1)
-
-            # get the log prob and values for policy optimization
 
             one_discrete_log_probs, one_continuous_log_probs = self.action_embedder.log_probs(
                 policy_embed,
@@ -3305,101 +3355,158 @@ class DynamicsWorldModel(Module):
             discrete_log_probs = safe_cat((discrete_log_probs, one_discrete_log_probs), dim = 1)
             continuous_log_probs = safe_cat((continuous_log_probs, one_continuous_log_probs), dim = 1)
 
-            # pass the sampled action to the environment and get back next state and reward
+            if env_is_vectorized:
+                if not exists(sampled_continuous_actions):
+                    action_out = sampled_discrete_actions.cpu().numpy().reshape(-1)
+                else:
+                    action_out = (sampled_discrete_actions.cpu().numpy(), sampled_continuous_actions.cpu().numpy())
+            else:
+                action_out = int(sampled_discrete_actions.item()) if sampled_discrete_actions.shape[-1] == 1 else (sampled_discrete_actions, sampled_continuous_actions)
 
-            env_step_out = env.step((sampled_discrete_actions, sampled_continuous_actions))
+            env_step_out = env.step(action_out)
 
             if len(env_step_out) == 2:
-                obs, reward = env_step_out
-                terminated = full((batch,), False)
-                truncated = full((batch,), False)
-
+                next_obs, reward = env_step_out
+                terminated = full((batch,), False, device = device)
+                truncated = full((batch,), False, device = device)
             elif len(env_step_out) == 3:
-                obs, reward, terminated = env_step_out
-                truncated = full((batch,), False)
-
+                next_obs, reward, terminated = env_step_out
+                truncated = full((batch,), False, device = device)
             elif len(env_step_out) == 4:
-                obs, reward, terminated, truncated = env_step_out
-
+                next_obs, reward, terminated, truncated = env_step_out
             elif len(env_step_out) == 5:
-                obs, reward, terminated, truncated, info = env_step_out
+                next_obs, reward, terminated, truncated, info = env_step_out
+            
+            terminated = cast_to_tensor(terminated, device).view((batch,))
+            truncated = cast_to_tensor(truncated, device).view((batch,))
+            reward = cast_to_tensor(reward, device, dtype = torch.float32)
 
-            # if we are not a observation dict, we must be a raw image tensor
+            if not isinstance(next_obs, dict):
+                if not is_tensor(next_obs):
+                    next_obs = cast_to_tensor(next_obs, device, dtype=torch.float32)
+                if next_obs.ndim >= 3:
+                    next_obs = dict(image = next_obs)
+                else:
+                    next_obs = dict(state = next_obs)
 
-            if not isinstance(obs, dict):
-                assert isinstance(obs, torch.Tensor)
-                obs = dict(image = obs)
+            assert 'image' in next_obs or 'state' in next_obs
+            
+            episode_lens = torch.where(done_flag, episode_lens, episode_lens + 1)
 
-            assert 'image' in obs
-            if self.has_proprio:
-                assert 'proprio' in obs
-
-            # maybe add state entropy bonus
-
-            if self.add_state_entropy_bonus:
-                state_pred_token = embeds.state_pred
-
-                state_pred = self.to_state_pred(state_pred_token)
-
-                dist = self.state_beta_dist(state_pred)
-
-                state_entropy = dist.entropy().sum()
-
-                reward = reward + state_entropy * self.state_entropy_bonus_weight
-
-            # update episode lens
-
-            episode_lens = torch.where(is_terminated, episode_lens, episode_lens + 1)
-
-            # update `is_terminated`
-
-            # (1) - environment says it is terminated
-            # (2) - previous step is truncated (this step is for bootstrap value)
-
-            is_terminated |= (terminated | is_truncated)
-            was_terminated |= terminated
-
-            # update `is_truncated`
-
-            if step_index <= max_timesteps:
-                is_truncated |= truncated
-
-            if step_index == max_timesteps:
-                # if the step index is at the max time step allowed, set the truncated flag, if not already terminated
-
+            is_terminated |= terminated
+            is_truncated |= truncated
+            if step_index >= max_timesteps:
                 is_truncated |= ~is_terminated
 
-            proprio = obs.get('proprio')
-
-            # batch and time dimension
-
-            if env_is_vectorized:
-                next_frame = rearrange(obs['image'], 'b c vh vw -> b c 1 vh vw')
-                proprio = maybe(rearrange)(proprio, 'b d -> b 1 d')
-                reward = rearrange(reward, 'b -> b 1')
-            else:
-                next_frame = rearrange(obs['image'], 'c vh vw -> 1 c 1 vh vw')
-                proprio = maybe(rearrange)(proprio, 'd -> 1 1 d')
-                reward = rearrange(reward, ' -> 1 1')
-
-            # concat
-
-            video = cat((video, next_frame), dim = 2)
+            was_terminated |= terminated
+            done_flag |= (is_terminated | is_truncated)
+            
+            reward = rearrange(reward, 'b -> b 1') if env_is_vectorized else rearrange(reward, ' -> 1 1')
             rewards = safe_cat((rewards, reward), dim = 1)
-
-            accumulated_proprio = safe_cat((accumulated_proprio, proprio), dim=1)
 
             acc_agent_embed = safe_cat((acc_agent_embed, one_agent_embed), dim = 1)
 
-        # package up one experience for learning
+            obs = next_obs
+            next_proprio = obs.get('proprio', None)
+            
+            # handle fetching new states and images
 
-        batch, device = latents.shape[0], latents.device
+            curr_state = None
+
+            if env_is_vectorized:
+                curr_image = rearrange(cast_to_tensor(obs['image'], device), 'b c vh vw -> b c 1 vh vw') if 'image' in obs else None
+
+                if 'state' in obs:
+                    curr_state = cast_to_tensor(obs['state'], device, dtype = torch.float32)
+
+                next_proprio = maybe(rearrange)(next_proprio, 'b d -> b 1 d')
+            else:
+                curr_image = rearrange(cast_to_tensor(obs['image'], device), 'c vh vw -> 1 c 1 vh vw') if 'image' in obs else None
+
+                if 'state' in obs:
+                    curr_state = rearrange(cast_to_tensor(obs['state'], device, dtype = torch.float32), 'd -> 1 d')
+
+                next_proprio = maybe(rearrange)(next_proprio, 'd -> 1 1 d')
+
+            if exists(next_proprio):
+                next_proprio = cast_to_tensor(next_proprio, device, dtype = torch.float32)
+                accumulated_proprio = safe_cat((accumulated_proprio, next_proprio), dim=1)
+
+            if exists(curr_state):
+                state_frame = curr_state
+
+            if exists(state_frame):
+                if not is_tensor(state_frame):
+                    state_frame = tensor(state_frame, dtype = torch.float32, device = device)
+                else:
+                    state_frame = state_frame.to(device)
+
+                states.append(state_frame)
+
+            if exists(curr_image):
+                curr_image = curr_image.to(device)
+                video_frames.append(curr_image)
+
+            need_bootstrap = is_truncated & ~was_terminated
+
+            if done_flag.all() and need_bootstrap.any():
+                if exists(obs_to_latents_fn):
+                    bootstrap_latents, _ = obs_to_latents_fn(obs, tokenizer_time_cache)
+                else:
+                    bootstrap_latents, _ = self.video_tokenizer(curr_image, return_latents = True, time_cache = tokenizer_time_cache, return_time_cache = True)
+                
+                _, (embeds, _) = self.forward(
+                    latents = bootstrap_latents,
+                    signal_levels = self.max_steps - 1,
+                    step_sizes = step_size,
+                    rewards = rewards[:, -1:] if exists(rewards) else None,
+                    discrete_actions = discrete_actions[:, -1:] if exists(discrete_actions) else None,
+                    continuous_actions = continuous_actions[:, -1:] if exists(continuous_actions) else None,
+                    proprio = accumulated_proprio[:, -1:] if exists(accumulated_proprio) else None,
+                    time_cache = time_cache,
+                    latent_is_noised = True,
+                    return_pred_only = True,
+                    return_intermediates = True
+                )
+                
+                one_agent_embed = embeds.agent[..., -1:, agent_index, :]
+                
+                value_embed = one_agent_embed
+
+                if exists(self.critic_state_embedder) and exists(state_frame):
+                    critic_embed = self.critic_state_embedder(state_frame.to(device))
+                    value_embed = value_embed + rearrange(critic_embed, 'batch dim -> batch 1 dim')
+
+                value_bins = self.value_head(value_embed)
+                bootstrap_value = self.reward_encoder.bins_to_scalar_value(value_bins)
+
+                values = torch.cat((values, bootstrap_value), dim = 1)
+                rewards = torch.cat((rewards, torch.zeros_like(rewards[:, -1:])), dim = 1)
+
+                if exists(discrete_actions):
+                    discrete_actions = torch.cat((discrete_actions, torch.zeros_like(discrete_actions[:, -1:])), dim = 1) # dummy action
+                    discrete_log_probs = torch.cat((discrete_log_probs, discrete_log_probs[:, -1:] * 0), dim = 1)
+
+                acc_latents = safe_cat((acc_latents, acc_latents[:, -1:]), dim = 1)
+
+                episode_lens = torch.where(need_bootstrap, episode_lens + 1, episode_lens)
+                break
+
+        video = cat(video_frames, dim=2) if len(video_frames) > 0 else None
+        stacked_states = stack(states, dim=1) if len(states) > 0 else None
+
+        # calculate episode return
+
+        time_dim = rewards.shape[-1]
+        step_mask = lens_to_mask(episode_lens, time_dim)
+        episode_return = rewards.masked_fill(~step_mask, 0.).sum(dim = -1)
 
         one_experience = Experience(
-            latents = latents,
-            video = video[:, :, :-1],
+            latents = acc_latents,
+            video = video[:, :, :-1] if exists(video) else None,
+            critic_state = stacked_states[:, :-1] if exists(stacked_states) else None,
             rewards = rewards,
-            proprio=accumulated_proprio[:, :-1] if exists(accumulated_proprio) else None,
+            proprio = accumulated_proprio[:, :-1] if exists(accumulated_proprio) else None,
             actions = Actions(discrete_actions, continuous_actions),
             log_probs = Actions(discrete_log_probs, continuous_log_probs),
             values = values,
@@ -3410,7 +3517,8 @@ class DynamicsWorldModel(Module):
             is_truncated = is_truncated,
             terminals = was_terminated,
             lens = episode_lens,
-            is_from_world_model = False
+            is_from_world_model = False,
+            episode_return = episode_return
         )
 
         return one_experience
@@ -3585,16 +3693,37 @@ class DynamicsWorldModel(Module):
 
         policy_agent_embeds = frac_gradient(agent_embeds, self.agent_policy_gradient_frac)
         policy_embed = self.policy_head(policy_agent_embeds)
+        
+        # align actions with policy embed if latents had a bootstrap state appended
+        
+        if exists(discrete_actions) and discrete_actions.shape[1] == latents.shape[1] and discrete_actions.shape[1] == policy_embed.shape[1] + 1:
+            discrete_actions = discrete_actions[:, :-1]
+            if exists(continuous_actions):
+                continuous_actions = continuous_actions[:, :-1]
 
         log_probs, entropies = self.action_embedder.log_probs(policy_embed, pred_head_index = 0, discrete_targets = discrete_actions, continuous_targets = continuous_actions, return_entropies = True)
 
         # concat discrete and continuous actions into one for optimizing
+
+        if exists(old_log_probs) and old_log_probs.discrete.shape[1] == policy_embed.shape[1] + 1:
+            old_log_probs = Actions(
+                old_log_probs.discrete[:, :-1] if exists(old_log_probs.discrete) else None,
+                old_log_probs.continuous[:, :-1] if exists(old_log_probs.continuous) else None
+            )
 
         old_log_probs = safe_cat(old_log_probs, dim = -1)
         log_probs = safe_cat(log_probs, dim = -1)
         entropies = safe_cat(entropies, dim = -1)
 
         advantage = rearrange(advantage, '... -> ... 1') # broadcast across all actions
+
+        # align advantage to log_probs length if bootstrap padded
+
+        if advantage.shape[1] == log_probs.shape[1] + 1:
+            advantage = advantage[:, :-1]
+            mask = mask[:, :-1] if exists(mask) else None
+            pos_advantage_mask = pos_advantage_mask[:, :-1] if exists(pos_advantage_mask) else None
+            neg_advantage_mask = neg_advantage_mask[:, :-1] if exists(neg_advantage_mask) else None
 
         # calculate delight
         # Ian Osband - https://arxiv.org/abs/2603.14608v1
@@ -3723,6 +3852,11 @@ class DynamicsWorldModel(Module):
 
         value_bins = self.value_head(value_agent_embeds)
         values = self.reward_encoder.bins_to_scalar_value(value_bins)
+
+        # align returns and old_values to value_bins length if bootstrap padded
+        if returns.shape[1] == value_bins.shape[1] + 1:
+            returns = returns[:, :-1]
+            old_values = old_values[:, :-1]
 
         return_bins = self.reward_encoder(returns)
 
