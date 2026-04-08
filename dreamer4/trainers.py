@@ -1282,11 +1282,14 @@ class DreamerTrainer(Module):
 
         self.model = model
 
-        # world model optimizer (all params)
+        # world model optimizer
+        # keep the policy/action parameters here because the autoregressive action loss trains them
+        # exclude only the value head, which is optimized purely from RL targets
 
         optim_kwargs = dict(lr = learning_rate, weight_decay = weight_decay)
 
-        model_params = list(model.parameter())
+        value_head_params = set(model.value_head_parameters())
+        model_params = [p for p in model.parameter() if p not in value_head_params]
         muon_params = list(model.muon_parameters()) if hasattr(model, 'muon_parameters') else []
 
         if optim_klass is MuonAdamAtan2:
@@ -1452,6 +1455,8 @@ class DreamerTrainer(Module):
 
             self.world_model_optim.step()
             self.world_model_optim.zero_grad()
+            self.policy_head_optim.zero_grad()
+            self.value_head_optim.zero_grad()
 
             total_loss += loss.item()
             num_batches += 1
