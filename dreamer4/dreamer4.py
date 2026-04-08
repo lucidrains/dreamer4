@@ -3600,8 +3600,7 @@ class DynamicsWorldModel(Module):
         else:
             advantage = returns - old_values
 
-        # if using pmpo, do not normalize advantages, but can be overridden
-
+        # follow the PMPO paper default of using raw advantage signs unless explicitly overridden
         normalize_advantages = default(normalize_advantages, not use_pmpo)
 
         if normalize_advantages:
@@ -3712,23 +3711,16 @@ class DynamicsWorldModel(Module):
             α = self.pmpo_pos_to_neg_weight
             policy_loss = -α * pos_loss + (1 - α) * neg_loss
 
-            # take care of kl
-
             if self.pmpo_kl_div_loss_weight > 0.:
 
                 new_unembedded_actions = self.action_embedder.unembed(policy_embed, pred_head_index = 0)
 
                 kl_div_inputs, kl_div_targets = new_unembedded_actions, old_action_unembeds
 
-                # mentioned that the "reverse direction for the prior KL" was used
-                # make optional, as observed instability in toy task
-
                 if self.pmpo_reverse_kl:
                     kl_div_inputs, kl_div_targets = kl_div_targets, kl_div_inputs
 
                 discrete_kl_div, continuous_kl_div = self.action_embedder.kl_div(kl_div_inputs, kl_div_targets)
-
-                # accumulate discrete and continuous kl div
 
                 kl_div_loss = 0.
 
@@ -3741,8 +3733,6 @@ class DynamicsWorldModel(Module):
                 policy_loss = policy_loss + kl_div_loss * self.pmpo_kl_div_loss_weight
 
         else:
-
-            # ppo clipped surrogate loss
 
             ratio = (log_probs - old_log_probs).exp()
             clipped_ratio = ratio.clamp(1. - self.ppo_eps_clip, 1. + self.ppo_eps_clip)
