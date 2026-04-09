@@ -3600,17 +3600,12 @@ class DynamicsWorldModel(Module):
         else:
             advantage = returns - old_values
 
-        # follow the PMPO paper default of using raw advantage signs unless explicitly overridden
-        normalize_advantages = default(normalize_advantages, not use_pmpo)
+        normalize_advantages = default(normalize_advantages, True)
 
         if normalize_advantages:
             advantage = F.layer_norm(advantage, advantage.shape, eps = eps)
 
         # https://arxiv.org/abs/2410.04166v1
-
-        if use_pmpo:
-            pos_advantage_mask = advantage >= 0.
-            neg_advantage_mask = ~pos_advantage_mask
 
         with torch.no_grad():
             valid_returns = returns[learn_mask]
@@ -3669,82 +3664,24 @@ class DynamicsWorldModel(Module):
 
         advantage = rearrange(advantage, '... -> ... 1') # broadcast across all actions
 
-        # calculate delight
-        # Ian Osband - https://arxiv.org/abs/2603.14608v1
+        # ppo clipped surrogate loss
+        # when use_pmpo, advantage is replaced with sign(advantage) following cleanrl pmpo_v2
+        # https://arxiv.org/abs/2410.04166v1
+
+        ratio = (log_probs - old_log_probs).exp()
+        clipped_ratio = ratio.clamp(1. - self.ppo_eps_clip, 1. + self.ppo_eps_clip)
+
+        ppo_advantage = advantage.sign() if use_pmpo else advantage
+
+        policy_loss = -torch.min(ratio * ppo_advantage, clipped_ratio * ppo_advantage)
 
         if use_delight_gating:
             delight_gate = ((-log_probs * advantage) / delight_temperature).sigmoid().detach()
+            policy_loss = policy_loss * delight_gate
 
-        # maybe pmpo
-        # pmpo - weighting the positive and negative advantages equally - ignoring magnitude of advantage and taking the sign
-        # seems to be weighted across batch and time, iiuc
-        # eq (10) in https://arxiv.org/html/2410.04166v1
+        policy_loss = reduce(policy_loss, 'b t na -> b t', 'sum')
 
-        if use_pmpo:
-
-            maybe_gated_log_prob = log_probs
-
-            if use_delight_gating:
-                maybe_gated_log_prob = log_probs * delight_gate
-
-            pos = pos_advantage_mask
-            neg = neg_advantage_mask
-
-            if exists(learn_mask):
-                pos = pos & learn_mask
-                neg = neg & learn_mask
-
-            scaled_action_log_probs = maybe_gated_log_prob * advantage.tanh().abs()
-
-            num_actions = scaled_action_log_probs.shape[-1]
-            pos = repeat(pos, 'b t -> b t na', na = num_actions)
-            neg = repeat(neg, 'b t -> b t na', na = num_actions)
-
-            pos_loss, neg_loss = 0., 0.
-
-            if pos.any():
-                pos_loss = scaled_action_log_probs[pos].mean()
-
-            if neg.any():
-                neg_loss = scaled_action_log_probs[neg].mean()
-
-            α = self.pmpo_pos_to_neg_weight
-            policy_loss = -α * pos_loss + (1 - α) * neg_loss
-
-            if self.pmpo_kl_div_loss_weight > 0.:
-
-                new_unembedded_actions = self.action_embedder.unembed(policy_embed, pred_head_index = 0)
-
-                kl_div_inputs, kl_div_targets = new_unembedded_actions, old_action_unembeds
-
-                if self.pmpo_reverse_kl:
-                    kl_div_inputs, kl_div_targets = kl_div_targets, kl_div_inputs
-
-                discrete_kl_div, continuous_kl_div = self.action_embedder.kl_div(kl_div_inputs, kl_div_targets)
-
-                kl_div_loss = 0.
-
-                if exists(discrete_kl_div):
-                    kl_div_loss = kl_div_loss + masked_mean(discrete_kl_div, learn_mask)
-
-                if exists(continuous_kl_div):
-                    kl_div_loss = kl_div_loss + masked_mean(continuous_kl_div, learn_mask)
-
-                policy_loss = policy_loss + kl_div_loss * self.pmpo_kl_div_loss_weight
-
-        else:
-
-            ratio = (log_probs - old_log_probs).exp()
-            clipped_ratio = ratio.clamp(1. - self.ppo_eps_clip, 1. + self.ppo_eps_clip)
-
-            policy_loss = -torch.min(ratio * advantage, clipped_ratio * advantage)
-
-            if use_delight_gating:
-                policy_loss = policy_loss * delight_gate
-
-            policy_loss = reduce(policy_loss, 'b t na -> b t', 'sum')
-
-            policy_loss = masked_mean(policy_loss, learn_mask)
+        policy_loss = masked_mean(policy_loss, learn_mask)
 
         # handle entropy loss for naive exploration bonus
 
