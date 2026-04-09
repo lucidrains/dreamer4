@@ -120,6 +120,7 @@ class Experience:
     agent_embed: MaybeTensor = None
     rewards: Tensor | None = None
     terminals: Tensor | None = None
+    continuation_probs: Tensor | None = None
     actions: Actions | None = None
     log_probs: Actions | None = None
     old_action_unembeds: tuple[MaybeTensor, MaybeTensor] | None = None
@@ -3053,6 +3054,13 @@ class DynamicsWorldModel(Module):
                 Rearrange('... 1 -> ...')
             )
 
+            # initialize output bias to predict non-terminal (sigmoid(-5) ≈ 0.007)
+            # prevents soft continuation from halving effective discount before the head is trained
+            terminal_mlp = self.to_state_terminal_pred[0]
+            terminal_output_linear = terminal_mlp.layers[-1][0]
+            if hasattr(terminal_output_linear, 'bias') and terminal_output_linear.bias is not None:
+                nn.init.constant_(terminal_output_linear.bias, -5.)
+
         # value head
 
         self.value_head = create_mlp(
@@ -3536,21 +3544,32 @@ class DynamicsWorldModel(Module):
 
         rewards = rewards.masked_fill(~learn_mask, 0.)
 
-        # build continuation masks for gae from terminals
+        # build continuation masks for gae
+        # use soft continuation probabilities from dreams (dreamerv3-style) when available,
+        # fall back to hard masks from terminals for real experience
 
-        if is_var_len:
-            continuation_masks = lens_to_mask((experience.lens - 1).clamp(min = 0), max_time).float()
+        if exists(experience.continuation_probs):
+            # dreamerv3-style: use learned continuation probability directly
+            continuation_masks = experience.continuation_probs
+
+            if is_var_len:
+                # zero out past episode length
+                len_mask = lens_to_mask((experience.lens - 1).clamp(min = 0), max_time).float()
+                continuation_masks = continuation_masks * len_mask
         else:
-            continuation_masks = F.pad(torch.ones_like(old_values[..., :-1]), (0, 1), value = 0.).float()
+            if is_var_len:
+                continuation_masks = lens_to_mask((experience.lens - 1).clamp(min = 0), max_time).float()
+            else:
+                continuation_masks = F.pad(torch.ones_like(old_values[..., :-1]), (0, 1), value = 0.).float()
 
-        if exists(experience.terminals):
-            terminals = experience.terminals
+            if exists(experience.terminals):
+                terminals = experience.terminals
 
-            if terminals.ndim == 1:
-                last_step = (experience.lens - 1).clamp(min = 0) if is_var_len else full((batch,), time - 1, device = self.device)
-                terminals = flags_to_sequence(terminals, last_step, time)
+                if terminals.ndim == 1:
+                    last_step = (experience.lens - 1).clamp(min = 0) if is_var_len else full((batch,), time - 1, device = self.device)
+                    terminals = flags_to_sequence(terminals, last_step, time)
 
-            continuation_masks.masked_fill_(terminals.bool(), 0.)
+                continuation_masks.masked_fill_(terminals.bool(), 0.)
 
         # calculate returns
 
@@ -3899,6 +3918,7 @@ class DynamicsWorldModel(Module):
 
         decoded_terminals = torch.zeros((batch_size,), device = self.device, dtype = torch.bool)
         decoded_lens = full((batch_size,), time_steps, device = self.device)
+        decoded_continuation_probs = None
 
         should_predict_terminals = return_terminals and self.predict_terminals
 
@@ -4055,6 +4075,11 @@ class DynamicsWorldModel(Module):
                 pooled_latent = reduce(denoised_latent, 'b t v n d -> b t d', 'mean')
                 state_terminal_logits = self.to_state_terminal_pred(pooled_latent)
 
+                # store soft continuation probability for dreamerv3-style return weighting
+                cont_prob = rearrange((-state_terminal_logits).sigmoid(), 'b 1 -> b 1')
+                decoded_continuation_probs = safe_cat((decoded_continuation_probs, cont_prob), dim = 1)
+
+                # still use bernoulli sampling for early stopping of generation
                 is_terminal = torch.bernoulli(state_terminal_logits.sigmoid()) == 1.
                 is_terminal = rearrange(is_terminal, 'b 1 -> b')
 
@@ -4204,6 +4229,7 @@ class DynamicsWorldModel(Module):
             lens = decoded_lens,
             is_truncated = is_truncated,
             terminals = decoded_terminals,
+            continuation_probs = decoded_continuation_probs,
             is_from_world_model = True
         )
 
