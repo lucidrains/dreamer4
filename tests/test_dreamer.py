@@ -1172,3 +1172,91 @@ def test_rac_like_tokenizer(steps):
         recon_video = model.decode(latents, height = height, width = width)
 
     assert recon_video.shape == (batch, channels, time, height, width)
+
+@param('use_time_rnn', (False, True))
+@param('use_causal_conv3d', (False, True))
+def test_e2e_sequential_parallel_cache(use_time_rnn, use_causal_conv3d):
+    import torch
+    from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
+
+    tokenizer = VideoTokenizer(
+        dim = 16,
+        dim_latent = 16,
+        patch_size = 32,
+        image_height = 64,
+        image_width = 64,
+        num_latent_tokens = 4,
+        encoder_depth = 2,
+        decoder_depth = 2,
+        time_block_every = 2,
+        attn_heads = 4,
+        attn_dim_head = 16,
+        use_causal_conv3d = use_causal_conv3d
+    ).eval()
+
+    dynamics = DynamicsWorldModel(
+        dim = 32,
+        dim_latent = tokenizer.dim_latent,
+        num_latent_tokens = tokenizer.num_latent_tokens,
+        num_discrete_actions = 2,
+        video_tokenizer = tokenizer,
+        depth = 1,
+        time_block_every = 1,
+        policy_head_mlp_depth = 2,
+        value_head_mlp_depth = 2,
+        attn_heads = 4,
+        attn_dim_head = 16,
+        use_time_rnn = use_time_rnn
+    ).eval()
+
+    video = torch.randn(1, 3, 4, 64, 64)
+    discrete_actions = torch.randint(0, 2, (1, 4, 1))
+
+    with torch.no_grad():
+        latents_parallel, tokenizer_cache_parallel = tokenizer(
+            video,
+            return_latents = True,
+            return_time_cache = True
+        )
+
+        step_sizes = torch.ones((1,))
+        signal_levels = torch.full((1, 4), dynamics.max_steps - 1)
+
+        _, (embeds_parallel, _) = dynamics(
+            latents = latents_parallel,
+            signal_levels = signal_levels,
+            step_sizes = step_sizes,
+            discrete_actions = discrete_actions,
+            return_pred_only = True,
+            return_intermediates = True
+        )
+
+        policy_embed_parallel = dynamics.policy_head(embeds_parallel.agent)
+
+        tokenizer_cache_sequential = dynamics_cache_sequential = None
+        policy_embed_sequential = []
+
+        for frame_idx in range(4):
+            latents_sequential, tokenizer_cache_sequential = tokenizer(
+                video[:, :, frame_idx],
+                return_latents = True,
+                time_cache = tokenizer_cache_sequential,
+                return_time_cache = True
+            )
+            seq_action = None if frame_idx == 0 else discrete_actions[:, frame_idx-1:frame_idx]
+
+            _, (intermediates_sequential, dynamics_cache_sequential) = dynamics(
+                latents = latents_sequential,
+                signal_levels = signal_levels[:, frame_idx:frame_idx+1],
+                step_sizes = step_sizes,
+                discrete_actions = seq_action,
+                time_cache = dynamics_cache_sequential,
+                return_pred_only = True,
+                return_intermediates = True
+            )
+
+            policy_embed_sequential.append(dynamics.policy_head(intermediates_sequential.agent))
+
+        policy_embed_sequential = torch.cat(policy_embed_sequential, dim = 1)
+
+    assert torch.allclose(policy_embed_parallel, policy_embed_sequential, atol = 1e-4)

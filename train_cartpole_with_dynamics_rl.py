@@ -1,0 +1,346 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "torch",
+#     "gymnasium[classic_control]",
+#     "tqdm",
+#     "ninja",
+#     "dreamer4",
+#     "fire",
+#     "wandb"
+# ]
+# [tool.uv.sources]
+# dreamer4 = { path = "." }
+# ///
+
+import fire
+from collections import deque
+from functools import partial
+
+import wandb
+
+import gymnasium as gym
+
+from tqdm import tqdm
+import numpy as np
+
+import torch
+from torch import nn, stack, tensor, is_tensor, zeros
+import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_sequence
+from torch.optim import AdamW
+pad_sequence = partial(pad_sequence, batch_first = True)
+
+from einops import rearrange, repeat
+from einops.layers.torch import Rearrange
+
+from accelerate import Accelerator
+
+from dreamer4.dreamer4 import (
+    DynamicsWorldModel,
+    Experience,
+    Actions,
+    divisible_by,
+    combine_experiences,
+    exists,
+    default,
+    cast_to_tensor,
+    VideoTokenizer
+)
+
+# env
+
+class ImageObservationWrapper(gym.ObservationWrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        
+    def observation(self, obs):
+        img_tensor = render_frame(self.env)
+        # render_frame returns (1, c, h, w), need to squeeze the batch dim for interact_with_env single env wrapper
+        from einops import rearrange
+        img_tensor = rearrange(img_tensor, '1 c h w -> c h w')
+        return dict(state = obs, image = img_tensor)
+
+def make_env(seed, use_image_input = False, vectorized = False, num_envs = 8):
+    env_kwargs = dict(render_mode = 'rgb_array') if use_image_input else dict()
+
+    if vectorized:
+        env = gym.make_vec('CartPole-v1', num_envs = num_envs, **env_kwargs)
+        env = gym.wrappers.vector.RecordEpisodeStatistics(env)
+    else:
+        env = gym.make('CartPole-v1', **env_kwargs)
+        env = gym.wrappers.RecordEpisodeStatistics(env)
+
+    if exists(seed):
+        env.action_space.seed(seed)
+    
+    if use_image_input:
+        if vectorized:
+            raise NotImplementedError('Image observation wrapper not yet implemented for vectorized environments here')
+        env = ImageObservationWrapper(env)
+        
+    return env
+
+# helper to grab and preprocess a rendered frame
+
+def render_frame(env):
+    img = env.render()
+    img = tensor(img, dtype = torch.float32, device = 'cpu')
+    img = rearrange(img, 'h w c -> 1 c h w')
+    img = F.interpolate(img, size = (64, 64), mode = 'bilinear', align_corners = False)
+    img = img / 255.0
+    return img
+
+# agent
+
+class TransformerPPOAgent(nn.Module):
+    def __init__(
+        self,
+        use_asym_critic = False,
+        agent_value_gradient_frac = 1.0,
+        agent_policy_gradient_frac = 1.0,
+        use_image_input = False
+    ):
+        super().__init__()
+        self.use_image_input = use_image_input
+
+        tokenizer = None
+        if use_image_input:
+            tokenizer = VideoTokenizer(
+                channels = 3,
+                patch_size = 8,
+                dim = 64,
+                dim_latent = 32,
+                num_latent_tokens = 2,
+                image_height = 64,
+                image_width = 64,
+                encoder_depth = 2,
+                decoder_depth = 2,
+                time_block_every = 2,
+                use_causal_conv3d = True
+            )
+
+        self.dynamics = DynamicsWorldModel(
+            video_tokenizer = tokenizer,
+            dim = 128,
+            dim_latent = 32,
+            dim_state = None if use_image_input else 4, 
+            num_latent_tokens = 2,
+            num_spatial_tokens = 4,
+            num_register_tokens = 1,
+            num_discrete_actions = 2,
+            use_time_rnn = False,
+            transformer_kwargs = dict(
+                use_attn_pool = False
+            ),
+            depth = 3,
+            time_block_every = 3,
+            policy_head_mlp_depth = 2,
+            value_head_mlp_depth = 2,
+            gae_discount_factor = 0.99,
+            ppo_eps_clip = 0.2,
+            agent_value_gradient_frac = agent_value_gradient_frac,
+            agent_policy_gradient_frac = agent_policy_gradient_frac,
+            normalize_advantages = True,
+            use_loss_normalization = False,
+            attn_heads = 4,
+            attn_dim_head = 16,
+            reward_encoder_kwargs = dict(reward_range = (-10., 10.)),
+            dim_critic_state = 4 if use_asym_critic else None
+        )
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    @property
+    def num_discrete_actions(self):
+        return self.dynamics.action_embedder.num_discrete_actions.sum().item()
+
+# experience processing
+
+def slice_experience(exp, idx):
+    slice_maybe = lambda t: t[idx] if is_tensor(t) else t
+
+    old_action_unembeds = tuple(slice_maybe(t) for t in exp.old_action_unembeds) if exists(exp.old_action_unembeds) else None
+
+    actions = Actions(slice_maybe(exp.actions.discrete), slice_maybe(exp.actions.continuous)) if exists(exp.actions) else None
+    log_probs = Actions(slice_maybe(exp.log_probs.discrete), slice_maybe(exp.log_probs.continuous)) if exists(exp.log_probs) else None
+
+    return Experience(
+        latents = slice_maybe(exp.latents),
+        video = slice_maybe(exp.video),
+        critic_state = slice_maybe(exp.critic_state),
+        rewards = slice_maybe(exp.rewards),
+        terminals = slice_maybe(exp.terminals),
+        actions = actions,
+        log_probs = log_probs,
+        old_action_unembeds = old_action_unembeds,
+        values = slice_maybe(exp.values),
+        step_size = slice_maybe(exp.step_size),
+        is_truncated = slice_maybe(exp.is_truncated),
+        lens = slice_maybe(exp.lens),
+        agent_index = slice_maybe(exp.agent_index),
+        is_from_world_model = slice_maybe(exp.is_from_world_model),
+        episode_return = slice_maybe(exp.episode_return)
+    )
+
+# training loop
+
+def main(
+    batch_size = 8,
+    grad_accum_every = 1,
+    update_episodes = 64,
+    update_epochs = 4,
+    num_episodes = 5000,
+    max_timesteps = 500,
+    learning_rate = 3e-4,
+    max_grad_norm = 0.5,
+    target_return = 70.0,
+    use_asym_critic = True,
+    max_policy_updates = 250,
+    agent_value_gradient_frac = 0.1,
+    agent_policy_gradient_frac = 0.1,
+    seed = 42,
+    use_wandb = False,
+    use_pmpo = False,
+    use_image_input = False,
+    vectorized = False,
+    num_envs = 8,
+    cpu = False
+):
+    torch.manual_seed(seed)
+    
+    if vectorized:
+        update_episodes = max(1, update_episodes // num_envs)
+
+    assert divisible_by(update_episodes, batch_size) if not vectorized else True
+
+    if use_image_input:
+        use_asym_critic = True
+
+    if use_wandb:
+        wandb.init(project = 'dreamer4-cartpole')
+
+    accelerator = Accelerator(
+        gradient_accumulation_steps = grad_accum_every,
+        cpu = cpu
+    )
+    device = accelerator.device
+
+    def log(msg):
+        accelerator.print(msg)
+
+    env = make_env(seed, use_image_input, vectorized=vectorized, num_envs=num_envs)
+
+    agent = TransformerPPOAgent(
+        use_asym_critic = use_asym_critic,
+        agent_value_gradient_frac = agent_value_gradient_frac,
+        agent_policy_gradient_frac = agent_policy_gradient_frac,
+        use_image_input = use_image_input
+    ).to(device)
+
+    optimizer = AdamW(agent.parameters(), lr = learning_rate)
+    agent, optimizer = accelerator.prepare(agent, optimizer)
+
+    # rollout state
+
+    recent_returns = deque(maxlen = 20)
+    memories = deque(maxlen = update_episodes)
+
+    pbar = tqdm(range(num_episodes), desc = 'episodes')
+    agent.eval()
+    num_policy_updates = 0
+
+    for episode in pbar:
+        # Use interact_with_env for standard collection
+
+        experience = agent.dynamics.interact_with_env(
+            env = env,
+            seed = seed if episode == 0 else None,
+            max_timesteps = max_timesteps,
+            env_is_vectorized = vectorized,
+            store_agent_embed = False,
+            store_old_action_unembeds = True
+        )
+
+        # calculate actual return
+        
+        episode_return = experience.episode_return.mean().item()
+        recent_returns.append(episode_return)
+
+        memories.append(experience)
+
+        avg_ret = np.mean(recent_returns) if len(recent_returns) > 0 else 0.0
+
+        if avg_ret >= target_return:
+            log(f'\n✅ Target average return of {target_return} reached! (avg={avg_ret:.1f}) Stopping training.')
+            break
+
+        loss_metrics = dict(average_return = f'{avg_ret:.1f}')
+
+        # P(M)PO update
+
+        if divisible_by(episode + 1, update_episodes):
+            agent.train()
+
+            exp_batch = combine_experiences(list(memories)).to(device)
+
+            total_envs = exp_batch.latents.shape[0] if exists(exp_batch.latents) else exp_batch.critic_state.shape[0]
+
+            epoch_policy_loss = 0.
+            epoch_value_loss = 0.
+
+            for _ in range(update_epochs):
+                batches = torch.randperm(total_envs, device = device).split(batch_size)
+
+                for i, batch_idx in enumerate(batches):
+                    micro = slice_experience(exp_batch, batch_idx)
+
+                    policy_loss, value_loss = agent.dynamics.learn_from_experience(
+                        experience = micro,
+                        only_learn_policy_value_heads = False,
+                        use_pmpo = use_pmpo
+                    )
+
+                    total_loss = (policy_loss + value_loss) / grad_accum_every
+                    accelerator.backward(total_loss)
+
+                    is_last_batch = (i + 1) == len(batches)
+
+                    if divisible_by(i + 1, grad_accum_every) or is_last_batch:
+                        accelerator.clip_grad_norm_(agent.parameters(), max_grad_norm)
+                        optimizer.step()
+                        optimizer.zero_grad()
+
+                    epoch_policy_loss += policy_loss.item() / len(batches)
+                    epoch_value_loss += value_loss.item() / len(batches)
+
+            avg_policy_loss = epoch_policy_loss / update_epochs
+            avg_value_loss = epoch_value_loss / update_epochs
+
+            loss_metrics.update(policy_loss = f'{avg_policy_loss:.3f}', value_loss = f'{avg_value_loss:.3f}')
+
+            if use_wandb:
+                wandb.log(dict(
+                    average_return = avg_ret,
+                    policy_loss = avg_policy_loss,
+                    value_loss = avg_value_loss
+                ))
+
+            num_policy_updates += 1
+            memories.clear()
+
+            if num_policy_updates >= max_policy_updates:
+                log(f'\nReached {num_policy_updates} PPO updates! Stopping training.')
+                break
+
+            agent.eval()
+
+        pbar.set_postfix(loss_metrics)
+
+    if use_wandb:
+        wandb.finish()
+
+if __name__ == '__main__':
+    fire.Fire(main)
