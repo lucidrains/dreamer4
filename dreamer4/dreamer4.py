@@ -2201,6 +2201,7 @@ class VideoTokenizer(Module):
         decorr_sample_frac = 0.25,
         use_loss_normalization = True,
         use_causal_conv3d = False,
+        use_time_rnn = False,
         causal_conv3d_kernel_size = 3,
         decoder_flow_steps = 1,
         decoder_v_space_loss = True,
@@ -2290,7 +2291,8 @@ class VideoTokenizer(Module):
             attn_kwargs = attn_kwargs,
             ff_kwargs = ff_kwargs,
             final_norm = True,
-            time_attention_use_pope = time_attention_use_pope
+            time_attention_use_pope = time_attention_use_pope,
+            rnn_time = use_time_rnn
         )
 
         # latents
@@ -2330,7 +2332,8 @@ class VideoTokenizer(Module):
             attn_kwargs = attn_kwargs,
             ff_kwargs = ff_kwargs,
             final_norm = True,
-            time_attention_use_pope = time_attention_use_pope
+            time_attention_use_pope = time_attention_use_pope,
+            rnn_time = use_time_rnn
         )
 
         # loss related
@@ -2525,7 +2528,8 @@ class VideoTokenizer(Module):
         return_intermediates = False,
         update_loss_ema = None,
         time_cache = None,
-        return_time_cache = False
+        return_time_cache = False,
+        time_lens = None
     ):
 
         # handle image pretraining
@@ -2668,7 +2672,17 @@ class VideoTokenizer(Module):
 
         # mse loss
 
-        recon_loss = F.mse_loss(pred, target)
+        if exists(time_lens):
+            if not is_tensor(time_lens):
+                time_lens = tensor(time_lens, device = device, dtype = torch.long)
+
+            recon_loss = F.mse_loss(pred, target, reduction = 'none')
+
+            mask = lens_to_mask(time_lens, time)
+            mask = rearrange(mask, 'b t -> b 1 t 1 1')
+            recon_loss = masked_mean(recon_loss, mask)
+        else:
+            recon_loss = F.mse_loss(pred, target)
 
         # losses
 

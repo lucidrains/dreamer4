@@ -99,7 +99,8 @@ class TransformerPPOAgent(nn.Module):
         use_asym_critic = False,
         agent_value_gradient_frac = 1.0,
         agent_policy_gradient_frac = 1.0,
-        use_image_input = False
+        use_image_input = False,
+        use_time_rnn = False
     ):
         super().__init__()
         self.use_image_input = use_image_input
@@ -117,7 +118,8 @@ class TransformerPPOAgent(nn.Module):
                 encoder_depth = 2,
                 decoder_depth = 2,
                 time_block_every = 2,
-                use_causal_conv3d = True
+                use_causal_conv3d = True,
+                use_time_rnn = use_time_rnn
             )
 
         self.dynamics = DynamicsWorldModel(
@@ -129,7 +131,7 @@ class TransformerPPOAgent(nn.Module):
             num_spatial_tokens = 4,
             num_register_tokens = 1,
             num_discrete_actions = 2,
-            use_time_rnn = False,
+            use_time_rnn = use_time_rnn,
             transformer_kwargs = dict(
                 use_attn_pool = False
             ),
@@ -207,7 +209,12 @@ def main(
     use_image_input = False,
     vectorized = False,
     num_envs = 8,
-    cpu = False
+    cpu = False,
+    use_time_rnn = False,
+    ssl_every_rl_updates = 2,
+    ssl_epochs = 1,
+    ssl_batch_size = 8,
+    tokenizer_learning_rate = 1e-4
 ):
     torch.manual_seed(seed)
     
@@ -237,10 +244,27 @@ def main(
         use_asym_critic = use_asym_critic,
         agent_value_gradient_frac = agent_value_gradient_frac,
         agent_policy_gradient_frac = agent_policy_gradient_frac,
-        use_image_input = use_image_input
+        use_image_input = use_image_input,
+        use_time_rnn = use_time_rnn
     ).to(device)
 
-    optimizer = AdamW(agent.parameters(), lr = learning_rate)
+    # separate optimizers
+
+    has_tokenizer = use_image_input and exists(agent.dynamics.video_tokenizer)
+    should_ssl = has_tokenizer and ssl_every_rl_updates > 0
+
+    if should_ssl:
+        tokenizer = agent.dynamics.video_tokenizer
+        tokenizer_params = set(tokenizer.parameters())
+        agent_params = [p for p in agent.parameters() if p not in tokenizer_params]
+        
+        tokenizer_optim = AdamW(tokenizer.parameters(), lr = tokenizer_learning_rate)
+        tokenizer_optim = accelerator.prepare(tokenizer_optim)
+    else:
+        agent_params = agent.parameters()
+        tokenizer_optim = None
+
+    optimizer = AdamW(agent_params, lr = learning_rate)
     agent, optimizer = accelerator.prepare(agent, optimizer)
 
     # rollout state
@@ -269,7 +293,7 @@ def main(
         episode_return = experience.episode_return.mean().item()
         recent_returns.append(episode_return)
 
-        memories.append(experience)
+        memories.append(experience.to('cpu'))
 
         avg_ret = np.mean(recent_returns) if len(recent_returns) > 0 else 0.0
 
@@ -279,12 +303,33 @@ def main(
 
         loss_metrics = dict(average_return = f'{avg_ret:.1f}')
 
+        # determine update schedule
+
+        is_rl_update = divisible_by(episode + 1, update_episodes)
+
+        if is_rl_update:
+            num_rl_updates = (episode + 1) // update_episodes
+            should_do_ssl_now = should_ssl and divisible_by(num_rl_updates - 1, ssl_every_rl_updates)
+        else:
+            should_do_ssl_now = False
+
         # P(M)PO update
 
-        if divisible_by(episode + 1, update_episodes):
+        ssl_video = None
+        ssl_lens = None
+
+        if is_rl_update:
             agent.train()
 
-            exp_batch = combine_experiences(list(memories)).to(device)
+            exp_batch = combine_experiences(list(memories))
+
+            # clone video for ssl before moving to device, to avoid double combine
+
+            if should_do_ssl_now and exists(exp_batch.video):
+                ssl_video = exp_batch.video.clone().to(device)
+                ssl_lens = exp_batch.lens.clone().to(device) if exists(exp_batch.lens) else None
+
+            exp_batch = exp_batch.to(device)
 
             total_envs = exp_batch.latents.shape[0] if exists(exp_batch.latents) else exp_batch.critic_state.shape[0]
 
@@ -334,6 +379,46 @@ def main(
             if num_policy_updates >= max_policy_updates:
                 log(f'\nReached {num_policy_updates} PPO updates! Stopping training.')
                 break
+
+            agent.eval()
+
+        # autoencoder ssl training
+
+        if should_do_ssl_now and exists(ssl_video):
+            agent.train()
+
+            total_recon_loss = 0.
+
+            for _ in range(ssl_epochs):
+                batches = torch.randperm(ssl_video.shape[0], device = device).split(ssl_batch_size)
+
+                for i, batch_indices in enumerate(batches):
+                    is_last_batch = (i + 1) == len(batches)
+                    batch_video = ssl_video[batch_indices]
+                    batch_lens = ssl_lens[batch_indices] if exists(ssl_lens) else None
+
+                    loss, (losses, _) = tokenizer(
+                        batch_video,
+                        time_lens = batch_lens,
+                        update_loss_ema = True,
+                        return_intermediates = True
+                    )
+
+                    loss = loss / grad_accum_every
+                    accelerator.backward(loss)
+
+                    if divisible_by(i + 1, grad_accum_every) or is_last_batch:
+                        accelerator.clip_grad_norm_(tokenizer.parameters(), max_grad_norm)
+                        tokenizer_optim.step()
+                        tokenizer_optim.zero_grad()
+
+                    total_recon_loss += losses.recon.item() / len(batches)
+
+            avg_recon_loss = total_recon_loss / ssl_epochs
+            loss_metrics.update(recon = f'{avg_recon_loss:.3f}')
+
+            if use_wandb:
+                wandb.log(dict(recon_loss = avg_recon_loss))
 
             agent.eval()
 

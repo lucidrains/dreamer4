@@ -558,7 +558,10 @@ def test_tokenizer_trainer():
             return 2
 
         def __getitem__(self, idx):
-            return torch.randn(3, 2, 64, 64)
+            return dict(
+                video = torch.randn(3, 2, 64, 64),
+                time_lens = 2
+            )
 
     dataset = MockDataset()
 
