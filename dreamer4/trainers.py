@@ -277,10 +277,14 @@ class VideoTokenizerTrainer(Module):
 
             for _ in range(self.grad_accum_every):
                 data = next(iter_train_dl)
-                video = data if is_tensor(data) else data['video']
+
+                is_dict = isinstance(data, dict)
+                video = data['video'] if is_dict else data
+                time_lens = data.get('time_lens') if is_dict else None
 
                 loss, (losses, recon_video) = self.model(
                     video,
+                    time_lens = time_lens,
                     update_loss_ema = True,
                     return_intermediates = True
                 )
