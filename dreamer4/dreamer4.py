@@ -4830,15 +4830,17 @@ class DynamicsWorldModel(Module):
 
             terminals_seq = terminals_seq.float()
 
-            # label smoothing trick from dreamerv3 - clamp targets to [1/H, 1 - 1/H] where H = 1 / (1 - γ)
+            # dreamerv3-style label smoothing: non-terminal targets → 1/H, terminal targets stay at 1.0
+            # only smooth the non-terminal class (min clamp), matching dreamerv3's asymmetric continuation targets
 
             eps = 1. - self.gae_discount_factor
-            terminals_seq = terminals_seq.clamp(min = eps, max = 1. - eps)
+            terminals_seq = terminals_seq.clamp(min = eps)
 
             state_terminal_losses = F.binary_cross_entropy_with_logits(state_terminal_pred, terminals_seq, reduction = 'none')
 
             if is_var_len:
-                state_terminal_loss = state_terminal_losses[loss_mask_without_last].mean()
+                valid_terminal_losses = state_terminal_losses[loss_mask_without_last]
+                state_terminal_loss = valid_terminal_losses.mean() if valid_terminal_losses.numel() > 0 else self.zero
             else:
                 state_terminal_loss = state_terminal_losses.mean()
 
