@@ -21,6 +21,10 @@ import wandb
 
 import gymnasium as gym
 
+from pathlib import Path
+import shutil
+from torchvision.utils import save_image
+
 from tqdm import tqdm
 import numpy as np
 
@@ -53,11 +57,9 @@ from dreamer4.dreamer4 import (
 class ImageObservationWrapper(gym.ObservationWrapper):
     def __init__(self, env):
         super().__init__(env)
-        
+
     def observation(self, obs):
         img_tensor = render_frame(self.env)
-        # render_frame returns (1, c, h, w), need to squeeze the batch dim for interact_with_env single env wrapper
-        from einops import rearrange
         img_tensor = rearrange(img_tensor, '1 c h w -> c h w')
         return dict(state = obs, image = img_tensor)
 
@@ -73,15 +75,15 @@ def make_env(seed, use_image_input = False, vectorized = False, num_envs = 8):
 
     if exists(seed):
         env.action_space.seed(seed)
-    
+
     if use_image_input:
         if vectorized:
-            raise NotImplementedError('Image observation wrapper not yet implemented for vectorized environments here')
+            raise NotImplementedError('Image observation wrapper not yet implemented for vectorized environments')
         env = ImageObservationWrapper(env)
-        
+
     return env
 
-# helper to grab and preprocess a rendered frame
+# helpers
 
 def render_frame(env):
     img = env.render()
@@ -119,14 +121,15 @@ class TransformerPPOAgent(nn.Module):
                 decoder_depth = 2,
                 time_block_every = 2,
                 use_causal_conv3d = True,
-                use_time_rnn = use_time_rnn
+                use_time_rnn = use_time_rnn,
+                use_loss_normalization = True
             )
 
         self.dynamics = DynamicsWorldModel(
             video_tokenizer = tokenizer,
             dim = 128,
             dim_latent = 32,
-            dim_state = None if use_image_input else 4, 
+            dim_state = None if use_image_input else 4,
             num_latent_tokens = 2,
             num_spatial_tokens = 4,
             num_register_tokens = 1,
@@ -192,7 +195,7 @@ def slice_experience(exp, idx):
 def main(
     batch_size = 8,
     grad_accum_every = 1,
-    update_episodes = 64,
+    update_episodes = 16,
     update_epochs = 4,
     num_episodes = 5000,
     max_timesteps = 500,
@@ -210,14 +213,16 @@ def main(
     vectorized = False,
     num_envs = 8,
     cpu = False,
-    use_time_rnn = False,
+    use_time_rnn = True,
     ssl_every_rl_updates = 2,
-    ssl_epochs = 1,
+    ssl_max_epochs = 25,
+    ssl_target_recon_loss = None,
     ssl_batch_size = 8,
+    ssl_max_memories = 64,
     tokenizer_learning_rate = 1e-4
 ):
     torch.manual_seed(seed)
-    
+
     if vectorized:
         update_episodes = max(1, update_episodes // num_envs)
 
@@ -233,10 +238,17 @@ def main(
         gradient_accumulation_steps = grad_accum_every,
         cpu = cpu
     )
+
     device = accelerator.device
 
     def log(msg):
         accelerator.print(msg)
+
+    results_folder = Path('./results')
+    shutil.rmtree(results_folder, ignore_errors=True)
+    results_folder.mkdir(exist_ok = True, parents = True)
+    
+    log(f'\nReconstruction grids will be saved directly to {results_folder.absolute()}\n')
 
     env = make_env(seed, use_image_input, vectorized=vectorized, num_envs=num_envs)
 
@@ -248,7 +260,7 @@ def main(
         use_time_rnn = use_time_rnn
     ).to(device)
 
-    # separate optimizers
+    # optimizers
 
     has_tokenizer = use_image_input and exists(agent.dynamics.video_tokenizer)
     should_ssl = has_tokenizer and ssl_every_rl_updates > 0
@@ -257,12 +269,11 @@ def main(
         tokenizer = agent.dynamics.video_tokenizer
         tokenizer_params = set(tokenizer.parameters())
         agent_params = [p for p in agent.parameters() if p not in tokenizer_params]
-        
+
         tokenizer_optim = AdamW(tokenizer.parameters(), lr = tokenizer_learning_rate)
         tokenizer_optim = accelerator.prepare(tokenizer_optim)
     else:
         agent_params = agent.parameters()
-        tokenizer_optim = None
 
     optimizer = AdamW(agent_params, lr = learning_rate)
     agent, optimizer = accelerator.prepare(agent, optimizer)
@@ -271,13 +282,15 @@ def main(
 
     recent_returns = deque(maxlen = 20)
     memories = deque(maxlen = update_episodes)
+    ssl_memories = deque(maxlen = ssl_max_memories) if should_ssl else None
 
     pbar = tqdm(range(num_episodes), desc = 'episodes')
     agent.eval()
     num_policy_updates = 0
 
     for episode in pbar:
-        # Use interact_with_env for standard collection
+
+        # collect experience
 
         experience = agent.dynamics.interact_with_env(
             env = env,
@@ -288,12 +301,19 @@ def main(
             store_old_action_unembeds = True
         )
 
-        # calculate actual return
-        
+        # track returns
+
         episode_return = experience.episode_return.mean().item()
         recent_returns.append(episode_return)
 
-        memories.append(experience.to('cpu'))
+        # store to replay buffers
+
+        cpu_experience = experience.to('cpu')
+
+        memories.append(cpu_experience)
+
+        if exists(ssl_memories):
+            ssl_memories.append(cpu_experience)
 
         avg_ret = np.mean(recent_returns) if len(recent_returns) > 0 else 0.0
 
@@ -313,23 +333,23 @@ def main(
         else:
             should_do_ssl_now = False
 
-        # P(M)PO update
+        # prepare ssl video from accumulated buffer
 
         ssl_video = None
         ssl_lens = None
 
+        if should_do_ssl_now:
+            ssl_exp_batch = combine_experiences(list(ssl_memories))
+            if exists(ssl_exp_batch.video):
+                ssl_video = ssl_exp_batch.video.clone().to(device)
+                ssl_lens = ssl_exp_batch.lens.clone().to(device) if exists(ssl_exp_batch.lens) else None
+
+        # rl update from most recent experiences
+
         if is_rl_update:
             agent.train()
 
-            exp_batch = combine_experiences(list(memories))
-
-            # clone video for ssl before moving to device, to avoid double combine
-
-            if should_do_ssl_now and exists(exp_batch.video):
-                ssl_video = exp_batch.video.clone().to(device)
-                ssl_lens = exp_batch.lens.clone().to(device) if exists(exp_batch.lens) else None
-
-            exp_batch = exp_batch.to(device)
+            exp_batch = combine_experiences(list(memories)).to(device)
 
             total_envs = exp_batch.latents.shape[0] if exists(exp_batch.latents) else exp_batch.critic_state.shape[0]
 
@@ -387,17 +407,20 @@ def main(
         if should_do_ssl_now and exists(ssl_video):
             agent.train()
 
-            total_recon_loss = 0.
+            epoch_recon_loss = 0.
 
-            for _ in range(ssl_epochs):
+            ssl_pbar = tqdm(range(ssl_max_epochs), desc = 'ssl epochs', leave = False)
+            for epoch in ssl_pbar:
                 batches = torch.randperm(ssl_video.shape[0], device = device).split(ssl_batch_size)
+                
+                epoch_recon_loss = 0.
 
                 for i, batch_indices in enumerate(batches):
                     is_last_batch = (i + 1) == len(batches)
                     batch_video = ssl_video[batch_indices]
                     batch_lens = ssl_lens[batch_indices] if exists(ssl_lens) else None
 
-                    loss, (losses, _) = tokenizer(
+                    loss, (losses, recon_video) = tokenizer(
                         batch_video,
                         time_lens = batch_lens,
                         update_loss_ema = True,
@@ -412,13 +435,37 @@ def main(
                         tokenizer_optim.step()
                         tokenizer_optim.zero_grad()
 
-                    total_recon_loss += losses.recon.item() / len(batches)
+                    epoch_recon_loss += losses.recon.item() / len(batches)
+                    
+                ssl_pbar.set_postfix(recon_loss = f'{epoch_recon_loss:.4f}')
+                    
+                if exists(ssl_target_recon_loss) and ssl_target_recon_loss > 0:
+                    if epoch_recon_loss <= ssl_target_recon_loss:
+                        log(f'\nSSL recon loss reached target {epoch_recon_loss:.4f} <= {ssl_target_recon_loss:.4f} at epoch {epoch + 1}! Stopping SSL early.')
+                        break
 
-            avg_recon_loss = total_recon_loss / ssl_epochs
+            avg_recon_loss = epoch_recon_loss
             loss_metrics.update(recon = f'{avg_recon_loss:.3f}')
 
             if use_wandb:
                 wandb.log(dict(recon_loss = avg_recon_loss))
+
+            with torch.no_grad():
+                agent.eval()
+                sample_video = ssl_video[:1]
+                sample_lens = ssl_lens[:1] if exists(ssl_lens) else None
+
+                _, (_, sample_recon) = tokenizer(
+                    sample_video,
+                    time_lens = sample_lens,
+                    mask_patches = False,
+                    return_intermediates = True
+                )
+
+                orig = rearrange(sample_video[0], 'c t h w -> t c h w')[:8]
+                recon = rearrange(sample_recon[0].clamp(0., 1.), 'c t h w -> t c h w')[:8]
+                grid = torch.cat((orig, recon), dim = 0)
+                save_image(grid, str(results_folder / f'recon_ep{episode}.png'), nrow = orig.shape[0])
 
             agent.eval()
 
