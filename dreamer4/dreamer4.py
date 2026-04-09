@@ -3617,7 +3617,7 @@ class DynamicsWorldModel(Module):
                     value_embed = value_embed + rearrange(critic_embed, 'batch dim -> batch 1 dim')
 
                 value_bins = self.value_head(value_embed)
-                bootstrap_value = self.reward_encoder.bins_to_scalar_value(value_bins)
+                bootstrap_value = self.value_encoder.bins_to_scalar_value(value_bins)
 
                 values = torch.cat((values, bootstrap_value), dim = 1)
                 rewards = torch.cat((rewards, torch.zeros_like(rewards[:, -1:])), dim = 1)
@@ -3961,7 +3961,7 @@ class DynamicsWorldModel(Module):
 
         value_loss = self.value_encoder.loss(value_logits, target_probs = return_probs)
 
-        if self.value_clip > 0.:
+        if self.clip_values and self.value_clip > 0.:
             values = self.value_encoder.bins_to_scalar_value(value_logits)
             clipped_values = old_values + (values - old_values).clamp(-self.value_clip, self.value_clip)
             clipped_value_logprobs = self.value_encoder.transform_to_logprobs(clipped_values)
