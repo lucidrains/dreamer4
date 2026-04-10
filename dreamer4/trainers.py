@@ -44,6 +44,17 @@ def default(v, d):
 def divisible_by(num, den):
     return (num % den) == 0
 
+def grad_norm(parameters):
+    sq_norm = 0.
+
+    for param in parameters:
+        if not exists(param.grad):
+            continue
+
+        sq_norm = sq_norm + param.grad.detach().float().pow(2).sum().item()
+
+    return sq_norm ** 0.5
+
 def video_tensor_to_gif(
     tensor,
     path,
@@ -855,7 +866,7 @@ class BehaviorCloneTrainer(Module):
         self.accelerator.end_training()
         self.print('training complete')
 
-# training from dreams
+# full dreamer loop - collect from env, train world model, dream, train policy
 
 class DreamTrainer(Module):
     def __init__(
@@ -1240,4 +1251,639 @@ class SimTrainer(Module):
 
             experiences.clear()
 
+        self.print('training complete')
+
+# full dreamer loop - collect from env, train world model, dream, train policy
+
+class DreamerTrainer(Module):
+    def __init__(
+        self,
+        model: DynamicsWorldModel,
+        optim_klass = AdamW,
+        batch_size = 16,
+        wm_max_frames_per_batch = 512,
+        learning_rate = 3e-4,
+        max_grad_norm = 0.5,
+        weight_decay = 0.,
+        dream_timesteps = 16,
+        dream_prompt_len = 1,
+        env_max_timesteps = 16,
+        wm_collect_frames = 2048,
+        dream_train_steps_per_collect = 16,
+        wm_only_steps = 0,
+        use_pmpo = True,
+        accelerate_kwargs: dict = dict(),
+        cpu = False,
+        use_tensorboard_logger = False,
+        log_dir: str | None = None,
+        project_name = 'dreamer4',
+        checkpoint_every = 1000,
+        checkpoint_folder = './checkpoints',
+        start_step = 0,
+        log_video_every = 50,
+    ):
+        super().__init__()
+
+        if use_tensorboard_logger:
+            accelerate_kwargs.update(log_with = 'tensorboard', project_dir = log_dir)
+
+        self.accelerator = Accelerator(
+            cpu = cpu,
+            **accelerate_kwargs
+        )
+
+        if use_tensorboard_logger:
+            self.accelerator.init_trackers(project_name)
+
+        self.model = model
+
+        # world model optimizer
+        # keep the policy/action parameters here because the autoregressive action loss trains them
+        # exclude only the value head, which is optimized purely from RL targets
+
+        optim_kwargs = dict(lr = learning_rate, weight_decay = weight_decay)
+
+        value_head_params = set(model.value_head_parameters())
+        model_params = [p for p in model.parameters() if p not in value_head_params]
+        muon_params = list(model.muon_parameters()) if hasattr(model, 'muon_parameters') else []
+
+        if optim_klass is MuonAdamAtan2:
+            self.world_model_optim = MuonAdamAtan2(muon_params, model_params, **optim_kwargs)
+        else:
+            self.world_model_optim = optim_klass(model_params, **optim_kwargs)
+
+        # policy/value optimizers (separate param groups)
+
+        self.policy_head_optim = optim_klass(model.policy_head_parameters(), **optim_kwargs)
+        self.value_head_optim = optim_klass(model.value_head_parameters(), **optim_kwargs)
+
+        self.max_grad_norm = max_grad_norm
+        self.batch_size = batch_size
+        self.wm_max_frames_per_batch = wm_max_frames_per_batch
+        self.dream_timesteps = dream_timesteps
+        self.dream_prompt_len = dream_prompt_len
+        self.env_max_timesteps = env_max_timesteps
+        self.wm_collect_frames = wm_collect_frames
+        self.dream_train_steps_per_collect = dream_train_steps_per_collect
+        self.wm_only_steps = wm_only_steps
+        self.use_pmpo = use_pmpo
+
+        self.checkpoint_every = checkpoint_every
+        self.checkpoint_folder = Path(checkpoint_folder)
+        self.checkpoint_folder.mkdir(exist_ok = True, parents = True)
+
+        self.log_video_every = log_video_every
+        self.results_folder = Path(checkpoint_folder).parent / 'results'
+        self.results_folder.mkdir(exist_ok = True, parents = True)
+
+        self.register_buffer('step', tensor(start_step))
+
+        (
+            self.model,
+            self.world_model_optim,
+            self.policy_head_optim,
+            self.value_head_optim,
+        ) = self.accelerator.prepare(
+            self.model,
+            self.world_model_optim,
+            self.policy_head_optim,
+            self.value_head_optim
+        )
+
+    @property
+    def device(self):
+        return self.accelerator.device
+
+    @property
+    def unwrapped_model(self):
+        return self.accelerator.unwrap_model(self.model)
+
+    @property
+    def is_main_process(self):
+        return self.accelerator.is_main_process
+
+    def print(self, *args, **kwargs):
+        return self.accelerator.print(*args, **kwargs)
+
+    def log(self, **data):
+        self.accelerator.log(data, step = self.step.item())
+
+    def save_checkpoint(self):
+        import pickle
+        from torch_einops_utils.save_load import dehydrate_config
+
+        ckpt_path = self.checkpoint_folder / f'dreamer-{self.step.item()}.pt'
+
+        model = self.unwrapped_model
+        config = getattr(model, '_config', None)
+
+        pkg = dict(
+            model = model.state_dict(),
+            config = pickle.dumps(dehydrate_config(config, '_config')) if config else None,
+            step = self.step.item()
+        )
+        torch.save(pkg, str(ckpt_path))
+        self.print(f"checkpoint saved to {ckpt_path}")
+
+    def _slice_experience(self, experience: Experience, indices):
+        """Slice an experience along the batch dimension, trimming bootstrap padding to match video length."""
+        video = experience.video[indices]
+        time = video.shape[2]  # video is (b, c, t, h, w)
+        rewards = experience.rewards[indices][..., :time] if exists(experience.rewards) else None
+        terminals = experience.terminals[indices] if exists(experience.terminals) else None
+        discrete_actions = experience.actions[0][indices][:, :time] if exists(experience.actions[0]) else None
+        continuous_actions = experience.actions[1][indices][:, :time] if exists(experience.actions[1]) else None
+        lens = experience.lens[indices] if exists(experience.lens) else None
+
+        # clamp lens to video length (bootstrap may have incremented them)
+        if exists(lens):
+            lens = lens.clamp(max = time)
+
+        return video, rewards, terminals, discrete_actions, continuous_actions, lens
+
+    def _transition_lens(self, experience: Experience):
+        if exists(experience.latents):
+            payload = experience.latents
+            seq_len = payload.shape[1]
+        else:
+            payload = experience.video
+            seq_len = payload.shape[2]
+
+        lens = default(experience.lens, torch.full((payload.shape[0],), seq_len, device = self.device))
+
+        transition_lens = lens.clone()
+
+        if exists(experience.rewards):
+            transition_lens = transition_lens.clamp(max = experience.rewards.shape[1])
+
+        if exists(experience.actions):
+            discrete_actions, continuous_actions = experience.actions
+
+            if exists(discrete_actions):
+                transition_lens = transition_lens.clamp(max = discrete_actions.shape[1])
+
+            if exists(continuous_actions):
+                transition_lens = transition_lens.clamp(max = continuous_actions.shape[1])
+
+        return transition_lens
+
+    def _make_frame_batches(self, lens, max_frames):
+        """Group episodes into batches respecting a frame budget. Returns list of index tensors."""
+        # sort by length so similar-length episodes pack together (less padding waste)
+        sorted_indices = lens.argsort()
+        batches = []
+        current_batch = []
+        current_max_len = 0
+
+        for idx in sorted_indices:
+            ep_len = lens[idx].item()
+            new_max_len = max(current_max_len, ep_len)
+            new_frames = new_max_len * (len(current_batch) + 1)
+
+            if current_batch and new_frames > max_frames:
+                batches.append(torch.tensor(current_batch, device = lens.device))
+                current_batch = [idx.item()]
+                current_max_len = ep_len
+            else:
+                current_batch.append(idx.item())
+                current_max_len = new_max_len
+
+        if current_batch:
+            batches.append(torch.tensor(current_batch, device = lens.device))
+
+        return batches
+
+    def train_world_model(self, experience: Experience):
+        """Train world model on collected experience for 1 epoch with frame-budget batching."""
+
+        ep_lens = experience.lens if exists(experience.lens) else torch.full((experience.video.shape[0],), experience.video.shape[2], device = self.device)
+        batches = self._make_frame_batches(ep_lens, self.wm_max_frames_per_batch)
+
+        # shuffle batch order
+        batch_order = torch.randperm(len(batches))
+
+        wm_loss_breakdown = None
+        total_loss = 0.
+        num_batches = 0
+
+        for bi in batch_order:
+            batch_indices = batches[bi]
+            video, rewards, terminals, discrete_actions, continuous_actions, lens = self._slice_experience(experience, batch_indices)
+
+            loss, losses = self.model(
+                video = video,
+                rewards = rewards,
+                terminals = terminals,
+                discrete_actions = discrete_actions,
+                continuous_actions = continuous_actions,
+                lens = lens,
+                return_all_losses = True,
+            )
+
+            wm_loss_breakdown = dict(
+                flow_loss = losses.flow.item(),
+                shortcut_loss = losses.shortcut.item(),
+                reward_loss = losses.rewards.sum().item(),
+                terminal_loss = losses.terminals.sum().item(),
+                **getattr(self.unwrapped_model, '_cont_diagnostics', {}),
+                discrete_action_loss = losses.discrete_actions.sum().item(),
+                continuous_action_loss = losses.continuous_actions.sum().item(),
+                state_pred_loss = losses.state_pred.item(),
+                agent_state_pred_loss = losses.agent_state_pred.item(),
+                latent_ar_loss = losses.latent_ar.item(),
+                latent_ar_sigreg_loss = losses.latent_ar_sigreg.item(),
+            )
+
+            self.accelerator.backward(loss)
+
+            if exists(self.max_grad_norm):
+                self.accelerator.clip_grad_norm_(self.unwrapped_model.parameters(), self.max_grad_norm)
+
+            self.world_model_optim.step()
+            self.world_model_optim.zero_grad()
+            self.policy_head_optim.zero_grad()
+            self.value_head_optim.zero_grad()
+
+            total_loss += loss.item()
+            num_batches += 1
+
+        avg_loss = total_loss / max(num_batches, 1)
+
+        return tensor(avg_loss, device = self.device), wm_loss_breakdown
+
+    def _sample_dream_prompts(self, experience: Experience):
+        return self._sample_dream_prompts_with_metadata(experience)[0]
+
+    def _sample_dream_prompts_with_metadata(self, experience: Experience):
+        if self.dream_prompt_len <= 0:
+            return {}, None
+
+        latents = experience.latents
+        lens = self._transition_lens(experience)
+
+        if not exists(latents) or not exists(lens):
+            return {}, None
+
+        valid_episode_mask = lens >= self.dream_prompt_len
+
+        if not valid_episode_mask.any():
+            return {}, None
+
+        valid_episode_indices = valid_episode_mask.nonzero(as_tuple = True)[0]
+        sampled_episode_indices = valid_episode_indices[torch.randint(len(valid_episode_indices), (self.batch_size,), device = latents.device)]
+
+        sampled_lens = lens[sampled_episode_indices]
+        max_start = sampled_lens - self.dream_prompt_len
+        start_offsets = (torch.rand((self.batch_size,), device = latents.device) * (max_start + 1).float()).floor().long()
+        time_offsets = torch.arange(self.dream_prompt_len, device = latents.device)
+        time_indices = start_offsets[:, None] + time_offsets
+
+        prompt_kwargs = dict(
+            prompt_latents = latents[sampled_episode_indices[:, None], time_indices]
+        )
+
+        if exists(experience.proprio):
+            prompt_kwargs['prompt_proprio'] = experience.proprio[sampled_episode_indices[:, None], time_indices]
+
+        if exists(experience.rewards):
+            prompt_kwargs['prompt_rewards'] = experience.rewards[sampled_episode_indices[:, None], time_indices]
+
+        if exists(experience.actions):
+            discrete_actions, continuous_actions = experience.actions
+
+            if exists(discrete_actions):
+                prompt_kwargs['prompt_discrete_actions'] = discrete_actions[sampled_episode_indices[:, None], time_indices]
+
+            if exists(continuous_actions):
+                prompt_kwargs['prompt_continuous_actions'] = continuous_actions[sampled_episode_indices[:, None], time_indices]
+
+        prompt_metadata = dict(
+            episode_indices = sampled_episode_indices,
+            start_offsets = start_offsets,
+            prompt_len = self.dream_prompt_len
+        )
+
+        return prompt_kwargs, prompt_metadata
+
+    @torch.no_grad()
+    def _compute_dream_alignment_diagnostics(
+        self,
+        experience: Experience,
+        dreams: Experience,
+        prompt_metadata: dict | None
+    ):
+        if (
+            not exists(prompt_metadata) or
+            not exists(experience.rewards) or
+            not exists(experience.lens) or
+            not exists(dreams.rewards) or
+            not exists(dreams.lens)
+        ):
+            return {}
+
+        episode_indices = prompt_metadata['episode_indices']
+        start_offsets = prompt_metadata['start_offsets']
+        prompt_len = prompt_metadata['prompt_len']
+        transition_lens = self._transition_lens(experience)
+
+        real_start = start_offsets + prompt_len
+        real_remaining = (transition_lens[episode_indices] - real_start).clamp(min = 0)
+        dream_learnable_lens = (dreams.lens - dreams.is_truncated.long()).clamp(min = 0)
+
+        diagnostics = dict(
+            dream_rollout_len_mean = dream_learnable_lens.float().mean().item(),
+            real_future_len_mean = real_remaining.float().mean().item(),
+            dream_rollout_len_minus_real_future_len = (dream_learnable_lens.float() - real_remaining.float()).mean().item(),
+            dream_real_len_mae = (dream_learnable_lens.float() - real_remaining.float()).abs().mean().item(),
+        )
+
+        compare_horizon = min(dreams.rewards.shape[1], experience.rewards.shape[1])
+
+        if compare_horizon <= 0:
+            return diagnostics
+
+        device = dreams.rewards.device
+        time_offsets = torch.arange(compare_horizon, device = device)
+        future_time = real_start[:, None] + time_offsets
+        clamped_future_time = future_time.clamp(max = experience.rewards.shape[1] - 1)
+
+        real_future_rewards = experience.rewards[episode_indices[:, None], clamped_future_time]
+        dream_future_rewards = dreams.rewards[:, :compare_horizon]
+
+        real_mask = time_offsets < real_remaining[:, None]
+        dream_mask = time_offsets < dream_learnable_lens[:, None]
+        shared_mask = real_mask & dream_mask
+
+        diagnostics['dream_shared_horizon_mean'] = shared_mask.sum(dim = -1).float().mean().item()
+
+        if shared_mask.any():
+            gamma = self.unwrapped_model.gae_discount_factor
+            discount = torch.full((compare_horizon,), gamma, device = device).pow(time_offsets)
+
+            masked_real_rewards = real_future_rewards.masked_fill(~shared_mask, 0.)
+            masked_dream_rewards = dream_future_rewards.masked_fill(~shared_mask, 0.)
+
+            real_reward_sums = masked_real_rewards.sum(dim = -1)
+            dream_reward_sums = masked_dream_rewards.sum(dim = -1)
+
+            real_discounted_returns = (masked_real_rewards * discount).sum(dim = -1)
+            dream_discounted_returns = (masked_dream_rewards * discount).sum(dim = -1)
+
+            diagnostics.update(
+                dream_reward_sum_mean = dream_reward_sums.mean().item(),
+                real_reward_sum_mean = real_reward_sums.mean().item(),
+                dream_minus_real_reward_sum = (dream_reward_sums - real_reward_sums).mean().item(),
+                dream_real_reward_sum_mae = (dream_reward_sums - real_reward_sums).abs().mean().item(),
+                dream_discounted_return_mean = dream_discounted_returns.mean().item(),
+                real_discounted_return_mean = real_discounted_returns.mean().item(),
+                dream_minus_real_discounted_return = (dream_discounted_returns - real_discounted_returns).mean().item(),
+                dream_real_discounted_return_mae = (dream_discounted_returns - real_discounted_returns).abs().mean().item(),
+            )
+
+            if exists(dreams.values):
+                diagnostics.update(
+                    dream_value0_mean = dreams.values[:, 0].mean().item(),
+                    dream_value0_dream_return_mae = (dreams.values[:, 0] - dream_discounted_returns).abs().mean().item(),
+                    dream_value0_real_return_mae = (dreams.values[:, 0] - real_discounted_returns).abs().mean().item(),
+                )
+
+        if exists(dreams.continuation_probs):
+            is_truncated = default(experience.is_truncated, torch.ones_like(experience.lens, dtype = torch.bool))
+            known_terminal_mask = ~is_truncated[episode_indices].bool()
+
+            if known_terminal_mask.any():
+                continuation_probs = dreams.continuation_probs.clamp(0., 1.)
+
+                for horizon in (5, 10, 20):
+                    if horizon > continuation_probs.shape[1]:
+                        continue
+
+                    horizon_offsets = time_offsets[:horizon]
+                    horizon_valid = horizon_offsets < dream_learnable_lens[:, None]
+                    horizon_cont = continuation_probs[:, :horizon].masked_fill(~horizon_valid, 1.)
+                    dream_terminal_prob = 1. - horizon_cont.prod(dim = -1)
+
+                    real_terminal_by_horizon = (real_remaining <= horizon).float()
+
+                    masked_pred = dream_terminal_prob[known_terminal_mask]
+                    masked_real = real_terminal_by_horizon[known_terminal_mask]
+
+                    diagnostics.update(
+                        {f'dream_terminal_prob_h{horizon}_mean': masked_pred.mean().item()},
+                        **{f'real_terminal_rate_h{horizon}': masked_real.mean().item()},
+                        **{f'dream_terminal_overconfidence_h{horizon}': (masked_pred - masked_real).mean().item()},
+                        **{f'dream_terminal_brier_h{horizon}': ((masked_pred - masked_real) ** 2).mean().item()},
+                    )
+
+        return diagnostics
+
+    def train_policy_from_dreams(self, experience: Experience):
+        """Generate dream rollouts and train policy/value heads."""
+
+        prompt_kwargs, prompt_metadata = self._sample_dream_prompts_with_metadata(experience)
+        prompt_len = self.dream_prompt_len if 'prompt_latents' in prompt_kwargs else 0
+        dream_time_steps = self.dream_timesteps + 1 + prompt_len
+        dream_alignment_diagnostics = {}
+
+        for _ in range(self.dream_train_steps_per_collect):
+            dreams = self.unwrapped_model.generate(
+                dream_time_steps,
+                batch_size = self.batch_size,
+                return_for_policy_optimization = True,
+                return_decoded_video = False,
+                drop_prompt_from_experience = True,
+                **prompt_kwargs,
+            )
+
+            dream_alignment_diagnostics = self._compute_dream_alignment_diagnostics(experience, dreams, prompt_metadata)
+            policy_loss, value_loss = self.model.learn_from_experience(dreams, use_pmpo = self.use_pmpo)
+
+            self.accelerator.backward(policy_loss)
+
+            policy_grad_norm = grad_norm(self.model.policy_head_parameters())
+
+            self.unwrapped_model._rl_diagnostics.update(
+                policy_grad_norm = policy_grad_norm
+            )
+
+            if exists(self.max_grad_norm):
+                self.accelerator.clip_grad_norm_(self.model.policy_head_parameters(), self.max_grad_norm)
+
+            self.policy_head_optim.step()
+            self.policy_head_optim.zero_grad()
+
+            self.accelerator.backward(value_loss)
+
+            if exists(self.max_grad_norm):
+                self.accelerator.clip_grad_norm_(self.model.value_head_parameters(), self.max_grad_norm)
+
+            self.value_head_optim.step()
+            self.value_head_optim.zero_grad()
+
+        return policy_loss, value_loss, dream_alignment_diagnostics
+
+    @torch.no_grad()
+    def save_visualizations(self, env, env_is_vectorized = False):
+        """Save dream rollout and policy episode GIFs to results folder."""
+        step = self.step.item()
+        model = self.unwrapped_model
+        was_training = model.training
+        model.eval()
+
+        # dream rollout
+        try:
+            dreams = model.generate(
+                self.dream_timesteps + 1,
+                batch_size = 1,
+                return_decoded_video = True,
+                return_rewards_per_frame = True,
+                return_agent_actions = True,
+            )
+
+            if exists(dreams.video):
+                dream_video = dreams.video.clamp(0., 1.)
+                gif_path = self.results_folder / f'dream-{step}.gif'
+                save_video_grid_as_gif(dream_video, gif_path)
+        except Exception as e:
+            self.print(f'warning: dream visualization failed: {e}')
+
+        # policy episode in real env
+        try:
+            experience = model.interact_with_env(
+                env,
+                max_timesteps = min(self.env_max_timesteps, 200),
+                env_is_vectorized = env_is_vectorized,
+            )
+
+            video = experience.video[:1].clamp(0., 1.)  # first env only
+            ep_len = experience.lens[0].item() if exists(experience.lens) else video.shape[2]
+            video = video[:, :, :ep_len]
+
+            gif_path = self.results_folder / f'policy-{step}.gif'
+            save_video_grid_as_gif(video, gif_path)
+        except Exception as e:
+            self.print(f'warning: policy visualization failed: {e}')
+
+        if was_training:
+            model.train()
+
+    def forward(
+        self,
+        env,
+        num_episodes = 5000,
+        max_steps: int | None = None,
+        env_is_vectorized = False,
+    ):
+        pbar = tqdm(range(num_episodes), disable = not self.is_main_process)
+
+        for _ in pbar:
+
+            # 1. collect experience from env until we have enough frames
+
+            experiences = []
+            total_frames = 0
+
+            while total_frames < self.wm_collect_frames:
+                experience = self.unwrapped_model.interact_with_env(
+                    env,
+                    max_timesteps = self.env_max_timesteps,
+                    env_is_vectorized = env_is_vectorized,
+                    store_final_observation = True
+                )
+
+                num_frames = experience.video.shape[0] * experience.video.shape[2]  # batch * time
+                total_frames += num_frames
+                experiences.append(experience.cpu())
+
+            combined = combine_experiences(experiences)
+            combined = combined.to(self.device)
+
+            # log episode stats
+
+            # mask rewards by episode length to get true episode reward
+            if exists(combined.lens):
+                reward_mask = torch.arange(combined.rewards.shape[-1], device = self.device).unsqueeze(0) < combined.lens.unsqueeze(-1)
+                ep_reward = (combined.rewards * reward_mask).sum(dim = -1).mean().item()
+            else:
+                ep_reward = combined.rewards.sum(dim = -1).mean().item()
+
+            ep_length = self._transition_lens(combined).float().mean().item()
+
+            experiences.clear()
+
+            # 2. train world model on collected experience
+
+            wm_loss, wm_loss_breakdown = self.train_world_model(combined)
+
+            # 3. train policy/value from dream rollouts (skip during WM warmup)
+
+            if self.step.item() >= self.wm_only_steps:
+                policy_loss, value_loss, dream_alignment_diagnostics = self.train_policy_from_dreams(combined)
+            else:
+                policy_loss = value_loss = tensor(0., device = self.device)
+                dream_alignment_diagnostics = {}
+
+            # logging
+
+            log_data = dict(
+                world_model_loss = wm_loss.item(),
+                policy_loss = policy_loss.item(),
+                value_loss = value_loss.item(),
+                episode_reward = ep_reward,
+                episode_length = ep_length,
+                collected_frames = total_frames,
+                wm_batch_count = combined.video.shape[0],
+            )
+
+            if exists(wm_loss_breakdown):
+                log_data.update(wm_loss_breakdown)
+
+            log_data.update(getattr(self.unwrapped_model, '_rl_diagnostics', {}))
+            log_data.update(dream_alignment_diagnostics)
+
+            self.log(**log_data)
+
+            postfix = OrderedDict(
+                wm = f"{wm_loss.item():.4f}",
+                policy = f"{policy_loss.item():.4f}",
+                value = f"{value_loss.item():.4f}",
+                reward = f"{ep_reward:.1f}",
+            )
+
+            if exists(wm_loss_breakdown):
+                if wm_loss_breakdown['flow_loss'] > 0.:
+                    postfix['flow'] = f"{wm_loss_breakdown['flow_loss']:.4f}"
+
+                if wm_loss_breakdown['reward_loss'] > 0.:
+                    postfix['wm_reward'] = f"{wm_loss_breakdown['reward_loss']:.4f}"
+
+                if wm_loss_breakdown['discrete_action_loss'] > 0.:
+                    postfix['disc_act'] = f"{wm_loss_breakdown['discrete_action_loss']:.4f}"
+
+                if wm_loss_breakdown['continuous_action_loss'] > 0.:
+                    postfix['cont_act'] = f"{wm_loss_breakdown['continuous_action_loss']:.4f}"
+
+            if 'dream_real_discounted_return_mae' in dream_alignment_diagnostics:
+                postfix['dream_ret_gap'] = f"{dream_alignment_diagnostics['dream_real_discounted_return_mae']:.2f}"
+
+            if 'dream_rollout_len_minus_real_future_len' in dream_alignment_diagnostics:
+                postfix['dream_len_bias'] = f"{dream_alignment_diagnostics['dream_rollout_len_minus_real_future_len']:.2f}"
+
+            if 'dream_terminal_overconfidence_h5' in dream_alignment_diagnostics:
+                postfix['term_bias5'] = f"{dream_alignment_diagnostics['dream_terminal_overconfidence_h5']:.2f}"
+
+            pbar.set_postfix(ordered_dict = postfix)
+
+            if self.log_video_every > 0 and self.is_main_process and divisible_by(self.step.item(), self.log_video_every):
+                self.save_visualizations(env, env_is_vectorized)
+
+            self.step += 1
+
+            if self.checkpoint_every > 0 and self.is_main_process and divisible_by(self.step.item(), self.checkpoint_every):
+                self.save_checkpoint()
+
+            if exists(max_steps) and self.step.item() >= max_steps:
+                break
+
+        self.accelerator.end_training()
         self.print('training complete')

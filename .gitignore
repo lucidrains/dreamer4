@@ -214,3 +214,5 @@ __marimo__/
 # Tokenizer training
 results_mnist_tokenizer/
 checkpoints_mnist_tokenizer/
+
+runs/

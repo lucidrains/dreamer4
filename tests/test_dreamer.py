@@ -1,5 +1,6 @@
 import pytest
 param = pytest.mark.parametrize
+import numpy as np
 import torch
 
 def exists(v):
@@ -164,25 +165,60 @@ def test_e2e(
         rewards = rewards
     )
 
-def test_symexp_two_hot():
+def test_symexp_hl_gauss():
     import torch
-    from dreamer4.dreamer4 import SymExpTwoHot
+    from dreamer4.dreamer4 import SymExpHLGauss
 
-    two_hot_encoder = SymExpTwoHot(
+    encoder = SymExpHLGauss(
         (-3., 3.),
-        num_bins = 20,
+        num_bins = 255,
         learned_embedding = True,
         dim_embed = 512
     )
 
     values = torch.randn((10))
 
-    two_hot_encoded = two_hot_encoder(values)
-    recon_values = two_hot_encoder.bins_to_scalar_value(two_hot_encoded)
+    # test encode -> decode round trip via logits
+    target_probs = encoder.target_probs(values)
+    recon_values = encoder.bins_to_scalar_value(target_probs.log())
 
-    assert torch.allclose(recon_values, values, atol = 1e-6)
+    assert torch.allclose(recon_values, values, atol = 1e-1)
 
-    reward_embeds = two_hot_encoder.embed(two_hot_encoded)
+    # test loss
+    logits = torch.randn(10, 255)
+    loss = encoder.loss(logits, values)
+    assert loss.shape == (10,)
+
+    # test embedding
+    reward_embeds = encoder.embed(target_probs)
+    assert reward_embeds.shape == (10, 512)
+
+def test_symexp_two_hot():
+    import torch
+    from dreamer4.dreamer4 import SymExpTwoHot
+
+    encoder = SymExpTwoHot(
+        (-3., 3.),
+        num_bins = 255,
+        learned_embedding = True,
+        dim_embed = 512
+    )
+
+    values = torch.randn((10))
+
+    # test encode -> decode round trip
+    target_probs = encoder.target_probs(values)
+    recon_values = encoder.bins_to_scalar_value(target_probs.log())
+
+    assert torch.allclose(recon_values, values, atol = 1e-4)
+
+    # test loss
+    logits = torch.randn(10, 255)
+    loss = encoder.loss(logits, values)
+    assert loss.shape == (10,)
+
+    # test embedding
+    reward_embeds = encoder.embed(target_probs)
     assert reward_embeds.shape == (10, 512)
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = 'no cuda')
@@ -281,7 +317,15 @@ def test_action_with_world_model():
 
     # take a reinforcement learning step
 
-    actor_loss, critic_loss = dynamics.learn_from_experience(gen)
+    actor_loss, critic_loss = dynamics.learn_from_experience(gen, use_pmpo = False)
+
+    for key in (
+        'policy_entropy_mean',
+        'ppo_ratio_mean',
+        'ppo_approx_kl',
+        'ppo_clipfrac',
+    ):
+        assert key in dynamics._rl_diagnostics
 
     actor_loss.backward(retain_graph = True)
     critic_loss.backward()
@@ -658,6 +702,185 @@ def test_dream_trainer():
 
     dream_trainer()
 
+def test_world_model_training_accepts_final_observation_sequences():
+    from dreamer4.dreamer4 import DynamicsWorldModel
+
+    world_model = DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 16,
+        max_steps = 64,
+        num_latent_tokens = 1,
+        depth = 2,
+        time_block_every = 1,
+        num_spatial_tokens = 1,
+        pred_orig_latent = True,
+        num_discrete_actions = 4,
+        attn_dim_head = 16,
+        predict_terminals = True
+    )
+
+    latents = torch.randn(2, 5, 1, 16)
+    rewards = torch.randn(2, 4)
+    discrete_actions = torch.randint(0, 4, (2, 4, 1))
+    terminals = torch.tensor([True, False])
+    lens = torch.tensor([5, 5])
+
+    loss, losses = world_model(
+        latents = latents,
+        rewards = rewards,
+        terminals = terminals,
+        discrete_actions = discrete_actions,
+        lens = lens,
+        return_all_losses = True,
+    )
+
+    assert loss.numel() == 1
+    assert losses.rewards.numel() > 0
+
+def test_dreamer_trainer_alignment_diagnostics():
+    from dreamer4.dreamer4 import DynamicsWorldModel, Experience, Actions
+    from dreamer4.trainers import DreamerTrainer
+
+    world_model = DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 16,
+        max_steps = 64,
+        num_latent_tokens = 1,
+        depth = 2,
+        time_block_every = 1,
+        num_spatial_tokens = 1,
+        pred_orig_latent = True,
+        num_discrete_actions = 4,
+        attn_dim_head = 16,
+        predict_terminals = True
+    )
+
+    trainer = DreamerTrainer(
+        world_model,
+        batch_size = 2,
+        dream_timesteps = 4,
+        dream_prompt_len = 2,
+        cpu = True
+    )
+
+    experience = Experience(
+        latents = torch.randn(2, 7, 1, 16),
+        rewards = torch.randn(2, 6),
+        actions = Actions(torch.randint(0, 4, (2, 6, 1)), None),
+        lens = torch.tensor([7, 7]),
+        is_truncated = torch.tensor([False, False])
+    )
+
+    _, _, diagnostics = trainer.train_policy_from_dreams(experience)
+
+    assert 'dream_rollout_len_mean' in diagnostics
+    assert 'real_future_len_mean' in diagnostics
+    assert 'dream_rollout_len_minus_real_future_len' in diagnostics
+    assert 'dream_real_discounted_return_mae' in diagnostics
+    assert 'dream_minus_real_discounted_return' in diagnostics
+    assert 'dream_value0_dream_return_mae' in diagnostics
+    assert 'dream_value0_real_return_mae' in diagnostics
+
+def test_interact_with_env_store_final_observation_for_terminated_episode():
+    from dreamer4.dreamer4 import DynamicsWorldModel, VideoTokenizer
+    from dreamer4.mocks import MockEnv
+
+    tokenizer = VideoTokenizer(
+        16,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        time_block_every = 1,
+        dim_latent = 16,
+        patch_size = 32,
+        attn_dim_head = 16,
+        num_latent_tokens = 1,
+        image_height = 32,
+        image_width = 32,
+    )
+
+    world_model = DynamicsWorldModel(
+        video_tokenizer = tokenizer,
+        dim = 16,
+        dim_latent = 16,
+        max_steps = 64,
+        num_tasks = 4,
+        num_latent_tokens = 1,
+        depth = 2,
+        time_block_every = 1,
+        num_spatial_tokens = 1,
+        pred_orig_latent = True,
+        num_discrete_actions = 4,
+        attn_dim_head = 16,
+        predict_terminals = True
+    )
+
+    env = MockEnv(
+        (32, 32),
+        vectorized = False,
+        num_envs = 1,
+        terminate_after_step = 0,
+        rand_terminate_prob = 1.0
+    )
+
+    experience = world_model.interact_with_env(
+        env,
+        max_timesteps = 8,
+        env_is_vectorized = False,
+        store_final_observation = True
+    )
+
+    assert experience.latents.shape[1] == experience.rewards.shape[1] + 1
+    assert experience.video.shape[2] == experience.rewards.shape[1] + 1
+    assert experience.lens.item() == experience.latents.shape[1]
+    assert bool(experience.terminals.item())
+    assert not bool(experience.is_truncated.item())
+
+def test_interact_with_env_store_final_observation_for_truncated_episode():
+    from dreamer4.dreamer4 import DynamicsWorldModel
+
+    class CountingStateEnv:
+        def __init__(self):
+            self.state = 0.
+
+        def reset(self, seed = None):
+            self.state = 0.
+            return {'state': torch.tensor([self.state])}
+
+        def step(self, action):
+            self.state += 1.
+            return {'state': torch.tensor([self.state])}, torch.tensor(1.), torch.tensor(False), torch.tensor(False)
+
+    def obs_to_latents_fn(model, obs, cache):
+        state = obs['state'].float().view(1, 1, 1)
+        latents = state.expand(1, 1, model.dim_latent)
+        return latents, cache
+
+    world_model = DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 16,
+        max_steps = 64,
+        num_latent_tokens = 1,
+        depth = 2,
+        time_block_every = 1,
+        num_spatial_tokens = 1,
+        pred_orig_latent = True,
+        num_discrete_actions = 4,
+        attn_dim_head = 16
+    )
+
+    experience = world_model.interact_with_env(
+        CountingStateEnv(),
+        max_timesteps = 1,
+        env_is_vectorized = False,
+        obs_to_latents_fn = obs_to_latents_fn,
+        store_final_observation = True
+    )
+
+    assert experience.latents.shape[1] == experience.rewards.shape[1] + 1
+    assert bool(experience.is_truncated.item())
+    assert torch.allclose(experience.latents[0, 0], torch.zeros_like(experience.latents[0, 0]))
+    assert torch.allclose(experience.latents[0, 1], torch.ones_like(experience.latents[0, 1]))
+
 def test_cache_generate():
     from dreamer4.dreamer4 import DynamicsWorldModel
 
@@ -935,6 +1158,40 @@ def test_interact_with_env_dict_obs(vectorized):
     assert experience.proprio.shape[-1] == 21
     assert experience.proprio.shape[1] > 0
 
+def test_gym_pixel_env_discrete_numpy_actions():
+    from gym_pixel_env import GymPixelEnv
+
+    env = GymPixelEnv(env_id = 'CartPole-v1', num_envs = 1)
+
+    try:
+        env.reset()
+        obs, reward, terminated, truncated = env.step(np.array([1]))
+
+        assert obs.ndim == 3
+        assert reward.numel() == 1
+        assert terminated.numel() == 1
+        assert truncated.numel() == 1
+    finally:
+        for sub_env in env.envs:
+            sub_env.close()
+
+def test_gym_pixel_env_vectorized_discrete_numpy_actions():
+    from gym_pixel_env import GymPixelEnv
+
+    env = GymPixelEnv(env_id = 'CartPole-v1', num_envs = 2)
+
+    try:
+        env.reset()
+        obs, reward, terminated, truncated = env.step(np.array([0, 1]))
+
+        assert obs.shape[0] == 2
+        assert reward.shape == (2,)
+        assert terminated.shape == (2,)
+        assert truncated.shape == (2,)
+    finally:
+        for sub_env in env.envs:
+            sub_env.close()
+
 @param('prompt_type', ('video', 'image', 'latents'))
 @param('with_proprio', (False, True))
 @param('with_discrete_actions', (False, True))
@@ -1036,6 +1293,74 @@ def test_prompting_generation(
 
         if with_continuous_actions:
             assert continuous_actions.shape == (2, 8, 2)
+
+def test_prompted_policy_generation_drops_prompt_prefix():
+    from einops import rearrange
+    from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
+
+    tokenizer = VideoTokenizer(
+        128,
+        dim_latent = 16,
+        patch_size = 16,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        time_block_every = 1,
+        attn_heads = 2,
+        image_height = 32,
+        image_width = 32,
+    )
+
+    dynamics = DynamicsWorldModel(
+        128,
+        num_agents = 1,
+        video_tokenizer = tokenizer,
+        dim_latent = 16,
+        num_discrete_actions = 4,
+        depth = 1,
+        time_block_every = 1,
+        predict_terminals = False,
+    )
+
+    prompt_video = torch.randn(2, 3, 1, 32, 32)
+    prompt_latents = tokenizer.tokenize(prompt_video)
+
+    generations = dynamics.generate(
+        time_steps = 6,
+        batch_size = 2,
+        prompt_latents = rearrange(prompt_latents, 'b t n d -> b t 1 n d'),
+        prompt_rewards = torch.zeros(2, 1),
+        prompt_discrete_actions = torch.randint(0, 4, (2, 1, 1)),
+        return_for_policy_optimization = True,
+        return_decoded_video = False,
+        drop_prompt_from_experience = True,
+    )
+
+    assert generations.latents.shape[1] == 5
+    assert generations.rewards.shape == (2, 5)
+    assert generations.values.shape == (2, 5)
+    assert generations.lens.shape == (2,)
+    assert torch.equal(generations.lens, torch.full((2,), 5, device = generations.lens.device))
+
+def test_calc_gae_excludes_bootstrap_delta_for_truncated_tail():
+    from dreamer4.dreamer4 import calc_gae
+
+    rewards = torch.tensor([[1., 2., 99.]])
+    values = torch.tensor([[10., 20., 30.]])
+    continuation_masks = torch.tensor([[1., 1., 0.]])
+    learn_masks = torch.tensor([[True, True, False]])
+
+    returns = calc_gae(
+        rewards,
+        values,
+        continuation_masks = continuation_masks,
+        learn_masks = learn_masks,
+        gamma = 1.,
+        lam = 1.,
+        use_accelerated = False,
+    )
+
+    assert torch.allclose(returns[:, :2], torch.tensor([[33., 32.]]))
+    assert torch.allclose(returns[:, 2:], torch.tensor([[30.]]))
 
 @param('steps', (1, 2, 4))
 def test_rac_like_tokenizer(steps):

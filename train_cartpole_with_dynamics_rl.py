@@ -148,7 +148,7 @@ class TransformerPPOAgent(nn.Module):
             ppo_eps_clip = 0.2,
             agent_value_gradient_frac = agent_value_gradient_frac,
             agent_policy_gradient_frac = agent_policy_gradient_frac,
-            normalize_advantages = True,
+            normalize_advantages = None,
             use_loss_normalization = False,
             attn_heads = 4,
             attn_dim_head = 16,
@@ -394,7 +394,6 @@ def main(
 
                     policy_loss, value_loss = agent.dynamics.learn_from_experience(
                         experience = micro,
-                        only_learn_policy_value_heads = False,
                         use_pmpo = use_pmpo
                     )
 
