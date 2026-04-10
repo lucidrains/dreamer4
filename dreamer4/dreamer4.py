@@ -47,6 +47,7 @@ from torch_einops_utils import (
     safe_stack,
     safe_cat,
     slice_right_at_dim,
+    slice_left_at_dim,
     tree_flatten_with_inverse
 )
 
@@ -1792,6 +1793,13 @@ class AxialSpaceTimeTransformer(Module):
         # special tokens
 
         self.num_special_spatial_tokens = num_special_spatial_tokens
+        self.should_special_cross_attend = num_special_spatial_tokens > 0 and not special_attend_only_itself
+
+        self.final_special_cross_attn = self.final_special_ff = None
+
+        if self.should_special_cross_attend:
+            self.final_special_cross_attn = Attention(dim = dim, heads = attn_heads, dim_head = attn_dim_head, pre_context_rmsnorm = True, **attn_kwargs)
+            self.final_special_ff = SwiGLUFeedforward(dim = dim, **ff_kwargs)
 
     def muon_parameters(self):
         muon_params = []
@@ -1972,6 +1980,20 @@ class AxialSpaceTimeTransformer(Module):
 
         if self.use_attn_pool:
             out = self.final_attn_pool(out, layer_hiddens) + out
+
+        if self.should_special_cross_attend:
+            non_special_tokens = slice_left_at_dim(out, -self.num_special_spatial_tokens, dim = -2)
+            special_tokens = slice_right_at_dim(out, self.num_special_spatial_tokens, dim = -2)
+
+            special_tokens_out = self.final_special_cross_attn(
+                special_tokens,
+                context = non_special_tokens
+            )
+
+            special_tokens = special_tokens + special_tokens_out
+            special_tokens = self.final_special_ff(special_tokens) + special_tokens
+
+            out = torch.cat((non_special_tokens, special_tokens), dim = -2)
 
         if has_kv_cache:
             # just concat the past tokens back on for now, todo - clean up the logic
@@ -3313,7 +3335,7 @@ class DynamicsWorldModel(Module):
         discrete_log_probs = None
         continuous_log_probs = None
         values = None
-        
+
         acc_latents = None
         acc_agent_embed = None
         acc_policy_embed = None
@@ -3332,7 +3354,7 @@ class DynamicsWorldModel(Module):
         tokenizer_time_cache = None
 
         step_index = 0
-        
+
         obs = init_obs
         curr_image = image_frame
         curr_state = state_frame
@@ -3385,7 +3407,7 @@ class DynamicsWorldModel(Module):
 
             if exists(self.critic_state_embedder) and exists(state_frame):
                 critic_embed = self.critic_state_embedder(state_frame.to(device))
-                value_embed = value_embed + rearrange(critic_embed, 'batch dim -> batch 1 dim')
+                value_embed = value_embed + rearrange(critic_embed, 'b d -> b 1 d')
 
             value_bins = self.value_head(value_embed)
             value = self.reward_encoder.bins_to_scalar_value(value_bins)
@@ -3432,7 +3454,7 @@ class DynamicsWorldModel(Module):
                 next_obs, reward, terminated, truncated = env_step_out
             elif len(env_step_out) == 5:
                 next_obs, reward, terminated, truncated, info = env_step_out
-            
+
             terminated = cast_to_tensor(terminated, device).view((batch,))
             truncated = cast_to_tensor(truncated, device).view((batch,))
             reward = cast_to_tensor(reward, device, dtype = torch.float32)
@@ -3446,7 +3468,7 @@ class DynamicsWorldModel(Module):
                     next_obs = dict(state = next_obs)
 
             assert 'image' in next_obs or 'state' in next_obs
-            
+
             episode_lens = torch.where(done_flag, episode_lens, episode_lens + 1)
 
             is_terminated |= terminated
@@ -3456,7 +3478,7 @@ class DynamicsWorldModel(Module):
 
             was_terminated |= terminated
             done_flag |= (is_terminated | is_truncated)
-            
+
             reward = rearrange(reward, 'b -> b 1') if env_is_vectorized else rearrange(reward, ' -> 1 1')
             rewards = safe_cat((rewards, reward), dim = 1)
 
@@ -3464,7 +3486,7 @@ class DynamicsWorldModel(Module):
 
             obs = next_obs
             next_proprio = obs.get('proprio', None)
-            
+
             # handle fetching new states and images
 
             curr_state = None
@@ -3508,9 +3530,12 @@ class DynamicsWorldModel(Module):
             if done_flag.all() and need_bootstrap.any():
                 if exists(obs_to_latents_fn):
                     bootstrap_latents, _ = obs_to_latents_fn(obs, tokenizer_time_cache)
-                else:
+                elif exists(curr_image):
                     bootstrap_latents, _ = self.video_tokenizer(curr_image, return_latents = True, time_cache = tokenizer_time_cache, return_time_cache = True)
-                
+                elif exists(curr_state):
+                    bootstrap_latents = self.state_to_latents(curr_state)
+                    bootstrap_latents = rearrange(bootstrap_latents, 'b n d -> b 1 n d') if bootstrap_latents.ndim == 3 else bootstrap_latents
+
                 _, (embeds, _) = self.forward(
                     latents = bootstrap_latents,
                     signal_levels = self.max_steps - 1,
@@ -3524,45 +3549,57 @@ class DynamicsWorldModel(Module):
                     return_pred_only = True,
                     return_intermediates = True
                 )
-                
+
+                # evaluate the bootstrap state
+
                 one_agent_embed = embeds.agent[..., -1:, agent_index, :]
-                
                 value_embed = one_agent_embed
 
                 if exists(self.critic_state_embedder) and exists(state_frame):
                     critic_embed = self.critic_state_embedder(state_frame.to(device))
-                    value_embed = value_embed + rearrange(critic_embed, 'batch dim -> batch 1 dim')
+                    value_embed = value_embed + rearrange(critic_embed, 'b d -> b 1 d')
 
                 value_bins = self.value_head(value_embed)
                 bootstrap_value = self.reward_encoder.bins_to_scalar_value(value_bins)
-
                 values = torch.cat((values, bootstrap_value), dim = 1)
-                rewards = torch.cat((rewards, torch.zeros_like(rewards[:, -1:])), dim = 1)
 
-                if exists(discrete_actions):
-                    discrete_actions = torch.cat((discrete_actions, torch.zeros_like(discrete_actions[:, -1:])), dim = 1) # dummy action
-                    discrete_log_probs = torch.cat((discrete_log_probs, discrete_log_probs[:, -1:] * 0), dim = 1)
+                # pad everything out for the truncated state
 
-                acc_latents = safe_cat((acc_latents, acc_latents[:, -1:]), dim = 1)
+                pad_right_ = lambda t: pad_right_at_dim(t, 1, dim = 1) if exists(t) else None
+
+                rewards, discrete_actions, discrete_log_probs, continuous_actions, continuous_log_probs = map(pad_right_, (
+                    rewards, discrete_actions, discrete_log_probs, continuous_actions, continuous_log_probs
+                ))
+
+                # safely append latents, and only append agent / policy embeds if they are being stored
+
+                acc_latents = safe_cat((acc_latents, bootstrap_latents), dim = 1)
+
+                if exists(acc_agent_embed):
+                    acc_agent_embed = safe_cat((acc_agent_embed, one_agent_embed), dim = 1)
+
+                if exists(acc_policy_embed):
+                    policy_embed = self.policy_head(one_agent_embed)
+                    acc_policy_embed = safe_cat((acc_policy_embed, policy_embed), dim = 1)
 
                 episode_lens = torch.where(need_bootstrap, episode_lens + 1, episode_lens)
                 break
 
-        video = cat(video_frames, dim=2) if len(video_frames) > 0 else None
-        stacked_states = stack(states, dim=1) if len(states) > 0 else None
+        time_dim = rewards.shape[-1]
+        video = cat(video_frames, dim=2)[:, :, :time_dim] if len(video_frames) > 0 else None
+        stacked_states = stack(states, dim=1)[:, :time_dim] if len(states) > 0 else None
 
         # calculate episode return
 
-        time_dim = rewards.shape[-1]
         step_mask = lens_to_mask(episode_lens, time_dim)
         episode_return = rewards.masked_fill(~step_mask, 0.).sum(dim = -1)
 
         one_experience = Experience(
             latents = acc_latents,
-            video = video[:, :, :-1] if exists(video) else None,
-            critic_state = stacked_states[:, :-1] if exists(stacked_states) else None,
+            video = video,
+            critic_state = stacked_states,
             rewards = rewards,
-            proprio = accumulated_proprio[:, :-1] if exists(accumulated_proprio) else None,
+            proprio = accumulated_proprio[:, :time_dim] if exists(accumulated_proprio) else None,
             actions = Actions(discrete_actions, continuous_actions),
             log_probs = Actions(discrete_log_probs, continuous_log_probs),
             values = values,
@@ -3749,9 +3786,9 @@ class DynamicsWorldModel(Module):
 
         policy_agent_embeds = frac_gradient(agent_embeds, self.agent_policy_gradient_frac)
         policy_embed = self.policy_head(policy_agent_embeds)
-        
+
         # align actions with policy embed if latents had a bootstrap state appended
-        
+
         if exists(discrete_actions) and discrete_actions.shape[1] == latents.shape[1] and discrete_actions.shape[1] == policy_embed.shape[1] + 1:
             discrete_actions = discrete_actions[:, :-1]
             if exists(continuous_actions):
@@ -4607,7 +4644,10 @@ class DynamicsWorldModel(Module):
 
                 pop_last_reward = int(reward_tokens.shape[1] == agent_tokens.shape[1]) # the last reward is popped off during training, during inference, it is not known yet, so need to handle this edge case
 
-                reward_tokens = pad_at_dim(reward_tokens, (1, -pop_last_reward), dim = -2, value = 0.)  # shift as each agent token predicts the next reward
+                is_sequential_step = exists(time_cache) and time == 1 and reward_tokens.shape[1] == 1
+
+                if not is_sequential_step:
+                    reward_tokens = pad_at_dim(reward_tokens, (1, -pop_last_reward), dim = -2, value = 0.)  # shift as each agent token predicts the next reward
 
                 reward_tokens = add('1 d, b t d', self.reward_learned_embed, reward_tokens)
 

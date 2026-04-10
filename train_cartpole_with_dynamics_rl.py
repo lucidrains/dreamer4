@@ -38,6 +38,8 @@ pad_sequence = partial(pad_sequence, batch_first = True)
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 
+from torch_einops_utils import pad_at_dim
+
 from accelerate import Accelerator
 
 from dreamer4.dreamer4 import (
@@ -93,6 +95,41 @@ def render_frame(env):
     img = img / 255.0
     return img
 
+# conv encoder
+
+class SmallConvEncoder(nn.Module):
+    def __init__(self, num_latent_tokens=4, dim_latent=32):
+        super().__init__()
+        self.num_latent_tokens = num_latent_tokens
+        self.dim_latent = dim_latent
+
+        self.net = nn.Sequential(
+            nn.Conv2d(3, 16, 4, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(16, 32, 4, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 4, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, num_latent_tokens * dim_latent, 8, stride=1, padding=0)
+        )
+
+    def forward(self, x, return_latents=False, time_cache=None, return_time_cache=False, **kwargs):
+        is_video = x.ndim == 5
+        if is_video:
+            b, c, t, h, w = x.shape
+            x = rearrange(x, 'b c t h w -> (b t) c h w')
+
+        out = self.net(x)
+        out = rearrange(out, 'b (n d) 1 1 -> b n d', n=self.num_latent_tokens, d=self.dim_latent)
+
+        if is_video:
+            out = rearrange(out, '(b t) n d -> b t n d', b=b, t=t).tanh()
+
+        if not return_time_cache:
+            return out
+
+        return out, None
+
 # agent
 
 class TransformerPPOAgent(nn.Module):
@@ -101,7 +138,9 @@ class TransformerPPOAgent(nn.Module):
         use_asym_critic = False,
         agent_value_gradient_frac = 1.0,
         agent_policy_gradient_frac = 1.0,
+        num_latent_tokens = 16,
         use_image_input = False,
+        use_conv_encoder = False,
         use_time_rnn = False
     ):
         super().__init__()
@@ -109,31 +148,37 @@ class TransformerPPOAgent(nn.Module):
 
         tokenizer = None
         if use_image_input:
-            tokenizer = VideoTokenizer(
-                channels = 3,
-                patch_size = 8,
-                dim = 64,
-                dim_latent = 32,
-                num_latent_tokens = 4,
-                image_height = 64,
-                image_width = 64,
-                encoder_depth = 3,
-                decoder_depth = 3,
-                time_block_every = 2,
-                use_causal_conv3d = True,
-                use_time_rnn = use_time_rnn,
-                use_loss_normalization = True,
-                decoder_flow_steps = 2,
-                lpips_loss_weight = 0.
-            )
+            if use_conv_encoder:
+                tokenizer = SmallConvEncoder(
+                    num_latent_tokens = num_latent_tokens,
+                    dim_latent = 32
+                )
+            else:
+                tokenizer = VideoTokenizer(
+                    channels = 3,
+                    patch_size = 8,
+                    dim = 64,
+                    dim_latent = 32,
+                    num_latent_tokens = num_latent_tokens,
+                    image_height = 64,
+                    image_width = 64,
+                    encoder_depth = 3,
+                    decoder_depth = 3,
+                    time_block_every = 2,
+                    use_causal_conv3d = True,
+                    use_time_rnn = use_time_rnn,
+                    use_loss_normalization = True,
+                    decoder_flow_steps = 2,
+                    lpips_loss_weight = 0.
+                )
 
         self.dynamics = DynamicsWorldModel(
             video_tokenizer = tokenizer,
             dim = 128,
             dim_latent = 32,
             dim_state = None if use_image_input else 4,
-            num_latent_tokens = 4,
-            num_spatial_tokens = 4,
+            num_latent_tokens = num_latent_tokens,
+            num_spatial_tokens = num_latent_tokens,
             num_register_tokens = 1,
             num_discrete_actions = 2,
             use_time_rnn = use_time_rnn,
@@ -206,13 +251,13 @@ def main(
     max_grad_norm = 0.5,
     target_return = 70.0,
     use_asym_critic = True,
-    max_policy_updates = 250,
     agent_value_gradient_frac = 0.1,
-    agent_policy_gradient_frac = 0.1,
+    agent_policy_gradient_frac = 1.0,
     seed = 42,
     use_wandb = False,
     use_pmpo = False,
     use_image_input = False,
+    use_conv_encoder = False,
     vectorized = False,
     num_envs = 8,
     cpu = False,
@@ -221,7 +266,6 @@ def main(
     ssl_max_epochs = 25,
     ssl_target_recon_loss = None,
     ssl_stop_after_episodes = 2000,
-    ssl_e2e_after_updates = 4,
     ssl_batch_size = 8,
     ssl_max_memories = 128,
     tokenizer_learning_rate = 1e-4
@@ -252,7 +296,7 @@ def main(
     results_folder = Path('./results')
     shutil.rmtree(results_folder, ignore_errors=True)
     results_folder.mkdir(exist_ok = True, parents = True)
-    
+
     log(f'\nReconstruction grids will be saved directly to {results_folder.absolute()}\n')
 
     env = make_env(seed, use_image_input, vectorized=vectorized, num_envs=num_envs)
@@ -262,13 +306,17 @@ def main(
         agent_value_gradient_frac = agent_value_gradient_frac,
         agent_policy_gradient_frac = agent_policy_gradient_frac,
         use_image_input = use_image_input,
+        use_conv_encoder = use_conv_encoder,
         use_time_rnn = use_time_rnn
     ).to(device)
 
     # optimizers
 
     has_tokenizer = use_image_input and exists(agent.dynamics.video_tokenizer)
-    should_ssl = has_tokenizer and ssl_every_rl_updates > 0
+    should_ssl = False
+
+    if has_tokenizer and not use_conv_encoder:
+        should_ssl = agent.dynamics.video_tokenizer.has_flow and ssl_every_rl_updates > 0
 
     if has_tokenizer:
         tokenizer = agent.dynamics.video_tokenizer
@@ -380,6 +428,7 @@ def main(
 
             epoch_policy_loss = 0.
             epoch_value_loss = 0.
+            epoch_conv_grad_norm = 0.
 
             for _ in range(update_epochs):
                 batches = torch.randperm(total_envs, device = device).split(batch_size)
@@ -387,10 +436,14 @@ def main(
                 for i, batch_idx in enumerate(batches):
                     micro = slice_experience(exp_batch, batch_idx)
 
-                    # always re-encode from video for e2e tokenizer gradients
-
-                    if has_tokenizer and exists(micro.video):
+                    if exists(agent.dynamics.video_tokenizer):
                         micro.latents = None
+
+                    if exists(micro.critic_state) and exists(micro.rewards) and micro.critic_state.shape[1] < micro.rewards.shape[1]:
+                        micro.critic_state = pad_at_dim(micro.critic_state, (0, micro.rewards.shape[1] - micro.critic_state.shape[1]), dim = 1)
+
+                    if exists(micro.video) and exists(micro.rewards) and micro.video.shape[2] < micro.rewards.shape[1]:
+                        micro.video = pad_at_dim(micro.video, (0, micro.rewards.shape[1] - micro.video.shape[2]), dim = 2)
 
                     policy_loss, value_loss = agent.dynamics.learn_from_experience(
                         experience = micro,
@@ -404,6 +457,10 @@ def main(
                     is_last_batch = (i + 1) == len(batches)
 
                     if divisible_by(i + 1, grad_accum_every) or is_last_batch:
+                        if exists(agent.dynamics.video_tokenizer):
+                            conv_grad = nn.utils.clip_grad_norm_(agent.dynamics.video_tokenizer.parameters(), float('inf'))
+                            epoch_conv_grad_norm += conv_grad.item() / len(batches)
+
                         accelerator.clip_grad_norm_(agent.parameters(), max_grad_norm)
                         optimizer.step()
                         optimizer.zero_grad()
@@ -413,8 +470,12 @@ def main(
 
             avg_policy_loss = epoch_policy_loss / update_epochs
             avg_value_loss = epoch_value_loss / update_epochs
+            avg_conv_grad_norm = epoch_conv_grad_norm / update_epochs
 
             loss_metrics.update(policy_loss = f'{avg_policy_loss:.3f}', value_loss = f'{avg_value_loss:.3f}')
+
+            if exists(agent.dynamics.video_tokenizer):
+                loss_metrics.update(conv_grad = f'{avg_conv_grad_norm:.3f}')
 
             if use_wandb:
                 wandb.log(dict(
@@ -443,7 +504,7 @@ def main(
             ssl_pbar = tqdm(range(ssl_max_epochs), desc = 'ssl epochs', leave = False)
             for epoch in ssl_pbar:
                 batches = torch.randperm(ssl_video.shape[0], device = device).split(ssl_batch_size)
-                
+
                 epoch_recon_loss = 0.
 
                 for i, batch_indices in enumerate(batches):
@@ -467,9 +528,9 @@ def main(
                         tokenizer_optim.zero_grad()
 
                     epoch_recon_loss += losses.recon.item() / len(batches)
-                    
+
                 ssl_pbar.set_postfix(recon_loss = f'{epoch_recon_loss:.4f}')
-                    
+
                 if exists(ssl_target_recon_loss) and ssl_target_recon_loss > 0:
                     if epoch_recon_loss <= ssl_target_recon_loss:
                         log(f'\nSSL recon loss reached target {epoch_recon_loss:.4f} <= {ssl_target_recon_loss:.4f} at epoch {epoch + 1}! Stopping SSL early.')

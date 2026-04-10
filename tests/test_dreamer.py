@@ -1130,7 +1130,8 @@ def test_e2e_sequential_parallel_cache(use_time_rnn, use_causal_conv3d, use_shif
             step_sizes = step_sizes,
             discrete_actions = discrete_actions,
             return_pred_only = True,
-            return_intermediates = True
+            return_intermediates = True,
+            latent_is_noised = True
         )
 
         policy_embed_parallel = dynamics.policy_head(embeds_parallel.agent)
@@ -1154,7 +1155,8 @@ def test_e2e_sequential_parallel_cache(use_time_rnn, use_causal_conv3d, use_shif
                 discrete_actions = seq_action,
                 time_cache = dynamics_cache_sequential,
                 return_pred_only = True,
-                return_intermediates = True
+                return_intermediates = True,
+                latent_is_noised = True
             )
 
             policy_embed_sequential.append(dynamics.policy_head(intermediates_sequential.agent))
