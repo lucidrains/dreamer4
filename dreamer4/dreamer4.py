@@ -2077,28 +2077,52 @@ class CausalDepthwiseConv3d(Module):
 # shifted patch tokenization
 
 class ShiftedPatchTokenization(Module):
-    def __init__(self, dim, patch_size, channels = 3):
+    def __init__(
+        self,
+        dim,
+        patch_size,
+        channels = 3,
+        temporal_shift = True
+    ):
         super().__init__()
-        patch_dim = (patch_size ** 2) * 6 * channels
+        self.patch_size = patch_size
+        self.temporal_shift = temporal_shift
+
+        num_segments = 6 if temporal_shift else 5
+        patch_dim = (patch_size ** 2) * num_segments * channels
 
         self.to_patch_tokens = Sequential(
-            Rearrange('b c t (h p1) (w p2) -> b t h w (p1 p2 c)', p1 = patch_size, p2 = patch_size),
+            Rearrange('... c p1 p2 -> ... (c p1 p2)'),
             Linear(patch_dim, dim)
         )
 
-    def forward(self, x, time_cache = None, return_time_cache = False):
+    def forward(
+        self,
+        x,
+        time_cache = None,
+        return_time_cache = False
+    ):
+        p1 = p2 = self.patch_size
+
+        x = rearrange(x, 'b c t (h p1) (w p2) -> b t h w c p1 p2', p1 = p1, p2 = p2)
+
         spatial_shifts = tuple(pad_at_dim(x, pad, dim = d) for d in (-1, -2) for pad in ((1, -1), (-1, 1)))
 
-        if exists(time_cache):
-            x_time_padded = torch.cat((time_cache, x), dim = -3)
-        else:
-            x_time_padded = pad_at_dim(x, (1, 0), dim = -3)
+        shifts = spatial_shifts
 
-        next_time_cache = x_time_padded[:, :, -1:]
-        time_shift = x_time_padded[:, :, :-1]
+        next_time_cache = None
 
-        shifts = spatial_shifts + (time_shift,)
-        out = self.to_patch_tokens(cat((x, *shifts), dim = 1))
+        if self.temporal_shift:
+            if exists(time_cache):
+                x_time_padded = torch.cat((time_cache, x), dim = 1)
+            else:
+                x_time_padded = pad_at_dim(x, (1, 0), dim = 1)
+
+            next_time_cache = x_time_padded[:, -1:]
+            time_shift = x_time_padded[:, :-1]
+            shifts = (*shifts, time_shift)
+
+        out = self.to_patch_tokens(cat((x, *shifts), dim = -3))
 
         if not return_time_cache:
             return out
@@ -2136,7 +2160,8 @@ class VideoTokenizer(Module):
         decorr_sample_frac = 0.25,
         use_loss_normalization = True,
         use_causal_conv3d = False,
-        use_shifted_patch_tokenization = True,
+        use_shifted_patch_tokenization = False,
+        spt_kwargs: dict = dict(),
         use_time_rnn = False,
         causal_conv3d_kernel_size = 3,
         decoder_flow_steps = 1,
@@ -2172,7 +2197,7 @@ class VideoTokenizer(Module):
         self.use_shifted_patch_tokenization = use_shifted_patch_tokenization
 
         if use_shifted_patch_tokenization:
-            self.patch_to_tokens = ShiftedPatchTokenization(dim = dim, patch_size = patch_size, channels = channels)
+            self.patch_to_tokens = ShiftedPatchTokenization(dim = dim, patch_size = patch_size, channels = channels, **spt_kwargs)
         else:
             self.patch_to_tokens = Sequential(
                 Rearrange('b c t (h p1) (w p2) -> b t h w (p1 p2 c)', p1 = patch_size, p2 = patch_size),
@@ -2472,6 +2497,7 @@ class VideoTokenizer(Module):
         return_time_cache = False,
         time_lens = None
     ):
+        mask_patches = default(mask_patches, self.training and not return_latents)
 
         # handle image pretraining
 
