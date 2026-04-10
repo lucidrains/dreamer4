@@ -110,7 +110,8 @@ class SmallConvEncoder(nn.Module):
             nn.ReLU(),
             nn.Conv2d(32, 64, 4, stride=2, padding=1),
             nn.ReLU(),
-            nn.Conv2d(64, num_latent_tokens * dim_latent, 8, stride=1, padding=0)
+            nn.Conv2d(64, num_latent_tokens * dim_latent, 8, stride=1, padding=0),
+            nn.Tanh()
         )
 
     def forward(self, x, return_latents=False, time_cache=None, return_time_cache=False, **kwargs):
@@ -123,7 +124,7 @@ class SmallConvEncoder(nn.Module):
         out = rearrange(out, 'b (n d) 1 1 -> b n d', n=self.num_latent_tokens, d=self.dim_latent)
 
         if is_video:
-            out = rearrange(out, '(b t) n d -> b t n d', b=b, t=t).tanh()
+            out = rearrange(out, '(b t) n d -> b t n d', b=b, t=t)
 
         if not return_time_cache:
             return out
@@ -141,7 +142,8 @@ class TransformerPPOAgent(nn.Module):
         num_latent_tokens = 16,
         use_image_input = False,
         use_conv_encoder = False,
-        use_time_rnn = False
+        use_time_rnn = False,
+        pmpo_kl_div_loss_weight = 0.05
     ):
         super().__init__()
         self.use_image_input = use_image_input
@@ -198,7 +200,8 @@ class TransformerPPOAgent(nn.Module):
             attn_heads = 4,
             attn_dim_head = 16,
             reward_encoder_kwargs = dict(reward_range = (-10., 10.)),
-            dim_critic_state = 4 if use_asym_critic else None
+            dim_critic_state = 4 if use_asym_critic else None,
+            pmpo_kl_div_loss_weight = pmpo_kl_div_loss_weight,
         )
 
     @property
