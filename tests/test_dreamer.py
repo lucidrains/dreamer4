@@ -317,7 +317,15 @@ def test_action_with_world_model():
 
     # take a reinforcement learning step
 
-    actor_loss, critic_loss = dynamics.learn_from_experience(gen)
+    actor_loss, critic_loss = dynamics.learn_from_experience(gen, use_pmpo = False)
+
+    for key in (
+        'policy_entropy_mean',
+        'ppo_ratio_mean',
+        'ppo_approx_kl',
+        'ppo_clipfrac',
+    ):
+        assert key in dynamics._rl_diagnostics
 
     actor_loss.backward(retain_graph = True)
     critic_loss.backward()

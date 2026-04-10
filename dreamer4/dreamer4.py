@@ -4042,9 +4042,35 @@ class DynamicsWorldModel(Module):
 
         # handle entropy loss for naive exploration bonus
 
-        entropy_loss = - reduce(entropies, 'b t na -> b t', 'sum')
+        action_entropies = reduce(entropies, 'b t na -> b t', 'sum')
+        entropy_loss = -action_entropies
 
         entropy_loss = masked_mean(entropy_loss, learn_mask)
+
+        with torch.no_grad():
+            self._rl_diagnostics.update(
+                policy_entropy_mean = masked_mean(action_entropies, learn_mask).item(),
+            )
+
+            if not use_pmpo:
+                log_ratio = log_probs - old_log_probs
+                clip_mask = (ratio < (1. - self.ppo_eps_clip)) | (ratio > (1. + self.ppo_eps_clip))
+
+                if exists(learn_mask):
+                    expanded_learn_mask = repeat(learn_mask, 'b t -> b t na', na = ratio.shape[-1])
+                    valid_log_ratio = log_ratio[expanded_learn_mask]
+                    valid_ratio = ratio[expanded_learn_mask]
+                    valid_clip_mask = clip_mask[expanded_learn_mask]
+                else:
+                    valid_log_ratio = log_ratio.flatten()
+                    valid_ratio = ratio.flatten()
+                    valid_clip_mask = clip_mask.flatten()
+
+                self._rl_diagnostics.update(
+                    ppo_ratio_mean = valid_ratio.mean().item(),
+                    ppo_approx_kl = (-valid_log_ratio).mean().item(),
+                    ppo_clipfrac = valid_clip_mask.float().mean().item(),
+                )
 
         # total policy loss
 

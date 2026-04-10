@@ -44,6 +44,17 @@ def default(v, d):
 def divisible_by(num, den):
     return (num % den) == 0
 
+def grad_norm(parameters):
+    sq_norm = 0.
+
+    for param in parameters:
+        if not exists(param.grad):
+            continue
+
+        sq_norm = sq_norm + param.grad.detach().float().pow(2).sum().item()
+
+    return sq_norm ** 0.5
+
 def video_tensor_to_gif(
     tensor,
     path,
@@ -1688,6 +1699,12 @@ class DreamerTrainer(Module):
             policy_loss, value_loss = self.model.learn_from_experience(dreams, use_pmpo = self.use_pmpo)
 
             self.accelerator.backward(policy_loss)
+
+            policy_grad_norm = grad_norm(self.model.policy_head_parameters())
+
+            self.unwrapped_model._rl_diagnostics.update(
+                policy_grad_norm = policy_grad_norm
+            )
 
             if exists(self.max_grad_norm):
                 self.accelerator.clip_grad_norm_(self.model.policy_head_parameters(), self.max_grad_norm)
