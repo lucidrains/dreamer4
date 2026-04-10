@@ -2008,7 +2008,7 @@ class AxialSpaceTimeTransformer(Module):
             safe_stack(normed_space_attn_inputs),
             safe_stack(rnn_hiddens),
             hiddens,
-            token_count + time
+            token_count + tokens.shape[1]
         )
 
         return out, intermediates
