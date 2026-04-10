@@ -33,6 +33,7 @@ def main(
     tokenizer_checkpoint_path: str = None,
     reward_encoding: str = 'hl_gauss',
     num_episodes = 5000,
+    max_steps: int = None,
     image_height = 60,
     image_width = 90,
     action_repeat = 1,
@@ -48,7 +49,7 @@ def main(
     env_max_timesteps = 16,
     wm_collect_frames = 4096,
     wm_max_frames_per_batch = 512,
-    dream_train_steps_per_collect = 1,
+    dream_train_steps_per_collect = 16,
     wm_only_steps = 100,
     predict_terminals = True,
     use_pmpo = True,
@@ -174,7 +175,7 @@ def main(
     print(f'Discrete actions: {env.num_discrete_actions}')
     print(f'Continuous actions: {env.num_continuous_actions}')
 
-    trainer(env, num_episodes = num_episodes, env_is_vectorized = num_envs > 1)
+    trainer(env, num_episodes = num_episodes, max_steps = max_steps, env_is_vectorized = num_envs > 1)
 
     env.close()
 
