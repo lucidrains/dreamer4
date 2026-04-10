@@ -2170,6 +2170,37 @@ class CausalDepthwiseConv3d(Module):
             return out, next_time_cache
         return out
 
+# shifted patch tokenization
+
+class ShiftedPatchTokenization(Module):
+    def __init__(self, dim, patch_size, channels = 3):
+        super().__init__()
+        patch_dim = (patch_size ** 2) * 6 * channels
+
+        self.to_patch_tokens = Sequential(
+            Rearrange('b c t (h p1) (w p2) -> b t h w (p1 p2 c)', p1 = patch_size, p2 = patch_size),
+            Linear(patch_dim, dim)
+        )
+
+    def forward(self, x, time_cache = None, return_time_cache = False):
+        spatial_shifts = tuple(pad_at_dim(x, pad, dim = d) for d in (-1, -2) for pad in ((1, -1), (-1, 1)))
+
+        if exists(time_cache):
+            x_time_padded = torch.cat((time_cache, x), dim = -3)
+        else:
+            x_time_padded = pad_at_dim(x, (1, 0), dim = -3)
+
+        next_time_cache = x_time_padded[:, :, -1:]
+        time_shift = x_time_padded[:, :, :-1]
+
+        shifts = spatial_shifts + (time_shift,)
+        out = self.to_patch_tokens(cat((x, *shifts), dim = 1))
+
+        if not return_time_cache:
+            return out
+
+        return out, next_time_cache
+
 # video tokenizer
 
 @save_load
@@ -2201,6 +2232,7 @@ class VideoTokenizer(Module):
         decorr_sample_frac = 0.25,
         use_loss_normalization = True,
         use_causal_conv3d = False,
+        use_shifted_patch_tokenization = True,
         use_time_rnn = False,
         causal_conv3d_kernel_size = 3,
         decoder_flow_steps = 1,
@@ -2233,10 +2265,15 @@ class VideoTokenizer(Module):
 
         dim_patch = channels * patch_size ** 2
 
-        self.patch_to_tokens = Sequential(
-            Rearrange('b c t (h p1) (w p2) -> b t h w (p1 p2 c)', p1 = patch_size, p2 = patch_size),
-            Linear(dim_patch, dim)
-        )
+        self.use_shifted_patch_tokenization = use_shifted_patch_tokenization
+
+        if use_shifted_patch_tokenization:
+            self.patch_to_tokens = ShiftedPatchTokenization(dim = dim, patch_size = patch_size, channels = channels)
+        else:
+            self.patch_to_tokens = Sequential(
+                Rearrange('b c t (h p1) (w p2) -> b t h w (p1 p2 c)', p1 = patch_size, p2 = patch_size),
+                Linear(dim_patch, dim)
+            )
 
         self.tokens_to_patch = Sequential(
             Linear(dim, dim_patch),
@@ -2551,14 +2588,19 @@ class VideoTokenizer(Module):
         # time cache setup
 
         if not exists(time_cache):
-            time_cache = (None,) * 3
+            time_cache = (None,) * 4
 
-        pre_causal_conv_cache, transformer_cache, post_causal_conv_cache = time_cache
+        spt_cache, pre_causal_conv_cache, transformer_cache, post_causal_conv_cache = time_cache
         causal_conv_kwargs = dict(return_time_cache = True)
 
         # to tokens
 
-        tokens = self.patch_to_tokens(video)
+        next_spt_cache = None
+
+        if self.use_shifted_patch_tokenization:
+            tokens, next_spt_cache = self.patch_to_tokens(video, time_cache = spt_cache, return_time_cache = True)
+        else:
+            tokens = self.patch_to_tokens(video)
 
         next_pre_causal_conv_cache = None
 
@@ -2624,7 +2666,7 @@ class VideoTokenizer(Module):
         latents = self.encoded_to_latents(latents)
 
         if return_latents:
-            next_time_cache = (next_pre_causal_conv_cache, next_transformer_cache, next_post_causal_conv_cache)
+            next_time_cache = (next_spt_cache, next_pre_causal_conv_cache, next_transformer_cache, next_post_causal_conv_cache)
 
             if not return_time_cache:
                 return latents

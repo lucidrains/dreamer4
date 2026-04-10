@@ -1392,7 +1392,8 @@ def test_rac_like_tokenizer(steps):
 
 @param('use_time_rnn', (False, True))
 @param('use_causal_conv3d', (False, True))
-def test_e2e_sequential_parallel_cache(use_time_rnn, use_causal_conv3d):
+@param('use_shifted_patch_tokenization', (False, True))
+def test_e2e_sequential_parallel_cache(use_time_rnn, use_causal_conv3d, use_shifted_patch_tokenization):
     import torch
     from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
 
@@ -1408,7 +1409,8 @@ def test_e2e_sequential_parallel_cache(use_time_rnn, use_causal_conv3d):
         time_block_every = 2,
         attn_heads = 4,
         attn_dim_head = 16,
-        use_causal_conv3d = use_causal_conv3d
+        use_causal_conv3d = use_causal_conv3d,
+        use_shifted_patch_tokenization = use_shifted_patch_tokenization
     ).eval()
 
     dynamics = DynamicsWorldModel(
