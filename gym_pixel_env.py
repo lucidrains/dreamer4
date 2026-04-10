@@ -71,6 +71,16 @@ class GymPixelEnv(Module):
         frames = torch.nn.functional.interpolate(frames, size = (self.image_height, self.image_width), mode = 'bilinear', align_corners = False)
         return frames.to(self.device)
 
+    def _extract_discrete_action(self, action):
+        if isinstance(action, torch.Tensor):
+            action = action.detach().cpu().reshape(-1)[0].item()
+        elif isinstance(action, np.ndarray):
+            action = action.reshape(-1)[0].item()
+        elif isinstance(action, (list, tuple)):
+            action = np.asarray(action).reshape(-1)[0].item()
+
+        return int(action)
+
     def reset(self, seed = None):
         self._needs_reset = [False] * self.num_envs
         frames = []
@@ -87,7 +97,15 @@ class GymPixelEnv(Module):
         return frames
 
     def step(self, actions):
-        discrete, continuous = actions
+        discrete = continuous = None
+
+        if self.is_discrete:
+            if isinstance(actions, tuple):
+                discrete, continuous = actions
+            else:
+                discrete = actions
+        else:
+            discrete, continuous = actions
 
         obs_list = []
         rewards = []
@@ -100,10 +118,8 @@ class GymPixelEnv(Module):
                 self._needs_reset[i] = False
 
             if self.is_discrete:
-                if self.vectorized:
-                    action = discrete[i].squeeze().cpu().item()
-                else:
-                    action = discrete.squeeze().cpu().item()
+                action_value = discrete[i] if self.vectorized else discrete
+                action = self._extract_discrete_action(action_value)
             else:
                 if self.vectorized:
                     action = continuous[i].detach().cpu().numpy().flatten()
