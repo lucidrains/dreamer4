@@ -1258,7 +1258,7 @@ class DreamerTrainer(Module):
         dream_prompt_len = 1,
         env_max_timesteps = 16,
         wm_collect_frames = 2048,
-        dream_train_steps_per_collect = 1,
+        dream_train_steps_per_collect = 16,
         wm_only_steps = 0,
         use_pmpo = True,
         accelerate_kwargs: dict = dict(),
@@ -1293,7 +1293,7 @@ class DreamerTrainer(Module):
         optim_kwargs = dict(lr = learning_rate, weight_decay = weight_decay)
 
         value_head_params = set(model.value_head_parameters())
-        model_params = [p for p in model.parameter() if p not in value_head_params]
+        model_params = [p for p in model.parameters() if p not in value_head_params]
         muon_params = list(model.muon_parameters()) if hasattr(model, 'muon_parameters') else []
 
         if optim_klass is MuonAdamAtan2:
@@ -1375,15 +1375,46 @@ class DreamerTrainer(Module):
         self.print(f"checkpoint saved to {ckpt_path}")
 
     def _slice_experience(self, experience: Experience, indices):
-        """Slice an experience along the batch dimension."""
+        """Slice an experience along the batch dimension, trimming bootstrap padding to match video length."""
         video = experience.video[indices]
-        rewards = experience.rewards[indices] if exists(experience.rewards) else None
+        time = video.shape[2]  # video is (b, c, t, h, w)
+        rewards = experience.rewards[indices][..., :time] if exists(experience.rewards) else None
         terminals = experience.terminals[indices] if exists(experience.terminals) else None
-        discrete_actions = experience.actions[0][indices] if exists(experience.actions[0]) else None
-        continuous_actions = experience.actions[1][indices] if exists(experience.actions[1]) else None
+        discrete_actions = experience.actions[0][indices][:, :time] if exists(experience.actions[0]) else None
+        continuous_actions = experience.actions[1][indices][:, :time] if exists(experience.actions[1]) else None
         lens = experience.lens[indices] if exists(experience.lens) else None
 
+        # clamp lens to video length (bootstrap may have incremented them)
+        if exists(lens):
+            lens = lens.clamp(max = time)
+
         return video, rewards, terminals, discrete_actions, continuous_actions, lens
+
+    def _transition_lens(self, experience: Experience):
+        if exists(experience.latents):
+            payload = experience.latents
+            seq_len = payload.shape[1]
+        else:
+            payload = experience.video
+            seq_len = payload.shape[2]
+
+        lens = default(experience.lens, torch.full((payload.shape[0],), seq_len, device = self.device))
+
+        transition_lens = lens.clone()
+
+        if exists(experience.rewards):
+            transition_lens = transition_lens.clamp(max = experience.rewards.shape[1])
+
+        if exists(experience.actions):
+            discrete_actions, continuous_actions = experience.actions
+
+            if exists(discrete_actions):
+                transition_lens = transition_lens.clamp(max = discrete_actions.shape[1])
+
+            if exists(continuous_actions):
+                transition_lens = transition_lens.clamp(max = continuous_actions.shape[1])
+
+        return transition_lens
 
     def _make_frame_batches(self, lens, max_frames):
         """Group episodes into batches respecting a frame budget. Returns list of index tensors."""
@@ -1455,7 +1486,7 @@ class DreamerTrainer(Module):
             self.accelerator.backward(loss)
 
             if exists(self.max_grad_norm):
-                self.accelerator.clip_grad_norm_(self.unwrapped_model.parameter(), self.max_grad_norm)
+                self.accelerator.clip_grad_norm_(self.unwrapped_model.parameters(), self.max_grad_norm)
 
             self.world_model_optim.step()
             self.world_model_optim.zero_grad()
@@ -1470,19 +1501,22 @@ class DreamerTrainer(Module):
         return tensor(avg_loss, device = self.device), wm_loss_breakdown
 
     def _sample_dream_prompts(self, experience: Experience):
+        return self._sample_dream_prompts_with_metadata(experience)[0]
+
+    def _sample_dream_prompts_with_metadata(self, experience: Experience):
         if self.dream_prompt_len <= 0:
-            return {}
+            return {}, None
 
         latents = experience.latents
-        lens = experience.lens
+        lens = self._transition_lens(experience)
 
         if not exists(latents) or not exists(lens):
-            return {}
+            return {}, None
 
         valid_episode_mask = lens >= self.dream_prompt_len
 
         if not valid_episode_mask.any():
-            return {}
+            return {}, None
 
         valid_episode_indices = valid_episode_mask.nonzero(as_tuple = True)[0]
         sampled_episode_indices = valid_episode_indices[torch.randint(len(valid_episode_indices), (self.batch_size,), device = latents.device)]
@@ -1512,14 +1546,133 @@ class DreamerTrainer(Module):
             if exists(continuous_actions):
                 prompt_kwargs['prompt_continuous_actions'] = continuous_actions[sampled_episode_indices[:, None], time_indices]
 
-        return prompt_kwargs
+        prompt_metadata = dict(
+            episode_indices = sampled_episode_indices,
+            start_offsets = start_offsets,
+            prompt_len = self.dream_prompt_len
+        )
+
+        return prompt_kwargs, prompt_metadata
+
+    @torch.no_grad()
+    def _compute_dream_alignment_diagnostics(
+        self,
+        experience: Experience,
+        dreams: Experience,
+        prompt_metadata: dict | None
+    ):
+        if (
+            not exists(prompt_metadata) or
+            not exists(experience.rewards) or
+            not exists(experience.lens) or
+            not exists(dreams.rewards) or
+            not exists(dreams.lens)
+        ):
+            return {}
+
+        episode_indices = prompt_metadata['episode_indices']
+        start_offsets = prompt_metadata['start_offsets']
+        prompt_len = prompt_metadata['prompt_len']
+        transition_lens = self._transition_lens(experience)
+
+        real_start = start_offsets + prompt_len
+        real_remaining = (transition_lens[episode_indices] - real_start).clamp(min = 0)
+        dream_learnable_lens = (dreams.lens - dreams.is_truncated.long()).clamp(min = 0)
+
+        diagnostics = dict(
+            dream_rollout_len_mean = dream_learnable_lens.float().mean().item(),
+            real_future_len_mean = real_remaining.float().mean().item(),
+            dream_rollout_len_minus_real_future_len = (dream_learnable_lens.float() - real_remaining.float()).mean().item(),
+            dream_real_len_mae = (dream_learnable_lens.float() - real_remaining.float()).abs().mean().item(),
+        )
+
+        compare_horizon = min(dreams.rewards.shape[1], experience.rewards.shape[1])
+
+        if compare_horizon <= 0:
+            return diagnostics
+
+        device = dreams.rewards.device
+        time_offsets = torch.arange(compare_horizon, device = device)
+        future_time = real_start[:, None] + time_offsets
+        clamped_future_time = future_time.clamp(max = experience.rewards.shape[1] - 1)
+
+        real_future_rewards = experience.rewards[episode_indices[:, None], clamped_future_time]
+        dream_future_rewards = dreams.rewards[:, :compare_horizon]
+
+        real_mask = time_offsets < real_remaining[:, None]
+        dream_mask = time_offsets < dream_learnable_lens[:, None]
+        shared_mask = real_mask & dream_mask
+
+        diagnostics['dream_shared_horizon_mean'] = shared_mask.sum(dim = -1).float().mean().item()
+
+        if shared_mask.any():
+            gamma = self.unwrapped_model.gae_discount_factor
+            discount = torch.full((compare_horizon,), gamma, device = device).pow(time_offsets)
+
+            masked_real_rewards = real_future_rewards.masked_fill(~shared_mask, 0.)
+            masked_dream_rewards = dream_future_rewards.masked_fill(~shared_mask, 0.)
+
+            real_reward_sums = masked_real_rewards.sum(dim = -1)
+            dream_reward_sums = masked_dream_rewards.sum(dim = -1)
+
+            real_discounted_returns = (masked_real_rewards * discount).sum(dim = -1)
+            dream_discounted_returns = (masked_dream_rewards * discount).sum(dim = -1)
+
+            diagnostics.update(
+                dream_reward_sum_mean = dream_reward_sums.mean().item(),
+                real_reward_sum_mean = real_reward_sums.mean().item(),
+                dream_minus_real_reward_sum = (dream_reward_sums - real_reward_sums).mean().item(),
+                dream_real_reward_sum_mae = (dream_reward_sums - real_reward_sums).abs().mean().item(),
+                dream_discounted_return_mean = dream_discounted_returns.mean().item(),
+                real_discounted_return_mean = real_discounted_returns.mean().item(),
+                dream_minus_real_discounted_return = (dream_discounted_returns - real_discounted_returns).mean().item(),
+                dream_real_discounted_return_mae = (dream_discounted_returns - real_discounted_returns).abs().mean().item(),
+            )
+
+            if exists(dreams.values):
+                diagnostics.update(
+                    dream_value0_mean = dreams.values[:, 0].mean().item(),
+                    dream_value0_dream_return_mae = (dreams.values[:, 0] - dream_discounted_returns).abs().mean().item(),
+                    dream_value0_real_return_mae = (dreams.values[:, 0] - real_discounted_returns).abs().mean().item(),
+                )
+
+        if exists(dreams.continuation_probs):
+            is_truncated = default(experience.is_truncated, torch.ones_like(experience.lens, dtype = torch.bool))
+            known_terminal_mask = ~is_truncated[episode_indices].bool()
+
+            if known_terminal_mask.any():
+                continuation_probs = dreams.continuation_probs.clamp(0., 1.)
+
+                for horizon in (5, 10, 20):
+                    if horizon > continuation_probs.shape[1]:
+                        continue
+
+                    horizon_offsets = time_offsets[:horizon]
+                    horizon_valid = horizon_offsets < dream_learnable_lens[:, None]
+                    horizon_cont = continuation_probs[:, :horizon].masked_fill(~horizon_valid, 1.)
+                    dream_terminal_prob = 1. - horizon_cont.prod(dim = -1)
+
+                    real_terminal_by_horizon = (real_remaining <= horizon).float()
+
+                    masked_pred = dream_terminal_prob[known_terminal_mask]
+                    masked_real = real_terminal_by_horizon[known_terminal_mask]
+
+                    diagnostics.update(
+                        {f'dream_terminal_prob_h{horizon}_mean': masked_pred.mean().item()},
+                        **{f'real_terminal_rate_h{horizon}': masked_real.mean().item()},
+                        **{f'dream_terminal_overconfidence_h{horizon}': (masked_pred - masked_real).mean().item()},
+                        **{f'dream_terminal_brier_h{horizon}': ((masked_pred - masked_real) ** 2).mean().item()},
+                    )
+
+        return diagnostics
 
     def train_policy_from_dreams(self, experience: Experience):
         """Generate dream rollouts and train policy/value heads."""
 
-        prompt_kwargs = self._sample_dream_prompts(experience)
+        prompt_kwargs, prompt_metadata = self._sample_dream_prompts_with_metadata(experience)
         prompt_len = self.dream_prompt_len if 'prompt_latents' in prompt_kwargs else 0
         dream_time_steps = self.dream_timesteps + 1 + prompt_len
+        dream_alignment_diagnostics = {}
 
         for _ in range(self.dream_train_steps_per_collect):
             dreams = self.unwrapped_model.generate(
@@ -1531,6 +1684,7 @@ class DreamerTrainer(Module):
                 **prompt_kwargs,
             )
 
+            dream_alignment_diagnostics = self._compute_dream_alignment_diagnostics(experience, dreams, prompt_metadata)
             policy_loss, value_loss = self.model.learn_from_experience(dreams, use_pmpo = self.use_pmpo)
 
             self.accelerator.backward(policy_loss)
@@ -1549,7 +1703,7 @@ class DreamerTrainer(Module):
             self.value_head_optim.step()
             self.value_head_optim.zero_grad()
 
-        return policy_loss, value_loss
+        return policy_loss, value_loss, dream_alignment_diagnostics
 
     @torch.no_grad()
     def save_visualizations(self, env, env_is_vectorized = False):
@@ -1600,6 +1754,7 @@ class DreamerTrainer(Module):
         self,
         env,
         num_episodes = 5000,
+        max_steps: int | None = None,
         env_is_vectorized = False,
     ):
         pbar = tqdm(range(num_episodes), disable = not self.is_main_process)
@@ -1615,7 +1770,8 @@ class DreamerTrainer(Module):
                 experience = self.unwrapped_model.interact_with_env(
                     env,
                     max_timesteps = self.env_max_timesteps,
-                    env_is_vectorized = env_is_vectorized
+                    env_is_vectorized = env_is_vectorized,
+                    store_final_observation = True
                 )
 
                 num_frames = experience.video.shape[0] * experience.video.shape[2]  # batch * time
@@ -1634,7 +1790,7 @@ class DreamerTrainer(Module):
             else:
                 ep_reward = combined.rewards.sum(dim = -1).mean().item()
 
-            ep_length = combined.lens.float().mean().item() if exists(combined.lens) else combined.video.shape[2]
+            ep_length = self._transition_lens(combined).float().mean().item()
 
             experiences.clear()
 
@@ -1645,9 +1801,10 @@ class DreamerTrainer(Module):
             # 3. train policy/value from dream rollouts (skip during WM warmup)
 
             if self.step.item() >= self.wm_only_steps:
-                policy_loss, value_loss = self.train_policy_from_dreams(combined)
+                policy_loss, value_loss, dream_alignment_diagnostics = self.train_policy_from_dreams(combined)
             else:
                 policy_loss = value_loss = tensor(0., device = self.device)
+                dream_alignment_diagnostics = {}
 
             # logging
 
@@ -1665,6 +1822,7 @@ class DreamerTrainer(Module):
                 log_data.update(wm_loss_breakdown)
 
             log_data.update(getattr(self.unwrapped_model, '_rl_diagnostics', {}))
+            log_data.update(dream_alignment_diagnostics)
 
             self.log(**log_data)
 
@@ -1688,6 +1846,15 @@ class DreamerTrainer(Module):
                 if wm_loss_breakdown['continuous_action_loss'] > 0.:
                     postfix['cont_act'] = f"{wm_loss_breakdown['continuous_action_loss']:.4f}"
 
+            if 'dream_real_discounted_return_mae' in dream_alignment_diagnostics:
+                postfix['dream_ret_gap'] = f"{dream_alignment_diagnostics['dream_real_discounted_return_mae']:.2f}"
+
+            if 'dream_rollout_len_minus_real_future_len' in dream_alignment_diagnostics:
+                postfix['dream_len_bias'] = f"{dream_alignment_diagnostics['dream_rollout_len_minus_real_future_len']:.2f}"
+
+            if 'dream_terminal_overconfidence_h5' in dream_alignment_diagnostics:
+                postfix['term_bias5'] = f"{dream_alignment_diagnostics['dream_terminal_overconfidence_h5']:.2f}"
+
             pbar.set_postfix(ordered_dict = postfix)
 
             if self.log_video_every > 0 and self.is_main_process and divisible_by(self.step.item(), self.log_video_every):
@@ -1697,6 +1864,9 @@ class DreamerTrainer(Module):
 
             if self.checkpoint_every > 0 and self.is_main_process and divisible_by(self.step.item(), self.checkpoint_every):
                 self.save_checkpoint()
+
+            if exists(max_steps) and self.step.item() >= max_steps:
+                break
 
         self.accelerator.end_training()
         self.print('training complete')

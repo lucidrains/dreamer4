@@ -3152,8 +3152,8 @@ class DynamicsWorldModel(Module):
         if predict_terminals:
             self.to_state_terminal_pred = Sequential(
                 create_mlp(
-                    dim_in = dim_latent,
-                    dim = dim_latent * 4,
+                    dim_in = dim,
+                    dim = dim * 4,
                     dim_out = 1,
                     **predict_terminal_mlp_kwargs
                 ),
@@ -3354,7 +3354,8 @@ class DynamicsWorldModel(Module):
         use_time_cache = True,
         store_agent_embed = True,
         store_old_action_unembeds = True,
-        obs_to_latents_fn = None
+        obs_to_latents_fn = None,
+        store_final_observation = False
     ):
         device = self.device
 
@@ -3510,7 +3511,10 @@ class DynamicsWorldModel(Module):
 
             if env_is_vectorized:
                 if not exists(sampled_continuous_actions):
-                    action_out = sampled_discrete_actions.cpu().numpy().reshape(-1)
+                    action_out = sampled_discrete_actions.detach().cpu().numpy()
+
+                    if action_out.shape[-1] == 1:
+                        action_out = action_out.squeeze(-1)
                 else:
                     action_out = (sampled_discrete_actions.cpu().numpy(), sampled_continuous_actions.cpu().numpy())
             else:
@@ -3602,47 +3606,65 @@ class DynamicsWorldModel(Module):
 
             need_bootstrap = is_truncated & ~was_terminated
 
-            if done_flag.all() and need_bootstrap.any():
-                if exists(obs_to_latents_fn):
-                    bootstrap_latents, _ = obs_to_latents_fn(obs, tokenizer_time_cache)
-                else:
-                    bootstrap_latents, _ = self.video_tokenizer(curr_image, return_latents = True, time_cache = tokenizer_time_cache, return_time_cache = True)
-                
-                _, (embeds, _) = self.forward(
-                    latents = bootstrap_latents,
-                    signal_levels = self.max_steps - 1,
-                    step_sizes = step_size,
-                    rewards = rewards[:, -1:] if exists(rewards) else None,
-                    discrete_actions = discrete_actions[:, -1:] if exists(discrete_actions) else None,
-                    continuous_actions = continuous_actions[:, -1:] if exists(continuous_actions) else None,
-                    proprio = accumulated_proprio[:, -1:] if exists(accumulated_proprio) else None,
-                    time_cache = time_cache,
-                    latent_is_noised = True,
-                    return_pred_only = True,
-                    return_intermediates = True
-                )
-                
-                one_agent_embed = embeds.agent[..., -1:, agent_index, :]
-                
-                value_embed = one_agent_embed
+            if done_flag.all():
+                if store_final_observation:
+                    if exists(obs_to_latents_fn):
+                        final_latents, _ = obs_to_latents_fn(self, obs, tokenizer_time_cache)
+                    elif exists(curr_image):
+                        final_latents, _ = self.video_tokenizer(curr_image, return_latents = True, time_cache = tokenizer_time_cache, return_time_cache = True)
+                    elif exists(curr_state):
+                        assert exists(self.state_to_latents), 'DynamicsWorldModel must have dim_state defined to automatically parse state observations'
+                        final_latents = self.state_to_latents(curr_state)
+                        final_latents = rearrange(final_latents, 'b n d -> b 1 n d') if final_latents.ndim == 3 else final_latents
+                    else:
+                        raise ValueError('Observations must contain an image or state key, or provide a custom obs_to_latents_fn')
 
-                if exists(self.critic_state_embedder) and exists(state_frame):
-                    critic_embed = self.critic_state_embedder(state_frame.to(device))
-                    value_embed = value_embed + rearrange(critic_embed, 'batch dim -> batch 1 dim')
+                    acc_latents = safe_cat((acc_latents, final_latents), dim = 1)
+                    episode_lens = torch.where(done_flag, episode_lens + 1, episode_lens)
+                    break
 
-                value_bins = self.value_head(value_embed)
-                bootstrap_value = self.value_encoder.bins_to_scalar_value(value_bins)
+                if need_bootstrap.any():
+                    if exists(obs_to_latents_fn):
+                        bootstrap_latents, _ = obs_to_latents_fn(self, obs, tokenizer_time_cache)
+                    else:
+                        bootstrap_latents, _ = self.video_tokenizer(curr_image, return_latents = True, time_cache = tokenizer_time_cache, return_time_cache = True)
 
-                values = torch.cat((values, bootstrap_value), dim = 1)
-                rewards = torch.cat((rewards, torch.zeros_like(rewards[:, -1:])), dim = 1)
+                    _, (embeds, _) = self.forward(
+                        latents = bootstrap_latents,
+                        signal_levels = self.max_steps - 1,
+                        step_sizes = step_size,
+                        rewards = rewards[:, -1:] if exists(rewards) else None,
+                        discrete_actions = discrete_actions[:, -1:] if exists(discrete_actions) else None,
+                        continuous_actions = continuous_actions[:, -1:] if exists(continuous_actions) else None,
+                        proprio = accumulated_proprio[:, -1:] if exists(accumulated_proprio) else None,
+                        time_cache = time_cache,
+                        latent_is_noised = True,
+                        return_pred_only = True,
+                        return_intermediates = True
+                    )
 
-                if exists(discrete_actions):
-                    discrete_actions = torch.cat((discrete_actions, torch.zeros_like(discrete_actions[:, -1:])), dim = 1) # dummy action
-                    discrete_log_probs = torch.cat((discrete_log_probs, discrete_log_probs[:, -1:] * 0), dim = 1)
+                    one_agent_embed = embeds.agent[..., -1:, agent_index, :]
 
-                acc_latents = safe_cat((acc_latents, acc_latents[:, -1:]), dim = 1)
+                    value_embed = one_agent_embed
 
-                episode_lens = torch.where(need_bootstrap, episode_lens + 1, episode_lens)
+                    if exists(self.critic_state_embedder) and exists(state_frame):
+                        critic_embed = self.critic_state_embedder(state_frame.to(device))
+                        value_embed = value_embed + rearrange(critic_embed, 'batch dim -> batch 1 dim')
+
+                    value_bins = self.value_head(value_embed)
+                    bootstrap_value = self.value_encoder.bins_to_scalar_value(value_bins)
+
+                    values = torch.cat((values, bootstrap_value), dim = 1)
+                    rewards = torch.cat((rewards, torch.zeros_like(rewards[:, -1:])), dim = 1)
+
+                    if exists(discrete_actions):
+                        discrete_actions = torch.cat((discrete_actions, torch.zeros_like(discrete_actions[:, -1:])), dim = 1) # dummy action
+                        discrete_log_probs = torch.cat((discrete_log_probs, discrete_log_probs[:, -1:] * 0), dim = 1)
+
+                    acc_latents = safe_cat((acc_latents, bootstrap_latents), dim = 1)
+
+                    episode_lens = torch.where(need_bootstrap, episode_lens + 1, episode_lens)
+
                 break
 
         video = cat(video_frames, dim=2) if len(video_frames) > 0 else None
@@ -3656,10 +3678,10 @@ class DynamicsWorldModel(Module):
 
         one_experience = Experience(
             latents = acc_latents,
-            video = video[:, :, :-1] if exists(video) else None,
-            critic_state = stacked_states[:, :-1] if exists(stacked_states) else None,
+            video = video if (exists(video) and store_final_observation) else (video[:, :, :-1] if exists(video) else None),
+            critic_state = stacked_states if (exists(stacked_states) and store_final_observation) else (stacked_states[:, :-1] if exists(stacked_states) else None),
             rewards = rewards,
-            proprio = accumulated_proprio[:, :-1] if exists(accumulated_proprio) else None,
+            proprio = accumulated_proprio if (exists(accumulated_proprio) and store_final_observation) else (accumulated_proprio[:, :-1] if exists(accumulated_proprio) else None),
             actions = Actions(discrete_actions, continuous_actions),
             log_probs = Actions(discrete_log_probs, continuous_log_probs),
             values = values,
@@ -3821,7 +3843,8 @@ class DynamicsWorldModel(Module):
         else:
             advantage = returns - old_values
 
-        normalize_advantages = default(normalize_advantages, True)
+        # follow the PMPO paper default of using raw advantage signs unless explicitly overridden
+        normalize_advantages = default(normalize_advantages, not use_pmpo)
 
         if normalize_advantages:
             advantage = z_score(advantage, mask = mask, eps = eps)
@@ -3906,24 +3929,74 @@ class DynamicsWorldModel(Module):
             learn_mask = learn_mask[:, :-1] if exists(learn_mask) else None
             mask = learn_mask
 
-        # ppo clipped surrogate loss
-        # when use_pmpo, advantage is replaced with sign(advantage) following cleanrl pmpo_v2
-        # https://arxiv.org/abs/2410.04166v1
-
-        ratio = (log_probs - old_log_probs).exp()
-        clipped_ratio = ratio.clamp(1. - self.ppo_eps_clip, 1. + self.ppo_eps_clip)
-
-        ppo_advantage = advantage.sign() if use_pmpo else advantage
-
-        policy_loss = -torch.min(ratio * ppo_advantage, clipped_ratio * ppo_advantage)
-
         if use_delight_gating:
             delight_gate = ((-log_probs * advantage) / delight_temperature).sigmoid().detach()
-            policy_loss = policy_loss * delight_gate
 
-        policy_loss = reduce(policy_loss, 'b t na -> b t', 'sum')
+        if use_pmpo:
+            pos_advantage_mask = rearrange(advantage, '... 1 -> ...') >= 0.
+            neg_advantage_mask = ~pos_advantage_mask
 
-        policy_loss = masked_mean(policy_loss, learn_mask)
+            maybe_gated_log_prob = log_probs
+
+            if use_delight_gating:
+                maybe_gated_log_prob = log_probs * delight_gate
+
+            pos = pos_advantage_mask
+            neg = neg_advantage_mask
+
+            if exists(learn_mask):
+                pos = pos & learn_mask
+                neg = neg & learn_mask
+
+            scaled_action_log_probs = maybe_gated_log_prob * advantage.tanh().abs()
+
+            num_actions = scaled_action_log_probs.shape[-1]
+            pos = repeat(pos, 'b t -> b t na', na = num_actions)
+            neg = repeat(neg, 'b t -> b t na', na = num_actions)
+
+            pos_loss, neg_loss = 0., 0.
+
+            if pos.any():
+                pos_loss = scaled_action_log_probs[pos].mean()
+
+            if neg.any():
+                neg_loss = scaled_action_log_probs[neg].mean()
+
+            α = self.pmpo_pos_to_neg_weight
+            policy_loss = -α * pos_loss + (1 - α) * neg_loss
+
+            if self.pmpo_kl_div_loss_weight > 0.:
+                new_unembedded_actions = self.action_embedder.unembed(policy_embed, pred_head_index = 0)
+
+                kl_div_inputs, kl_div_targets = new_unembedded_actions, old_action_unembeds
+
+                if self.pmpo_reverse_kl:
+                    kl_div_inputs, kl_div_targets = kl_div_targets, kl_div_inputs
+
+                discrete_kl_div, continuous_kl_div = self.action_embedder.kl_div(kl_div_inputs, kl_div_targets)
+
+                kl_div_loss = 0.
+
+                if exists(discrete_kl_div):
+                    kl_div_loss = kl_div_loss + masked_mean(discrete_kl_div, learn_mask)
+
+                if exists(continuous_kl_div):
+                    kl_div_loss = kl_div_loss + masked_mean(continuous_kl_div, learn_mask)
+
+                policy_loss = policy_loss + kl_div_loss * self.pmpo_kl_div_loss_weight
+
+        else:
+            ratio = (log_probs - old_log_probs).exp()
+            clipped_ratio = ratio.clamp(1. - self.ppo_eps_clip, 1. + self.ppo_eps_clip)
+
+            policy_loss = -torch.min(ratio * advantage, clipped_ratio * advantage)
+
+            if use_delight_gating:
+                policy_loss = policy_loss * delight_gate
+
+            policy_loss = reduce(policy_loss, 'b t na -> b t', 'sum')
+
+            policy_loss = masked_mean(policy_loss, learn_mask)
 
         # handle entropy loss for naive exploration bonus
 
@@ -3971,16 +4044,27 @@ class DynamicsWorldModel(Module):
             learn_mask = learn_mask[:, :-1] if exists(learn_mask) else None
             mask = learn_mask
 
+        values = self.value_encoder.bins_to_scalar_value(value_logits)
         return_probs = self.value_encoder.target_probs(returns)
 
         value_loss = self.value_encoder.loss(value_logits, target_probs = return_probs)
 
         if self.clip_values and self.value_clip > 0.:
-            values = self.value_encoder.bins_to_scalar_value(value_logits)
             clipped_values = old_values + (values - old_values).clamp(-self.value_clip, self.value_clip)
             clipped_value_logprobs = self.value_encoder.transform_to_logprobs(clipped_values)
             clipped_value_loss = -(return_probs * clipped_value_logprobs).sum(dim = -1)
             value_loss = torch.maximum(value_loss, clipped_value_loss)
+
+        with torch.no_grad():
+            valid_current_values = values[learn_mask]
+            self._rl_diagnostics.update(
+                current_value_mean = valid_current_values.mean().item(),
+                current_value_max = valid_current_values.max().item(),
+                current_value_return_mae = (valid_current_values - returns[learn_mask]).abs().mean().item(),
+                current_value_old_value_mae = (valid_current_values - old_values[learn_mask]).abs().mean().item(),
+                value_target_mean = returns[learn_mask].mean().item(),
+                value_target_max = returns[learn_mask].max().item(),
+            )
 
         value_loss = value_loss[learn_mask].mean()
 
@@ -4312,8 +4396,7 @@ class DynamicsWorldModel(Module):
             # maybe predict terminals
 
             if should_predict_terminals:
-                pooled_latent = reduce(denoised_latent, 'b t v n d -> b t d', 'mean')
-                state_terminal_logits = self.to_state_terminal_pred(pooled_latent)
+                state_terminal_logits = self.to_state_terminal_pred(one_agent_embed)
 
                 # store soft continuation probability for dreamerv3-style return weighting
                 cont_prob = rearrange((-state_terminal_logits).sigmoid(), 'b 1 -> b 1')
@@ -4558,7 +4641,6 @@ class DynamicsWorldModel(Module):
         if exists(rewards):
             rewards_len = rewards.shape[1]
             assert rewards_len in {time, time - 1}, f'rewards must have time length of either {time} or {time - 1}, but got {rewards_len}'
-            assert return_pred_only or rewards_len == time, f'during training, rewards must perfectly align with video length {time}, got {rewards_len}'
 
         # signal and step size related input conforming
 
@@ -5044,7 +5126,8 @@ class DynamicsWorldModel(Module):
 
             reward_pred = rearrange(reward_pred, 'mtp b t l -> b l t mtp')
 
-            reward_targets, reward_loss_mask = create_multi_token_prediction_targets(reward_target_probs[:, :-1], self.multi_token_pred_len)
+            reward_target_seq = reward_target_probs[:, :-1] if rewards.shape[1] == time else reward_target_probs
+            reward_targets, reward_loss_mask = create_multi_token_prediction_targets(reward_target_seq, self.multi_token_pred_len)
 
             reward_targets = rearrange(reward_targets, 'b t mtp l -> b l t mtp')
 
@@ -5061,8 +5144,7 @@ class DynamicsWorldModel(Module):
         # terminal prediction loss
 
         if exists(terminals) and self.predict_terminals:
-            pooled_latents = reduce(latents[:, 1:], 'b t v n d -> b t d', 'mean')
-            state_terminal_pred = self.to_state_terminal_pred(pooled_latents)
+            state_terminal_pred = self.to_state_terminal_pred(agent_tokens_shifted)
 
             if terminals.ndim == 1:
                 last_transition = (lens - 2).clamp(min = 0) if is_var_len else full((batch,), max(time - 2, 0), device = device)
@@ -5172,7 +5254,7 @@ class DynamicsWorldModel(Module):
             )
 
             if is_var_len:
-                action_loss_mask = loss_mask_without_last if pred_len == (time - 1) else loss_mask
+                action_loss_mask = loss_mask[:, :policy_embed.shape[1]]
 
             if exists(discrete_log_probs):
                 discrete_log_probs = discrete_log_probs.masked_fill(~discrete_mask[..., None], 0.)
