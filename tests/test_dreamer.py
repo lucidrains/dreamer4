@@ -866,6 +866,31 @@ def test_epo():
     fitness = torch.randn(16,)
     dynamics.evolve_(fitness)
 
+def test_cache_token_count():
+    from dreamer4 import AxialSpaceTimeTransformer
+
+    model = AxialSpaceTimeTransformer(
+        dim = 32,
+        depth = 4,
+        attn_heads = 4,
+        attn_dim_head = 8,
+        time_block_every = 2,
+        num_special_spatial_tokens = 0,
+        rnn_time = False,
+        value_residual = False,
+        use_attn_pool = False
+    )
+
+    #first pass: no cache, two timesteps
+    x=torch.randn(1,2,3,32)
+    _, cache = model(x, return_intermediates=True)
+    assert cache.token_count == 2
+
+    #second pass: full context+cache
+    x2 = torch.randn(1,3,3,32)
+    _, cache2 = model(x2, cache = cache, return_intermediates = True)
+    assert cache2.token_count == 3
+
 def test_images_to_video_tokenizer():
     import torch
     from dreamer4 import VideoTokenizer, DynamicsWorldModel, AxialSpaceTimeTransformer
