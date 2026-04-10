@@ -229,4 +229,13 @@ Passing `--condition_on_actions True` lets you explicitly prompt with velocity a
 }
 ```
 
+```bibtex
+@article{Lee2021VisionTF,
+    title   = {Vision Transformer for Small-Size Datasets},
+    author  = {Seung Hoon Lee and Seunghyun Lee and Byung Cheol Song},
+    journal = {arXiv preprint arXiv:2112.13492},
+    year    = {2021}
+}
+```
+
 *the conquest of nature is to be achieved through number and measure - angels to Descartes in a dream*
