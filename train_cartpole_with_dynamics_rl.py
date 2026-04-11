@@ -143,6 +143,7 @@ class TransformerPPOAgent(nn.Module):
         use_image_input = False,
         use_conv_encoder = False,
         use_time_rnn = False,
+        use_attn_pool = False,
         pmpo_kl_div_loss_weight = 0.05
     ):
         super().__init__()
@@ -185,7 +186,7 @@ class TransformerPPOAgent(nn.Module):
             num_discrete_actions = 2,
             use_time_rnn = use_time_rnn,
             transformer_kwargs = dict(
-                use_attn_pool = False
+                use_attn_pool = use_attn_pool
             ),
             depth = 3,
             time_block_every = 3,
@@ -271,7 +272,8 @@ def main(
     ssl_stop_after_episodes = 2000,
     ssl_batch_size = 8,
     ssl_max_memories = 128,
-    tokenizer_learning_rate = 1e-4
+    tokenizer_learning_rate = 1e-4,
+    use_attn_pool = False
 ):
     torch.manual_seed(seed)
 
@@ -300,8 +302,6 @@ def main(
     shutil.rmtree(results_folder, ignore_errors=True)
     results_folder.mkdir(exist_ok = True, parents = True)
 
-    log(f'\nReconstruction grids will be saved directly to {results_folder.absolute()}\n')
-
     env = make_env(seed, use_image_input, vectorized=vectorized, num_envs=num_envs)
 
     agent = TransformerPPOAgent(
@@ -310,7 +310,8 @@ def main(
         agent_policy_gradient_frac = agent_policy_gradient_frac,
         use_image_input = use_image_input,
         use_conv_encoder = use_conv_encoder,
-        use_time_rnn = use_time_rnn
+        use_time_rnn = use_time_rnn,
+        use_attn_pool = use_attn_pool
     ).to(device)
 
     # optimizers
@@ -320,6 +321,9 @@ def main(
 
     if has_tokenizer and not use_conv_encoder:
         should_ssl = agent.dynamics.video_tokenizer.has_flow and ssl_every_rl_updates > 0
+
+    if should_ssl:
+        log(f'\nReconstruction grids will be saved directly to {results_folder.absolute()}\n')
 
     if has_tokenizer:
         tokenizer = agent.dynamics.video_tokenizer

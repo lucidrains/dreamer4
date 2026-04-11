@@ -1410,6 +1410,24 @@ def get_attend_fn(
 
     return attend_fn
 
+# residual wrapper
+
+class Residual(Module):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def forward(
+        self,
+        x,
+        *args,
+        **kwargs
+    ):
+        out = self.fn(x, *args, **kwargs)
+        (out, *rest), inverse = tree_flatten_with_inverse(out)
+        out = out + x
+        return inverse((out, *rest))
+
 # attention
 
 class Attention(Module):
@@ -1666,10 +1684,11 @@ class AttentionPool(Module):
             dim = dim,
             heads = heads,
             dim_head = dim_head,
-            gate_values = False,
+            gate_values = True,
             value_residual = False,
             belief_attn = False,
-            rmsnorm_key = True,
+            pre_rmsnorm = True,
+            pre_context_rmsnorm = True,
             **kwargs
         )
 
@@ -1708,9 +1727,11 @@ class AxialSpaceTimeTransformer(Module):
         value_residual = True,               # https://arxiv.org/abs/2410.17897 - but with learned mixing from OSS
         rnn_time = False,
         time_attention_use_pope = False,
-        use_attn_pool = True
+        use_attn_pool = True,
+        use_attn_residual = False
     ):
         super().__init__()
+        self.use_attn_residual = use_attn_residual
         assert depth >= time_block_every, f'depth must be at least {time_block_every}'
 
         # attention
@@ -1751,16 +1772,15 @@ class AxialSpaceTimeTransformer(Module):
 
         # transformer
 
-        layers = []
-        rnn_layers = []
         is_time = []
 
-        rnn_attn_residuals = []
-        attn_attn_residuals = []
-        ff_attn_residuals = []
+        layers = []
+        rnn_layers = []
+        attn_pools = []
 
         for i in range(depth):
             layer_index = i + 1
+            is_last = i == (depth - 1)
 
             is_time_block = divisible_by(layer_index, time_block_every)
             is_time.append(is_time_block)
@@ -1771,20 +1791,30 @@ class AxialSpaceTimeTransformer(Module):
             layers.append(ModuleList([
                 rearrange_to_attend,
                 rearrange_from_attend,
-                Attention(dim = dim, heads = attn_heads, dim_head = attn_dim_head, value_residual = value_residual, **attn_kwargs),
-                SwiGLUFeedforward(dim = dim, **ff_kwargs)
+                Residual(Attention(dim = dim, heads = attn_heads, dim_head = attn_dim_head, value_residual = value_residual, **attn_kwargs)),
+                Residual(SwiGLUFeedforward(dim = dim, **ff_kwargs))
             ]))
 
-            rnn_layers.append(GRULayer(dim, dim) if is_time_block and rnn_time else None)
+            rnn_layers.append(Residual(GRULayer(dim, dim)) if is_time_block and rnn_time else None)
+
+            # maybe attention pool
+            # post-norm + attention residual https://arxiv.org/abs/2603.15031
+
+            maybe_attn_pool = None
+
+            if use_attn_pool and not is_last:
+                maybe_attn_pool = Residual(AttentionPool(dim, **attn_residual_kwargs))
+
+            attn_pools.append(maybe_attn_pool)
 
         self.layers = ModuleList(layers)
         self.rnn_layers = ModuleList(rnn_layers)
+        self.attn_pools = ModuleList(attn_pools)
 
         self.is_time = is_time
 
         self.use_attn_pool = use_attn_pool
-        if use_attn_pool:
-            self.final_attn_pool = AttentionPool(dim, **attn_residual_kwargs)
+        self.final_attn_pool = Residual(AttentionPool(dim, **attn_residual_kwargs)) if use_attn_pool else Identity()
 
         # final norm
 
@@ -1798,8 +1828,8 @@ class AxialSpaceTimeTransformer(Module):
         self.final_special_cross_attn = self.final_special_ff = None
 
         if self.should_special_cross_attend:
-            self.final_special_cross_attn = Attention(dim = dim, heads = attn_heads, dim_head = attn_dim_head, pre_context_rmsnorm = True, **attn_kwargs)
-            self.final_special_ff = SwiGLUFeedforward(dim = dim, **ff_kwargs)
+            self.final_special_cross_attn = Residual(Attention(dim = dim, heads = attn_heads, dim_head = attn_dim_head, pre_context_rmsnorm = True, **attn_kwargs))
+            self.final_special_ff = Residual(SwiGLUFeedforward(dim = dim, **ff_kwargs))
 
     def muon_parameters(self):
         muon_params = []
@@ -1889,13 +1919,16 @@ class AxialSpaceTimeTransformer(Module):
         layer_hiddens = [tokens]
         hiddens = []
 
-        for (pre_attn_rearrange, post_attn_rearrange, attn, ff), maybe_rnn, layer_is_time in zip(self.layers, self.rnn_layers, self.is_time):
+        for (
+            (pre_attn_rearrange, post_attn_rearrange, attn, ff),
+            maybe_rnn,
+            layer_is_time,
+            maybe_attn_pool
+         ) in zip(self.layers, self.rnn_layers, self.is_time, self.attn_pools):
 
             # rnn block
 
             if layer_is_time and exists(maybe_rnn):
-
-                residual = tokens
 
                 tokens = pre_attn_rearrange(tokens)
 
@@ -1909,13 +1942,9 @@ class AxialSpaceTimeTransformer(Module):
 
                 tokens = post_attn_rearrange(tokens)
 
-                tokens = tokens + residual
-
                 layer_hiddens.append(tokens)
 
             # attention block
-
-            residual = tokens
 
             tokens = pre_attn_rearrange(tokens)
 
@@ -1947,8 +1976,6 @@ class AxialSpaceTimeTransformer(Module):
 
             tokens = post_attn_rearrange(tokens_out)
 
-            tokens = tokens + residual
-
             layer_hiddens.append(tokens)
 
             # save kv cache if is time layer
@@ -1964,36 +1991,40 @@ class AxialSpaceTimeTransformer(Module):
 
             # feedforward block
 
-            residual = tokens
-
             tokens = ff(tokens)
-
-            tokens = tokens + residual
 
             layer_hiddens.append(tokens)
 
             hiddens.append(tokens)
 
-        out = self.final_norm(tokens)
+            # attention pooling
 
-        # apply attention pool post norm
+            if exists(maybe_attn_pool):
+                tokens = maybe_attn_pool(tokens, hiddens = layer_hiddens)
 
-        if self.use_attn_pool:
-            out = self.final_attn_pool(out, layer_hiddens) + out
+        # cross attend one last time from special tokens to spatial tokens, so attention on spatial tokens do not go to waste
 
         if self.should_special_cross_attend:
-            non_special_tokens = slice_left_at_dim(out, -self.num_special_spatial_tokens, dim = -2)
-            special_tokens = slice_right_at_dim(out, self.num_special_spatial_tokens, dim = -2)
+            packed_shape = [[space_seq_len - self.num_special_spatial_tokens], [self.num_special_spatial_tokens]]
+            non_special_tokens, special_tokens = unpack(tokens, packed_shape, 'b t * d')
 
-            special_tokens_out = self.final_special_cross_attn(
+            special_tokens = self.final_special_cross_attn(
                 special_tokens,
                 context = non_special_tokens
             )
 
-            special_tokens = special_tokens + special_tokens_out
-            special_tokens = self.final_special_ff(special_tokens) + special_tokens
+            special_tokens = self.final_special_ff(special_tokens)
 
-            out = torch.cat((non_special_tokens, special_tokens), dim = -2)
+            tokens, _ = pack((non_special_tokens, special_tokens), 'b t * d')
+
+        # apply maybe attention pool just before final norm
+
+        if self.use_attn_pool:
+            tokens = self.final_attn_pool(tokens, layer_hiddens)
+
+        # final norm
+
+        out = self.final_norm(tokens)
 
         if has_kv_cache:
             # just concat the past tokens back on for now, todo - clean up the logic
@@ -2072,6 +2103,7 @@ class CausalDepthwiseConv3d(Module):
 
         if return_time_cache:
             return out, next_time_cache
+
         return out
 
 # shifted patch tokenization
