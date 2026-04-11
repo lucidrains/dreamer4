@@ -1298,8 +1298,8 @@ class DreamerTrainer(Module):
         self.model = model
 
         # world model optimizer
-        # keep the policy/action parameters here because the autoregressive action loss trains them
-        # exclude only the value head, which is optimized purely from RL targets
+        # exclude only the value head; the policy head may optionally receive warmup
+        # action-modeling updates before dream RL starts
 
         optim_kwargs = dict(lr = learning_rate, weight_decay = weight_decay)
 
@@ -1478,6 +1478,10 @@ class DreamerTrainer(Module):
                 continuous_actions = continuous_actions,
                 lens = lens,
                 return_all_losses = True,
+                add_autoregressive_action_loss = (
+                    self.step.item() < self.wm_only_steps or
+                    self.dream_train_steps_per_collect <= 0
+                ),
             )
 
             wm_loss_breakdown = dict(
