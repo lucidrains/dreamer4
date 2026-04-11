@@ -781,6 +781,81 @@ def test_dreamer_trainer_alignment_diagnostics():
     assert 'dream_value0_dream_return_mae' in diagnostics
     assert 'dream_value0_real_return_mae' in diagnostics
 
+def test_dreamer_trainer_prompt_sampling_excludes_terminal_boundary():
+    from dreamer4.dreamer4 import DynamicsWorldModel, Experience, Actions
+    from dreamer4.trainers import DreamerTrainer
+
+    world_model = DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 16,
+        max_steps = 64,
+        num_latent_tokens = 1,
+        depth = 2,
+        time_block_every = 1,
+        num_spatial_tokens = 1,
+        pred_orig_latent = True,
+        num_discrete_actions = 4,
+        attn_dim_head = 16,
+    )
+
+    trainer = DreamerTrainer(
+        world_model,
+        batch_size = 1,
+        dream_prompt_len = 2,
+        cpu = True
+    )
+
+    experience = Experience(
+        latents = torch.randn(1, 2, 1, 16),
+        rewards = torch.randn(1, 2),
+        actions = Actions(torch.randint(0, 4, (1, 2, 1)), None),
+        lens = torch.tensor([2]),
+        is_truncated = torch.tensor([False])
+    )
+
+    prompt_kwargs, prompt_metadata = trainer._sample_dream_prompts_with_metadata(experience)
+
+    assert prompt_kwargs == {}
+    assert prompt_metadata is None
+
+def test_dreamer_trainer_skips_prompted_dream_update_when_prompt_unavailable():
+    from dreamer4.dreamer4 import DynamicsWorldModel, Experience, Actions
+    from dreamer4.trainers import DreamerTrainer
+
+    world_model = DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 16,
+        max_steps = 64,
+        num_latent_tokens = 1,
+        depth = 2,
+        time_block_every = 1,
+        num_spatial_tokens = 1,
+        pred_orig_latent = True,
+        num_discrete_actions = 4,
+        attn_dim_head = 16,
+    )
+
+    trainer = DreamerTrainer(
+        world_model,
+        batch_size = 1,
+        dream_prompt_len = 2,
+        cpu = True
+    )
+
+    experience = Experience(
+        latents = torch.randn(1, 2, 1, 16),
+        rewards = torch.randn(1, 2),
+        actions = Actions(torch.randint(0, 4, (1, 2, 1)), None),
+        lens = torch.tensor([2]),
+        is_truncated = torch.tensor([False])
+    )
+
+    policy_loss, value_loss, diagnostics = trainer.train_policy_from_dreams(experience)
+
+    assert policy_loss.item() == 0.
+    assert value_loss.item() == 0.
+    assert diagnostics['dream_prompt_unavailable'] == 1.
+
 def test_interact_with_env_store_final_observation_for_terminated_episode():
     from dreamer4.dreamer4 import DynamicsWorldModel, VideoTokenizer
     from dreamer4.mocks import MockEnv

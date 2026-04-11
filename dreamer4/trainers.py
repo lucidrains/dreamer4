@@ -1528,7 +1528,7 @@ class DreamerTrainer(Module):
         if not exists(latents) or not exists(lens):
             return {}, None
 
-        valid_episode_mask = lens >= self.dream_prompt_len
+        valid_episode_mask = lens > self.dream_prompt_len
 
         if not valid_episode_mask.any():
             return {}, None
@@ -1537,7 +1537,7 @@ class DreamerTrainer(Module):
         sampled_episode_indices = valid_episode_indices[torch.randint(len(valid_episode_indices), (self.batch_size,), device = latents.device)]
 
         sampled_lens = lens[sampled_episode_indices]
-        max_start = sampled_lens - self.dream_prompt_len
+        max_start = sampled_lens - self.dream_prompt_len - 1
         start_offsets = (torch.rand((self.batch_size,), device = latents.device) * (max_start + 1).float()).floor().long()
         time_offsets = torch.arange(self.dream_prompt_len, device = latents.device)
         time_indices = start_offsets[:, None] + time_offsets
@@ -1685,6 +1685,10 @@ class DreamerTrainer(Module):
         """Generate dream rollouts and train policy/value heads."""
 
         prompt_kwargs, prompt_metadata = self._sample_dream_prompts_with_metadata(experience)
+        if self.dream_prompt_len > 0 and not exists(prompt_metadata):
+            zero = tensor(0., device = self.device)
+            return zero, zero, dict(dream_prompt_unavailable = 1.)
+
         prompt_len = self.dream_prompt_len if 'prompt_latents' in prompt_kwargs else 0
         dream_time_steps = self.dream_timesteps + 1 + prompt_len
         dream_alignment_diagnostics = {}
