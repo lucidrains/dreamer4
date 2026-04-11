@@ -903,6 +903,34 @@ def test_cache_generate():
     generated, time_cache = dynamics.generate(1, time_cache = time_cache, return_time_cache = True)
     generated, time_cache = dynamics.generate(1, time_cache = time_cache, return_time_cache = True)
 
+def test_transformer_cache_token_count_advances_by_new_tokens_only():
+    from dreamer4.dreamer4 import DynamicsWorldModel
+
+    dynamics = DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 16,
+        max_steps = 64,
+        num_tasks = 4,
+        num_latent_tokens = 4,
+        depth = 1,
+        time_block_every = 1,
+        num_spatial_tokens = 1,
+        pred_orig_latent = True,
+        num_discrete_actions = 4,
+        attn_dim_head = 16,
+        prob_shortcut_train = 0.9
+    )
+
+    tokens = torch.randn(1, 2, 3, 16)
+    _, cache = dynamics.transformer(tokens, return_intermediates = True)
+
+    assert cache.token_count == 2
+
+    more_tokens = torch.randn(1, 3, 3, 16)
+    _, cache = dynamics.transformer(more_tokens, cache = cache, return_intermediates = True)
+
+    assert cache.token_count == 3
+
 @param('vectorized', (False, True))
 @param('use_pmpo', (False, True))
 @param('env_can_terminate', (False, True))

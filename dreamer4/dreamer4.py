@@ -1958,12 +1958,15 @@ class AxialSpaceTimeTransformer(Module):
         time_attn_kv_caches = []
         rnn_hiddens = []
 
+        processed_time = time
+
         if has_kv_cache:
             if time > 1:
                 past_tokens, tokens = tokens[:, :-1], tokens[:, -1:]
             else:
                 past_tokens = tokens[:, :0]
 
+            processed_time = tokens.shape[1]
             rotary_seq_len = 1
             rotary_pos_offset = token_count
         else:
@@ -2104,7 +2107,7 @@ class AxialSpaceTimeTransformer(Module):
             safe_stack(normed_space_attn_inputs),
             safe_stack(rnn_hiddens),
             hiddens,
-            token_count + time
+            token_count + processed_time
         )
 
         return out, intermediates
