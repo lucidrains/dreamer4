@@ -1862,33 +1862,31 @@ class AxialSpaceTimeTransformer(Module):
             rnn_prev_hiddens = cache.next_rnn_hiddens
             token_count = cache.token_count
 
-        # attend functions for space and time
+        # maybe excise past tokens if continuing from cache, and redefine time as the number of tokens to process
 
         has_kv_cache = exists(kv_cache)
+
+        past_tokens = tokens[:, :0]
+
+        if has_kv_cache and time > 1:
+            past_tokens, tokens = tokens[:, :-1], tokens[:, -1:]
+
+        time = tokens.shape[1]
+
+        # attention function related
+
         use_flex = exists(flex_attention) and tokens.is_cuda and not has_kv_cache # KV cache shape breaks flex attention TODO: Fix
 
         attend_kwargs = dict(use_flex = use_flex, softclamp_value = self.attn_softclamp_value, special_attend_only_itself = self.special_attend_only_itself, device = device)
 
         space_attend = get_attend_fn(causal = False, seq_len = space_seq_len, k_seq_len = space_seq_len, num_special_tokens = self.num_special_spatial_tokens, **attend_kwargs) # space has an agent token on the right-hand side for reinforcement learning - cannot be attended to by modality
 
-        time_attend = get_attend_fn(causal = True, seq_len = time, k_seq_len = time, **attend_kwargs)
+        time_attend = get_attend_fn(causal = True, seq_len = time, k_seq_len = time + token_count, **attend_kwargs)
 
         # prepare cache
 
         time_attn_kv_caches = []
         rnn_hiddens = []
-
-        if has_kv_cache:
-            if time > 1:
-                past_tokens, tokens = tokens[:, :-1], tokens[:, -1:]
-            else:
-                past_tokens = tokens[:, :0]
-
-            rotary_seq_len = 1
-            rotary_pos_offset = token_count
-        else:
-            rotary_seq_len = time
-            rotary_pos_offset = 0
 
         kv_cache = default(kv_cache, (None,))
 
@@ -1900,7 +1898,7 @@ class AxialSpaceTimeTransformer(Module):
 
         # positional embs
 
-        time_pos_emb = self.time_rotary(rotary_seq_len, offset = rotary_pos_offset)
+        time_pos_emb = self.time_rotary(time, offset = token_count)
 
         # value residual
 
@@ -2027,7 +2025,6 @@ class AxialSpaceTimeTransformer(Module):
         out = self.final_norm(tokens)
 
         if has_kv_cache:
-            # just concat the past tokens back on for now, todo - clean up the logic
             out = cat((past_tokens, out), dim = 1)
 
         if not return_intermediates:
@@ -2039,7 +2036,7 @@ class AxialSpaceTimeTransformer(Module):
             safe_stack(normed_space_attn_inputs),
             safe_stack(rnn_hiddens),
             hiddens,
-            token_count + tokens.shape[1]
+            token_count + time
         )
 
         return out, intermediates
