@@ -1846,6 +1846,8 @@ class DreamerTrainer(Module):
             if exists(wm_loss_breakdown):
                 log_data.update(wm_loss_breakdown)
 
+            log_data.update(getattr(self.unwrapped_model, '_env_policy_diagnostics', {}))
+            log_data.update(getattr(self.unwrapped_model, '_wm_policy_diagnostics', {}))
             log_data.update(getattr(self.unwrapped_model, '_rl_diagnostics', {}))
             log_data.update(dream_alignment_diagnostics)
 

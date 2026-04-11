@@ -321,6 +321,15 @@ def test_action_with_world_model():
 
     for key in (
         'policy_entropy_mean',
+        'policy_log_prob_mean',
+        'old_policy_log_prob_mean',
+        'policy_log_prob_delta_abs_mean',
+        'policy_log_prob_delta_max_abs',
+        'policy_log_prob_delta_zero_frac',
+        'policy_discrete_confidence_mean',
+        'policy_discrete_confidence_max',
+        'policy_discrete_logit_abs_mean',
+        'policy_discrete_logit_max',
         'ppo_ratio_mean',
         'ppo_approx_kl',
         'ppo_clipfrac',
@@ -329,6 +338,100 @@ def test_action_with_world_model():
 
     actor_loss.backward(retain_graph = True)
     critic_loss.backward()
+
+def test_policy_diagnostics_handle_empty_learn_mask():
+    from dataclasses import replace
+    from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
+
+    tokenizer = VideoTokenizer(
+        128,
+        dim_latent = 16,
+        patch_size = 16,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        time_block_every = 1,
+        attn_heads = 2,
+        image_height = 32,
+        image_width = 32,
+    )
+
+    dynamics = DynamicsWorldModel(
+        128,
+        num_agents = 1,
+        video_tokenizer = tokenizer,
+        dim_latent = 16,
+        num_discrete_actions = 4,
+        depth = 1,
+        time_block_every = 1,
+    )
+
+    generations = dynamics.generate(
+        time_steps = 1,
+        batch_size = 2,
+        return_for_policy_optimization = True,
+        return_decoded_video = False,
+    )
+
+    generations = replace(
+        generations,
+        lens = torch.zeros_like(generations.lens),
+        is_truncated = torch.ones_like(generations.is_truncated, dtype = torch.bool),
+    )
+
+    actor_loss, critic_loss = dynamics.learn_from_experience(generations, use_pmpo = False)
+
+    assert actor_loss.numel() == 1
+    assert critic_loss.numel() == 1
+    assert dynamics._rl_diagnostics['policy_log_prob_delta_max_abs'] == 0.
+    assert dynamics._rl_diagnostics['policy_discrete_confidence_max'] == 0.
+
+def test_world_model_policy_diagnostics_are_logged():
+    from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
+
+    tokenizer = VideoTokenizer(
+        64,
+        dim_latent = 8,
+        patch_size = 16,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        time_block_every = 1,
+        attn_heads = 2,
+        image_height = 32,
+        image_width = 32,
+    )
+
+    dynamics = DynamicsWorldModel(
+        64,
+        num_agents = 1,
+        video_tokenizer = tokenizer,
+        dim_latent = 8,
+        depth = 1,
+        time_block_every = 1,
+        num_discrete_actions = 4,
+        predict_terminals = True
+    )
+
+    video = torch.randn(2, 3, 4, 32, 32)
+    rewards = torch.randn(2, 4)
+    terminals = torch.zeros(2, dtype = torch.bool)
+    discrete_actions = torch.randint(0, 4, (2, 4, 1))
+
+    dynamics(
+        video = video,
+        rewards = rewards,
+        terminals = terminals,
+        discrete_actions = discrete_actions,
+        return_all_losses = True
+    )
+
+    for key in (
+        'wm_agent_token_norm_mean',
+        'wm_policy_embed_norm_mean',
+        'wm_policy_discrete_logit_abs_mean',
+        'wm_policy_discrete_confidence_mean',
+        'wm_policy_discrete_entropy_mean',
+    ):
+        assert key in dynamics._wm_policy_diagnostics
 
 def test_realign_generated_experience_for_policy_optimization():
     from dreamer4.dreamer4 import Experience, Actions, realign_generated_experience_for_policy_optimization
@@ -805,6 +908,39 @@ def test_dreamer_trainer_alignment_diagnostics():
     assert 'dream_value0_dream_return_mae' in diagnostics
     assert 'dream_value0_real_return_mae' in diagnostics
 
+def test_dreamer_trainer_excludes_value_head_from_world_model_optimizer():
+    from dreamer4.dreamer4 import DynamicsWorldModel
+    from dreamer4.trainers import DreamerTrainer
+
+    world_model = DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 16,
+        max_steps = 64,
+        num_latent_tokens = 1,
+        depth = 2,
+        time_block_every = 1,
+        num_spatial_tokens = 1,
+        pred_orig_latent = True,
+        num_discrete_actions = 4,
+        attn_dim_head = 16,
+    )
+
+    trainer = DreamerTrainer(
+        world_model,
+        batch_size = 2,
+        cpu = True
+    )
+
+    world_model_param_ids = {
+        id(param)
+        for group in trainer.world_model_optim.param_groups
+        for param in group['params']
+    }
+
+    value_param_ids = {id(param) for param in trainer.unwrapped_model.value_head_parameters()}
+
+    assert world_model_param_ids.isdisjoint(value_param_ids)
+
 def test_dreamer_trainer_prompt_sampling_excludes_terminal_boundary():
     from dreamer4.dreamer4 import DynamicsWorldModel, Experience, Actions
     from dreamer4.trainers import DreamerTrainer
@@ -933,6 +1069,15 @@ def test_interact_with_env_store_final_observation_for_terminated_episode():
     assert experience.lens.item() == experience.latents.shape[1]
     assert bool(experience.terminals.item())
     assert not bool(experience.is_truncated.item())
+
+    for key in (
+        'env_actor_input_norm_mean',
+        'env_policy_embed_norm_mean',
+        'env_policy_discrete_logit_abs_mean',
+        'env_policy_discrete_confidence_mean',
+        'env_policy_discrete_entropy_mean',
+    ):
+        assert key in world_model._env_policy_diagnostics
 
 def test_interact_with_env_store_final_observation_for_truncated_episode():
     from dreamer4.dreamer4 import DynamicsWorldModel
@@ -1514,6 +1659,45 @@ def test_prompted_policy_generation_drops_prompt_prefix():
     assert generations.values.shape == (2, 5)
     assert generations.lens.shape == (2,)
     assert torch.equal(generations.lens, torch.full((2,), 5, device = generations.lens.device))
+
+def test_continuous_only_policy_optimization_path():
+    from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
+
+    tokenizer = VideoTokenizer(
+        128,
+        dim_latent = 16,
+        patch_size = 16,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        time_block_every = 1,
+        attn_heads = 2,
+        image_height = 32,
+        image_width = 32,
+    )
+
+    dynamics = DynamicsWorldModel(
+        128,
+        num_agents = 1,
+        video_tokenizer = tokenizer,
+        dim_latent = 16,
+        num_continuous_actions = 2,
+        depth = 1,
+        time_block_every = 1,
+        predict_terminals = False,
+    )
+
+    generations = dynamics.generate(
+        time_steps = 6,
+        batch_size = 2,
+        return_for_policy_optimization = True,
+        return_decoded_video = False,
+    )
+
+    actor_loss, critic_loss = dynamics.learn_from_experience(generations, use_pmpo = False)
+
+    assert actor_loss.numel() == 1
+    assert critic_loss.numel() == 1
+    assert 'ppo_ratio_mean' in dynamics._rl_diagnostics
 
 def test_calc_gae_excludes_bootstrap_delta_for_truncated_tail():
     from dreamer4.dreamer4 import calc_gae

@@ -3508,7 +3508,21 @@ class DynamicsWorldModel(Module):
         tokenizer_time_cache = None
 
         step_index = 0
-        
+
+        env_policy_diag = dict(
+            actor_input_norm_sum = 0.,
+            actor_input_norm_max = 0.,
+            policy_embed_norm_sum = 0.,
+            policy_embed_norm_max = 0.,
+            policy_discrete_logit_abs_sum = 0.,
+            policy_discrete_logit_abs_max = 0.,
+            policy_discrete_conf_sum = 0.,
+            policy_discrete_entropy_sum = 0.,
+            policy_continuous_logvar_sum = 0.,
+            policy_continuous_std_sum = 0.,
+            count = 0
+        )
+
         obs = init_obs
         curr_image = image_frame
         curr_state = state_frame
@@ -3570,20 +3584,57 @@ class DynamicsWorldModel(Module):
 
             policy_embed = self.policy_head(one_agent_embed)
 
+            one_agent_embed_norm = one_agent_embed.norm(dim = -1)
+            env_policy_diag['actor_input_norm_sum'] += one_agent_embed_norm.mean().item()
+            env_policy_diag['actor_input_norm_max'] = max(env_policy_diag['actor_input_norm_max'], one_agent_embed_norm.max().item())
+
+            policy_embed_norm = policy_embed.norm(dim = -1)
+            env_policy_diag['policy_embed_norm_sum'] += policy_embed_norm.mean().item()
+            env_policy_diag['policy_embed_norm_max'] = max(env_policy_diag['policy_embed_norm_max'], policy_embed_norm.max().item())
+            env_policy_diag['count'] += 1
+
+            discrete_logits, continuous_mean_log_var = self.action_embedder.unembed(
+                policy_embed,
+                pred_head_index = 0,
+                return_split_discrete = True
+            )
+
+            if exists(discrete_logits):
+                discrete_dist = MultiCategorical(discrete_logits, use_parallel_multi_discrete = True)
+                sampled_discrete_actions = discrete_dist.sample(temperature = 1.)
+                one_discrete_log_probs = discrete_dist.log_prob(sampled_discrete_actions)
+                discrete_entropies = discrete_dist.entropy()
+                discrete_probs = [logits.softmax(dim = -1) for logits in discrete_logits]
+                discrete_confidences = [probs.amax(dim = -1) for probs in discrete_probs]
+
+                discrete_confidence = stack(discrete_confidences, dim = -1).mean(dim = -1)
+                discrete_entropy = reduce(discrete_entropies, '... na -> ...', 'sum')
+
+                env_policy_diag['policy_discrete_conf_sum'] += discrete_confidence.mean().item()
+                env_policy_diag['policy_discrete_entropy_sum'] += discrete_entropy.mean().item()
+                env_policy_diag['policy_discrete_logit_abs_sum'] += stack([logits.abs().mean() for logits in discrete_logits]).mean().item()
+                env_policy_diag['policy_discrete_logit_abs_max'] = max(env_policy_diag['policy_discrete_logit_abs_max'], stack([logits.abs().amax() for logits in discrete_logits]).amax().item())
+            else:
+                sampled_discrete_actions = None
+                one_discrete_log_probs = None
+
+            if exists(continuous_mean_log_var):
+                continuous_mean, continuous_log_var = continuous_mean_log_var.unbind(dim = -1)
+                continuous_std = (0.5 * continuous_log_var).exp()
+                sampled_continuous_actions = continuous_mean + continuous_std * torch.randn_like(continuous_mean)
+                continuous_distr = mean_log_var_to_distr(continuous_mean_log_var)
+                one_continuous_log_probs = continuous_distr.log_prob(sampled_continuous_actions)
+                env_policy_diag['policy_continuous_logvar_sum'] += continuous_log_var.mean().item()
+                env_policy_diag['policy_continuous_std_sum'] += continuous_std.mean().item()
+            else:
+                sampled_continuous_actions = None
+                one_continuous_log_probs = None
+
             if store_old_action_unembeds:
                 acc_policy_embed = safe_cat((acc_policy_embed, policy_embed), dim = 1)
 
-            sampled_discrete_actions, sampled_continuous_actions = self.action_embedder.sample(policy_embed, pred_head_index = 0, squeeze = True)
-
             discrete_actions = safe_cat((discrete_actions, sampled_discrete_actions), dim = 1)
             continuous_actions = safe_cat((continuous_actions, sampled_continuous_actions), dim = 1)
-
-            one_discrete_log_probs, one_continuous_log_probs = self.action_embedder.log_probs(
-                policy_embed,
-                pred_head_index = 0,
-                discrete_targets = sampled_discrete_actions,
-                continuous_targets = sampled_continuous_actions,
-            )
 
             discrete_log_probs = safe_cat((discrete_log_probs, one_discrete_log_probs), dim = 1)
             continuous_log_probs = safe_cat((continuous_log_probs, one_continuous_log_probs), dim = 1)
@@ -3781,6 +3832,22 @@ class DynamicsWorldModel(Module):
             episode_return = episode_return
         )
 
+        env_policy_diag_count = env_policy_diag.pop('count')
+
+        if env_policy_diag_count > 0:
+            self._env_policy_diagnostics = dict(
+                env_actor_input_norm_mean = env_policy_diag['actor_input_norm_sum'] / env_policy_diag_count,
+                env_actor_input_norm_max = env_policy_diag['actor_input_norm_max'],
+                env_policy_embed_norm_mean = env_policy_diag['policy_embed_norm_sum'] / env_policy_diag_count,
+                env_policy_embed_norm_max = env_policy_diag['policy_embed_norm_max'],
+                env_policy_discrete_logit_abs_mean = env_policy_diag['policy_discrete_logit_abs_sum'] / env_policy_diag_count,
+                env_policy_discrete_logit_abs_max = env_policy_diag['policy_discrete_logit_abs_max'],
+                env_policy_discrete_confidence_mean = env_policy_diag['policy_discrete_conf_sum'] / env_policy_diag_count,
+                env_policy_discrete_entropy_mean = env_policy_diag['policy_discrete_entropy_sum'] / env_policy_diag_count,
+                env_policy_continuous_logvar_mean = env_policy_diag['policy_continuous_logvar_sum'] / env_policy_diag_count,
+                env_policy_continuous_std_mean = env_policy_diag['policy_continuous_std_sum'] / env_policy_diag_count,
+            )
+
         return one_experience
 
     # ppo
@@ -3949,13 +4016,22 @@ class DynamicsWorldModel(Module):
             valid_returns = returns[learn_mask]
             valid_values = old_values[learn_mask]
             valid_advantages = advantage[learn_mask]
-            self._rl_diagnostics = dict(
-                dreamed_reward_mean = rewards[learn_mask].mean().item(),
-                dreamed_value_mean = valid_values.mean().item(),
-                dreamed_return_mean = valid_returns.mean().item(),
-                dreamed_return_max = valid_returns.max().item(),
-                dreamed_adv_abs_mean = valid_advantages.abs().mean().item(),
-            )
+            if valid_returns.numel() == 0:
+                self._rl_diagnostics = dict(
+                    dreamed_reward_mean = 0.,
+                    dreamed_value_mean = 0.,
+                    dreamed_return_mean = 0.,
+                    dreamed_return_max = 0.,
+                    dreamed_adv_abs_mean = 0.,
+                )
+            else:
+                self._rl_diagnostics = dict(
+                    dreamed_reward_mean = rewards[learn_mask].mean().item(),
+                    dreamed_value_mean = valid_values.mean().item(),
+                    dreamed_return_mean = valid_returns.mean().item(),
+                    dreamed_return_max = valid_returns.max().item(),
+                    dreamed_adv_abs_mean = valid_advantages.abs().mean().item(),
+                )
 
         # replay for the action logits and values
         # but only do so if fine tuning the entire world model for RL
@@ -3995,8 +4071,17 @@ class DynamicsWorldModel(Module):
         
         # align actions with policy embed if latents had a bootstrap state appended
         
-        if exists(discrete_actions) and discrete_actions.shape[1] == latents.shape[1] and discrete_actions.shape[1] == policy_embed.shape[1] + 1:
-            discrete_actions = discrete_actions[:, :-1]
+        action_time_len = None
+
+        if exists(discrete_actions):
+            action_time_len = discrete_actions.shape[1]
+        elif exists(continuous_actions):
+            action_time_len = continuous_actions.shape[1]
+
+        if exists(action_time_len) and action_time_len == latents.shape[1] and action_time_len == policy_embed.shape[1] + 1:
+            if exists(discrete_actions):
+                discrete_actions = discrete_actions[:, :-1]
+
             if exists(continuous_actions):
                 continuous_actions = continuous_actions[:, :-1]
 
@@ -4004,7 +4089,14 @@ class DynamicsWorldModel(Module):
 
         # concat discrete and continuous actions into one for optimizing
 
-        if exists(old_log_probs) and old_log_probs.discrete.shape[1] == policy_embed.shape[1] + 1:
+        old_log_prob_time_len = None
+
+        if exists(old_log_probs.discrete):
+            old_log_prob_time_len = old_log_probs.discrete.shape[1]
+        elif exists(old_log_probs.continuous):
+            old_log_prob_time_len = old_log_probs.continuous.shape[1]
+
+        if exists(old_log_prob_time_len) and old_log_prob_time_len == policy_embed.shape[1] + 1:
             old_log_probs = Actions(
                 old_log_probs.discrete[:, :-1] if exists(old_log_probs.discrete) else None,
                 old_log_probs.continuous[:, :-1] if exists(old_log_probs.continuous) else None
@@ -4022,6 +4114,8 @@ class DynamicsWorldModel(Module):
             advantage = advantage[:, :-1]
             learn_mask = learn_mask[:, :-1] if exists(learn_mask) else None
             mask = learn_mask
+
+        policy_learn_mask = learn_mask
 
         if use_delight_gating:
             delight_gate = ((-log_probs * advantage) / delight_temperature).sigmoid().detach()
@@ -4100,16 +4194,78 @@ class DynamicsWorldModel(Module):
         entropy_loss = masked_mean(entropy_loss, learn_mask)
 
         with torch.no_grad():
-            self._rl_diagnostics.update(
-                policy_entropy_mean = masked_mean(action_entropies, learn_mask).item(),
+            if exists(policy_learn_mask):
+                expanded_policy_learn_mask = repeat(policy_learn_mask, 'b t -> b t na', na = log_probs.shape[-1])
+                valid_log_probs = log_probs[expanded_policy_learn_mask]
+                valid_old_log_probs = old_log_probs[expanded_policy_learn_mask]
+            else:
+                valid_log_probs = log_probs.flatten()
+                valid_old_log_probs = old_log_probs.flatten()
+
+            if valid_log_probs.numel() == 0:
+                self._rl_diagnostics.update(
+                    policy_entropy_mean = 0.,
+                    policy_log_prob_mean = 0.,
+                    old_policy_log_prob_mean = 0.,
+                    policy_log_prob_delta_abs_mean = 0.,
+                    policy_log_prob_delta_max_abs = 0.,
+                    policy_log_prob_delta_zero_frac = 0.,
+                )
+            else:
+                log_prob_delta = valid_log_probs - valid_old_log_probs
+
+                self._rl_diagnostics.update(
+                    policy_entropy_mean = masked_mean(action_entropies, learn_mask).item(),
+                    policy_log_prob_mean = valid_log_probs.mean().item(),
+                    old_policy_log_prob_mean = valid_old_log_probs.mean().item(),
+                    policy_log_prob_delta_abs_mean = log_prob_delta.abs().mean().item(),
+                    policy_log_prob_delta_max_abs = log_prob_delta.abs().max().item(),
+                    policy_log_prob_delta_zero_frac = (log_prob_delta.abs() < 1e-12).float().mean().item(),
+                )
+
+            discrete_logits, continuous_mean_log_var = self.action_embedder.unembed(
+                policy_embed,
+                pred_head_index = 0,
+                return_split_discrete = True
             )
+
+            if exists(discrete_logits):
+                discrete_confidences = [logits.softmax(dim = -1).amax(dim = -1) for logits in discrete_logits]
+                discrete_confidence = stack(discrete_confidences, dim = -1).mean(dim = -1)
+
+                if exists(policy_learn_mask):
+                    valid_discrete_confidence = discrete_confidence[policy_learn_mask]
+                else:
+                    valid_discrete_confidence = discrete_confidence.flatten()
+
+                if valid_discrete_confidence.numel() == 0:
+                    self._rl_diagnostics.update(
+                        policy_discrete_confidence_mean = 0.,
+                        policy_discrete_confidence_max = 0.,
+                        policy_discrete_logit_abs_mean = 0.,
+                        policy_discrete_logit_max = 0.,
+                    )
+                else:
+                    self._rl_diagnostics.update(
+                        policy_discrete_confidence_mean = valid_discrete_confidence.mean().item(),
+                        policy_discrete_confidence_max = valid_discrete_confidence.max().item(),
+                        policy_discrete_logit_abs_mean = stack([logits.abs().mean() for logits in discrete_logits]).mean().item(),
+                        policy_discrete_logit_max = stack([logits.abs().amax() for logits in discrete_logits]).amax().item(),
+                    )
+
+            if exists(continuous_mean_log_var):
+                _, continuous_log_var = continuous_mean_log_var.unbind(dim = -1)
+                self._rl_diagnostics.update(
+                    policy_continuous_logvar_mean = continuous_log_var.mean().item(),
+                    policy_continuous_std_mean = (0.5 * continuous_log_var).exp().mean().item(),
+                )
 
             if not use_pmpo:
                 log_ratio = log_probs - old_log_probs
                 clip_mask = (ratio < (1. - self.ppo_eps_clip)) | (ratio > (1. + self.ppo_eps_clip))
 
-                if exists(learn_mask):
-                    expanded_learn_mask = repeat(learn_mask, 'b t -> b t na', na = ratio.shape[-1])
+                if exists(policy_learn_mask):
+                    expanded_learn_mask = repeat(policy_learn_mask, 'b t -> b t na', na = ratio.shape[-1])
                     valid_log_ratio = log_ratio[expanded_learn_mask]
                     valid_ratio = ratio[expanded_learn_mask]
                     valid_clip_mask = clip_mask[expanded_learn_mask]
@@ -4118,11 +4274,18 @@ class DynamicsWorldModel(Module):
                     valid_ratio = ratio.flatten()
                     valid_clip_mask = clip_mask.flatten()
 
-                self._rl_diagnostics.update(
-                    ppo_ratio_mean = valid_ratio.mean().item(),
-                    ppo_approx_kl = (-valid_log_ratio).mean().item(),
-                    ppo_clipfrac = valid_clip_mask.float().mean().item(),
-                )
+                if valid_ratio.numel() == 0:
+                    self._rl_diagnostics.update(
+                        ppo_ratio_mean = 0.,
+                        ppo_approx_kl = 0.,
+                        ppo_clipfrac = 0.,
+                    )
+                else:
+                    self._rl_diagnostics.update(
+                        ppo_ratio_mean = valid_ratio.mean().item(),
+                        ppo_approx_kl = (-valid_log_ratio).mean().item(),
+                        ppo_clipfrac = valid_clip_mask.float().mean().item(),
+                    )
 
         # total policy loss
 
@@ -4177,14 +4340,24 @@ class DynamicsWorldModel(Module):
 
         with torch.no_grad():
             valid_current_values = values[learn_mask]
-            self._rl_diagnostics.update(
-                current_value_mean = valid_current_values.mean().item(),
-                current_value_max = valid_current_values.max().item(),
-                current_value_return_mae = (valid_current_values - returns[learn_mask]).abs().mean().item(),
-                current_value_old_value_mae = (valid_current_values - old_values[learn_mask]).abs().mean().item(),
-                value_target_mean = returns[learn_mask].mean().item(),
-                value_target_max = returns[learn_mask].max().item(),
-            )
+            if valid_current_values.numel() == 0:
+                self._rl_diagnostics.update(
+                    current_value_mean = 0.,
+                    current_value_max = 0.,
+                    current_value_return_mae = 0.,
+                    current_value_old_value_mae = 0.,
+                    value_target_mean = 0.,
+                    value_target_max = 0.,
+                )
+            else:
+                self._rl_diagnostics.update(
+                    current_value_mean = valid_current_values.mean().item(),
+                    current_value_max = valid_current_values.max().item(),
+                    current_value_return_mae = (valid_current_values - returns[learn_mask]).abs().mean().item(),
+                    current_value_old_value_mae = (valid_current_values - old_values[learn_mask]).abs().mean().item(),
+                    value_target_mean = returns[learn_mask].mean().item(),
+                    value_target_max = returns[learn_mask].max().item(),
+                )
 
         value_loss = value_loss[learn_mask].mean()
 
@@ -5234,14 +5407,82 @@ class DynamicsWorldModel(Module):
         reward_loss = self.zero
         state_terminal_loss = self.zero
 
+        encoded_agent_tokens = embeds.agent
+
+        if encoded_agent_tokens.ndim == 4:
+            encoded_agent_tokens = reduce(encoded_agent_tokens, 'b t g d -> b t d', 'mean')
+
+        with torch.no_grad():
+            valid_agent_tokens = encoded_agent_tokens[loss_mask] if is_var_len else encoded_agent_tokens
+
+            if valid_agent_tokens.numel() == 0:
+                self._wm_policy_diagnostics = dict(
+                    wm_agent_token_norm_mean = 0.,
+                    wm_agent_token_norm_max = 0.,
+                    wm_policy_embed_norm_mean = 0.,
+                    wm_policy_embed_norm_max = 0.,
+                    wm_policy_discrete_logit_abs_mean = 0.,
+                    wm_policy_discrete_logit_abs_max = 0.,
+                    wm_policy_discrete_confidence_mean = 0.,
+                    wm_policy_discrete_entropy_mean = 0.,
+                    wm_policy_continuous_logvar_mean = 0.,
+                    wm_policy_continuous_std_mean = 0.,
+                )
+            else:
+                valid_agent_tokens = rearrange(valid_agent_tokens, '... d -> (...) d')
+
+                max_diag_tokens = 256
+
+                if valid_agent_tokens.shape[0] > max_diag_tokens:
+                    sample_indices = torch.randperm(valid_agent_tokens.shape[0], device = valid_agent_tokens.device)[:max_diag_tokens]
+                    valid_agent_tokens = valid_agent_tokens[sample_indices]
+
+                wm_policy_embed = self.policy_head(valid_agent_tokens.detach())
+                wm_policy_embed_norm = wm_policy_embed.norm(dim = -1)
+
+                wm_diagnostics = dict(
+                    wm_agent_token_norm_mean = valid_agent_tokens.norm(dim = -1).mean().item(),
+                    wm_agent_token_norm_max = valid_agent_tokens.norm(dim = -1).max().item(),
+                    wm_policy_embed_norm_mean = wm_policy_embed_norm.mean().item(),
+                    wm_policy_embed_norm_max = wm_policy_embed_norm.max().item(),
+                    wm_policy_discrete_logit_abs_mean = 0.,
+                    wm_policy_discrete_logit_abs_max = 0.,
+                    wm_policy_discrete_confidence_mean = 0.,
+                    wm_policy_discrete_entropy_mean = 0.,
+                    wm_policy_continuous_logvar_mean = 0.,
+                    wm_policy_continuous_std_mean = 0.,
+                )
+
+                discrete_logits, continuous_mean_log_var = self.action_embedder.unembed(
+                    wm_policy_embed,
+                    pred_head_index = 0,
+                    return_split_discrete = True
+                )
+
+                if exists(discrete_logits):
+                    discrete_probs = [logits.softmax(dim = -1) for logits in discrete_logits]
+                    discrete_confidences = [probs.amax(dim = -1) for probs in discrete_probs]
+                    discrete_entropies = [-(probs * probs.clamp(min = 1e-12).log()).sum(dim = -1) for probs in discrete_probs]
+
+                    wm_diagnostics.update(
+                        wm_policy_discrete_logit_abs_mean = stack([logits.abs().mean() for logits in discrete_logits]).mean().item(),
+                        wm_policy_discrete_logit_abs_max = stack([logits.abs().amax() for logits in discrete_logits]).amax().item(),
+                        wm_policy_discrete_confidence_mean = stack(discrete_confidences, dim = -1).mean().item(),
+                        wm_policy_discrete_entropy_mean = stack(discrete_entropies, dim = -1).mean().item(),
+                    )
+
+                if exists(continuous_mean_log_var):
+                    _, continuous_log_var = continuous_mean_log_var.unbind(dim = -1)
+                    wm_diagnostics.update(
+                        wm_policy_continuous_logvar_mean = continuous_log_var.mean().item(),
+                        wm_policy_continuous_std_mean = (0.5 * continuous_log_var).exp().mean().item(),
+                    )
+
+                self._wm_policy_diagnostics = wm_diagnostics
+
         needs_agent_pred = exists(rewards) or (exists(terminals) and self.predict_terminals)
 
         if needs_agent_pred:
-            encoded_agent_tokens = embeds.agent
-
-            if encoded_agent_tokens.ndim == 4:
-                encoded_agent_tokens = reduce(encoded_agent_tokens, 'b t g d -> b t d', 'mean')
-
             agent_tokens_shifted = encoded_agent_tokens[:, :-1]
 
         if exists(rewards):
