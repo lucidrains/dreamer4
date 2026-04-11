@@ -143,6 +143,40 @@ class Experience:
         experience_dict = tree_map(lambda t: t.to(device) if is_tensor(t) else t, experience_dict)
         return Experience(**experience_dict)
 
+def shift_sequence_left_with_last_pad(
+    t: Tensor | None
+) -> Tensor | None:
+    if not exists(t) or t.shape[1] == 0:
+        return t
+
+    return cat((t[:, 1:], torch.zeros_like(t[:, :1])), dim = 1)
+
+def realign_generated_experience_for_policy_optimization(
+    experience: Experience
+) -> Experience:
+    """
+    Generated dream experience contains states first, then predicts reward /
+    continuation for the arrival state at each step. For policy optimization we
+    need each transition signal aligned to the action chosen from the current
+    state, so shift those targets left and reserve the final dreamed state as a
+    bootstrap-only node.
+    """
+
+    experience_dict = {f.name: getattr(experience, f.name) for f in fields(experience)}
+
+    experience_dict['rewards'] = shift_sequence_left_with_last_pad(experience.rewards)
+    experience_dict['continuation_probs'] = shift_sequence_left_with_last_pad(experience.continuation_probs)
+
+    if exists(experience.terminals) and experience.terminals.ndim > 1:
+        experience_dict['terminals'] = shift_sequence_left_with_last_pad(experience.terminals)
+
+    truncation_ref = default(experience.is_truncated, experience.lens)
+
+    if exists(truncation_ref):
+        experience_dict['is_truncated'] = torch.ones_like(truncation_ref, dtype = torch.bool)
+
+    return Experience(**experience_dict)
+
 def combine_experiences(
     exps: list[Experiences]
 ) -> Experience:
@@ -3829,6 +3863,15 @@ class DynamicsWorldModel(Module):
                 # zero out past episode length
                 len_mask = lens_to_mask((lens - 1).clamp(min = 0), time).float()
                 continuation_masks = continuation_masks * len_mask
+
+            if exists(experience.terminals):
+                terminals = experience.terminals
+
+                if terminals.ndim == 1:
+                    last_step = (experience.lens - 1).clamp(min = 0) if is_var_len else full((batch,), time - 1, device = self.device)
+                    terminals = flags_to_sequence(terminals, last_step, time)
+
+                continuation_masks = continuation_masks.masked_fill(terminals.bool(), 0.)
         else:
             if is_var_len:
                 continuation_masks = lens_to_mask((lens - 1).clamp(min = 0), time).float()
@@ -4643,6 +4686,9 @@ class DynamicsWorldModel(Module):
             gen.log_probs = Actions(decoded_discrete_log_probs, decoded_continuous_log_probs)
 
             gen.values = decoded_values
+
+        if return_for_policy_optimization:
+            gen = realign_generated_experience_for_policy_optimization(gen)
 
         if not return_time_cache:
             return gen

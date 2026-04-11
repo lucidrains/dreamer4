@@ -330,6 +330,30 @@ def test_action_with_world_model():
     actor_loss.backward(retain_graph = True)
     critic_loss.backward()
 
+def test_realign_generated_experience_for_policy_optimization():
+    from dreamer4.dreamer4 import Experience, Actions, realign_generated_experience_for_policy_optimization
+
+    experience = Experience(
+        latents = torch.randn(1, 4, 1, 2, 3),
+        rewards = torch.tensor([[1., 2., 3., 4.]]),
+        continuation_probs = torch.tensor([[0.9, 0.8, 0.7, 0.6]]),
+        actions = Actions(torch.randint(0, 2, (1, 4, 1)), None),
+        log_probs = Actions(torch.randn(1, 4, 1), None),
+        values = torch.randn(1, 4),
+        lens = torch.tensor([4]),
+        is_truncated = torch.tensor([False]),
+        terminals = torch.tensor([True]),
+    )
+
+    realigned = realign_generated_experience_for_policy_optimization(experience)
+
+    assert torch.equal(realigned.rewards, torch.tensor([[2., 3., 4., 0.]]))
+    assert torch.equal(realigned.continuation_probs, torch.tensor([[0.8, 0.7, 0.6, 0.0]]))
+    assert torch.equal(realigned.is_truncated, torch.tensor([True]))
+    assert torch.equal(realigned.terminals, experience.terminals)
+    assert torch.equal(realigned.actions.discrete, experience.actions.discrete)
+    assert torch.equal(realigned.log_probs.discrete, experience.log_probs.discrete)
+
 def test_action_embedder():
     from dreamer4.dreamer4 import ActionEmbedder
 
