@@ -104,7 +104,7 @@ WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'shortcut', 'rewards'
 
 AttentionIntermediates = namedtuple('AttentionIntermediates', ('next_kv_cache', 'normed_inputs'))
 
-TransformerIntermediates = namedtuple('TransformerIntermediates', ('next_kv_cache', 'normed_time_inputs', 'normed_space_inputs', 'next_rnn_hiddens', 'layer_hiddens', 'token_count'), defaults=(None, None, None, None, None, 0))
+TransformerIntermediates = namedtuple('TransformerIntermediates', ('next_kv_cache', 'normed_time_inputs', 'normed_space_inputs', 'next_rnn_hiddens', 'layer_hiddens', 'token_count', 'cached_out'), defaults=(None, None, None, None, None, 0, None))
 
 Predictions = namedtuple('Predictions', ['flow', 'proprioception', 'state'])
 
@@ -1958,6 +1958,7 @@ class AxialSpaceTimeTransformer(Module):
         self,
         tokens, # (b t s d)
         cache: TransformerIntermediates | None = None,
+        cache_input_includes_prefix = False,
         return_intermediates = False
     ): # (b t s d) | (y 2 b h t d)
 
@@ -1967,7 +1968,7 @@ class AxialSpaceTimeTransformer(Module):
 
         # destruct intermediates to cache for attention and rnn respectively
 
-        kv_cache = rnn_prev_hiddens = None
+        kv_cache = rnn_prev_hiddens = cached_out = None
 
         token_count = 0
 
@@ -1975,6 +1976,7 @@ class AxialSpaceTimeTransformer(Module):
             kv_cache = cache.next_kv_cache
             rnn_prev_hiddens = cache.next_rnn_hiddens
             token_count = cache.token_count
+            cached_out = cache.cached_out
 
         # attend functions for space and time
 
@@ -1993,15 +1995,19 @@ class AxialSpaceTimeTransformer(Module):
         rnn_hiddens = []
 
         processed_time = time
+        cached_prefix_len = 0
 
         if has_kv_cache:
-            if time > 1:
-                past_tokens, tokens = tokens[:, :-1], tokens[:, -1:]
+            if cache_input_includes_prefix:
+                assert time >= token_count, 'cached full-sequence input must include the cached prefix length'
+                cached_prefix_len = token_count
+                past_tokens = tokens[:, :cached_prefix_len]
+                tokens = tokens[:, cached_prefix_len:]
             else:
                 past_tokens = tokens[:, :0]
 
             processed_time = tokens.shape[1]
-            rotary_seq_len = 1
+            rotary_seq_len = processed_time
             rotary_pos_offset = token_count
         else:
             rotary_seq_len = time
@@ -2128,9 +2134,15 @@ class AxialSpaceTimeTransformer(Module):
         if self.use_attn_pool:
             out = self.final_attn_pool(out, layer_hiddens) + out
 
+        next_cached_out = out
+
         if has_kv_cache:
-            # just concat the past tokens back on for now, todo - clean up the logic
-            out = cat((past_tokens, out), dim = 1)
+            if exists(cached_out):
+                next_cached_out = cat((cached_out, out), dim = 1)
+
+            if cached_prefix_len > 0:
+                assert exists(cached_out), 'cached full-sequence input requires cached transformer outputs'
+                out = cat((cached_out[:, :cached_prefix_len], out), dim = 1)
 
         if not return_intermediates:
             return out
@@ -2141,7 +2153,8 @@ class AxialSpaceTimeTransformer(Module):
             safe_stack(normed_space_attn_inputs),
             safe_stack(rnn_hiddens),
             hiddens,
-            token_count + processed_time
+            token_count + processed_time,
+            next_cached_out
         )
 
         return out, intermediates
@@ -4622,6 +4635,7 @@ class DynamicsWorldModel(Module):
                     continuous_actions = curr_continuous,
                     proprio = noised_proprio_with_context,
                     time_cache = time_cache,
+                    time_cache_input_includes_prefix = use_time_cache and exists(time_cache) and curr_time_steps > 0,
                     latent_is_noised = True,
                     latent_has_view_dim = True,
                     return_pred_only = True,
@@ -4888,6 +4902,7 @@ class DynamicsWorldModel(Module):
         continuous_action_types = None,  # (na)
         proprio = None,                  # (b t dp)
         time_cache = None,
+        time_cache_input_includes_prefix = False,
         return_pred_only = False,
         latent_is_noised = False,
         return_all_losses = False,
@@ -5202,7 +5217,12 @@ class DynamicsWorldModel(Module):
 
             # attention
 
-            tokens, intermediates = self.transformer(tokens, cache = time_cache, return_intermediates = True)
+            tokens, intermediates = self.transformer(
+                tokens,
+                cache = time_cache,
+                cache_input_includes_prefix = time_cache_input_includes_prefix,
+                return_intermediates = True
+            )
 
             # unpack
 

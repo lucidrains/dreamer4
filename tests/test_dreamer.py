@@ -1194,7 +1194,7 @@ def test_cache_generate():
     generated, time_cache = dynamics.generate(1, time_cache = time_cache, return_time_cache = True)
     generated, time_cache = dynamics.generate(1, time_cache = time_cache, return_time_cache = True)
 
-def test_transformer_cache_token_count_advances_by_new_tokens_only():
+def test_transformer_cache_full_sequence_append_matches_uncached():
     from dreamer4.dreamer4 import DynamicsWorldModel
 
     dynamics = DynamicsWorldModel(
@@ -1212,15 +1212,55 @@ def test_transformer_cache_token_count_advances_by_new_tokens_only():
         prob_shortcut_train = 0.9
     )
 
-    tokens = torch.randn(1, 2, 3, 16)
-    _, cache = dynamics.transformer(tokens, return_intermediates = True)
+    prefix_tokens = torch.randn(1, 2, 3, 16)
+    prefix_out, cache = dynamics.transformer(prefix_tokens, return_intermediates = True)
 
     assert cache.token_count == 2
 
-    more_tokens = torch.randn(1, 3, 3, 16)
-    _, cache = dynamics.transformer(more_tokens, cache = cache, return_intermediates = True)
+    new_tokens = torch.randn(1, 2, 3, 16)
+    full_tokens = torch.cat((prefix_tokens, new_tokens), dim = 1)
 
-    assert cache.token_count == 3
+    full_out_uncached, _ = dynamics.transformer(full_tokens, return_intermediates = True)
+    full_out_cached, cache = dynamics.transformer(
+        full_tokens,
+        cache = cache,
+        cache_input_includes_prefix = True,
+        return_intermediates = True
+    )
+
+    assert cache.token_count == 4
+    assert torch.allclose(prefix_out, full_out_uncached[:, :2], atol = 1e-4)
+    assert torch.allclose(full_out_cached, full_out_uncached, atol = 1e-4)
+
+def test_transformer_cache_suffix_only_multi_step_matches_uncached_suffix():
+    from dreamer4.dreamer4 import DynamicsWorldModel
+
+    dynamics = DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 16,
+        max_steps = 64,
+        num_tasks = 4,
+        num_latent_tokens = 4,
+        depth = 1,
+        time_block_every = 1,
+        num_spatial_tokens = 1,
+        pred_orig_latent = True,
+        num_discrete_actions = 4,
+        attn_dim_head = 16,
+        prob_shortcut_train = 0.9
+    )
+
+    prefix_tokens = torch.randn(1, 2, 3, 16)
+    _, cache = dynamics.transformer(prefix_tokens, return_intermediates = True)
+
+    new_tokens = torch.randn(1, 2, 3, 16)
+    full_tokens = torch.cat((prefix_tokens, new_tokens), dim = 1)
+
+    full_out_uncached, _ = dynamics.transformer(full_tokens, return_intermediates = True)
+    suffix_out_cached, cache = dynamics.transformer(new_tokens, cache = cache, return_intermediates = True)
+
+    assert cache.token_count == 4
+    assert torch.allclose(suffix_out_cached, full_out_uncached[:, 2:], atol = 1e-4)
 
 @param('vectorized', (False, True))
 @param('use_pmpo', (False, True))
