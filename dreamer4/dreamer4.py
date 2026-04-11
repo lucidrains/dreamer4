@@ -3671,8 +3671,14 @@ class DynamicsWorldModel(Module):
                 if need_bootstrap.any():
                     if exists(obs_to_latents_fn):
                         bootstrap_latents, _ = obs_to_latents_fn(self, obs, tokenizer_time_cache)
-                    else:
+                    elif exists(curr_image):
                         bootstrap_latents, _ = self.video_tokenizer(curr_image, return_latents = True, time_cache = tokenizer_time_cache, return_time_cache = True)
+                    elif exists(curr_state):
+                        assert exists(self.state_to_latents), 'DynamicsWorldModel must have dim_state defined to automatically parse state observations'
+                        bootstrap_latents = self.state_to_latents(curr_state)
+                        bootstrap_latents = rearrange(bootstrap_latents, 'b n d -> b 1 n d') if bootstrap_latents.ndim == 3 else bootstrap_latents
+                    else:
+                        raise ValueError('Observations must contain an image or state key, or provide a custom obs_to_latents_fn')
 
                     _, (embeds, _) = self.forward(
                         latents = bootstrap_latents,

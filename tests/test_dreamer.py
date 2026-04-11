@@ -881,6 +881,53 @@ def test_interact_with_env_store_final_observation_for_truncated_episode():
     assert torch.allclose(experience.latents[0, 0], torch.zeros_like(experience.latents[0, 0]))
     assert torch.allclose(experience.latents[0, 1], torch.ones_like(experience.latents[0, 1]))
 
+def test_interact_with_env_state_bootstrap_without_final_observation():
+    from dreamer4.dreamer4 import DynamicsWorldModel
+
+    class CountingStateEnv:
+        def __init__(self):
+            self.state = 0.
+
+        def reset(self, seed = None):
+            self.state = 0.
+            return {'state': torch.tensor([self.state])}
+
+        def step(self, action):
+            self.state += 1.
+            return {'state': torch.tensor([self.state])}, torch.tensor(1.), torch.tensor(False), torch.tensor(False)
+
+    def obs_to_latents_fn(model, obs, cache):
+        state = obs['state'].float().view(1, 1, 1)
+        latents = state.expand(1, 1, model.dim_latent)
+        return latents, cache
+
+    world_model = DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 16,
+        max_steps = 64,
+        num_latent_tokens = 1,
+        depth = 2,
+        time_block_every = 1,
+        num_spatial_tokens = 1,
+        pred_orig_latent = True,
+        num_discrete_actions = 4,
+        attn_dim_head = 16
+    )
+
+    experience = world_model.interact_with_env(
+        CountingStateEnv(),
+        max_timesteps = 1,
+        env_is_vectorized = False,
+        obs_to_latents_fn = obs_to_latents_fn,
+        store_final_observation = False
+    )
+
+    assert experience.latents.shape[1] == 2
+    assert experience.rewards.shape[1] == 2
+    assert bool(experience.is_truncated.item())
+    assert torch.allclose(experience.latents[0, 0], torch.zeros_like(experience.latents[0, 0]))
+    assert torch.allclose(experience.latents[0, 1], torch.ones_like(experience.latents[0, 1]))
+
 def test_cache_generate():
     from dreamer4.dreamer4 import DynamicsWorldModel
 
