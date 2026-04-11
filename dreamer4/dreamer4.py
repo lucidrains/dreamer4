@@ -183,24 +183,61 @@ def combine_experiences(
 
     assert len(exps) > 0
 
+    exps_dict = [{f.name: getattr(exp, f.name) for f in fields(exp)} for exp in exps]
+
     # set lens if not there
 
-    for exp in exps:
-        payload = default(exp.latents, exp.video)
+    for exp_dict in exps_dict:
+        payload = default(exp_dict['latents'], exp_dict['video'])
         batch, time, device = *payload.shape[:2], payload.device
 
-        if not exists(exp.lens):
-            exp.lens = full((batch,), time, device = device)
+        if not exists(exp_dict['lens']):
+            exp_dict['lens'] = full((batch,), time, device = device)
 
-        if not exists(exp.is_truncated):
-            exp.is_truncated = full((batch,), True, device = device)
+        if not exists(exp_dict['is_truncated']):
+            exp_dict['is_truncated'] = full((batch,), True, device = device)
 
-        if isinstance(exp.is_from_world_model, bool):
-            exp.is_from_world_model = full((batch,), exp.is_from_world_model, device = device, dtype = torch.bool)
+        if isinstance(exp_dict['is_from_world_model'], bool):
+            exp_dict['is_from_world_model'] = full((batch,), exp_dict['is_from_world_model'], device = device, dtype = torch.bool)
 
-    # convert to dictionary
+        if not exists(exp_dict['episode_return']):
+            exp_dict['episode_return'] = full((batch,), float('nan'), device = device)
 
-    exps_dict = [{f.name: getattr(exp, f.name) for f in fields(exp)} for exp in exps]
+    optional_tensor_fields = (
+        'video',
+        'proprio',
+        'critic_state',
+        'agent_embed',
+        'rewards',
+        'terminals',
+        'continuation_probs',
+        'values'
+    )
+
+    for field_name in optional_tensor_fields:
+        tensor_values = [exp_dict[field_name] for exp_dict in exps_dict if is_tensor(exp_dict[field_name])]
+
+        if len(tensor_values) == 0:
+            continue
+
+        exemplar = first(tensor_values)
+
+        for exp_dict in exps_dict:
+            field_value = exp_dict[field_name]
+
+            if is_tensor(field_value):
+                continue
+
+            payload = default(exp_dict['latents'], exp_dict['video'])
+            batch = payload.shape[0]
+
+            shape = list(exemplar.shape)
+            shape[0] = batch
+
+            if exemplar.ndim >= 2:
+                shape[1] = 0
+
+            exp_dict[field_name] = exemplar.new_zeros(shape)
 
     values, tree_specs = zip(*[tree_flatten(exp_dict) for exp_dict in exps_dict])
 
@@ -1305,6 +1342,74 @@ def calc_gae(
     returns = gae + values
 
     return returns
+
+def scalar_terminals_to_transition_sequence(
+    terminals: Tensor,
+    learnable_lens: Tensor,
+    seq_len: int
+) -> Tensor:
+    terminal_positions = (learnable_lens - 1).clamp(min = 0)
+    return flags_to_sequence(terminals.bool(), terminal_positions, seq_len)
+
+def build_rl_continuation_masks(
+    experience: Experience,
+    old_values: Tensor,
+    learnable_lens: Tensor
+) -> Tensor:
+    batch, time = old_values.shape
+    device = old_values.device
+
+    lens = default(experience.lens, full((batch,), time, device = device))
+    is_var_len = exists(experience.lens)
+    is_from_world_model = experience.is_from_world_model
+
+    if isinstance(is_from_world_model, bool):
+        is_from_world_model = full((batch,), is_from_world_model, device = device, dtype = torch.bool)
+    else:
+        is_from_world_model = default(is_from_world_model, full((batch,), True, device = device, dtype = torch.bool))
+
+    if is_var_len:
+        hard_continuation_masks = lens_to_mask(learnable_lens.clamp(min = 0), time).float()
+    else:
+        hard_continuation_masks = F.pad(torch.ones_like(old_values[..., :-1]), (0, 1), value = 0.).float()
+
+    if exists(experience.continuation_probs):
+        continuation_masks = experience.continuation_probs.float()
+
+        if continuation_masks.shape[1] < time:
+            continuation_masks = F.pad(
+                continuation_masks,
+                (0, time - continuation_masks.shape[1]),
+                value = 0.
+            )
+        elif continuation_masks.shape[1] > time:
+            continuation_masks = continuation_masks[:, :time]
+
+        if is_var_len:
+            learn_len_mask = lens_to_mask(learnable_lens.clamp(min = 0), time).float()
+            continuation_masks = continuation_masks * learn_len_mask
+
+        continuation_masks = torch.where(
+            rearrange(is_from_world_model, 'b -> b 1'),
+            continuation_masks,
+            hard_continuation_masks
+        )
+    else:
+        continuation_masks = hard_continuation_masks
+
+    if exists(experience.terminals):
+        terminals = experience.terminals
+
+        if terminals.ndim == 1:
+            terminals = scalar_terminals_to_transition_sequence(terminals, learnable_lens, time)
+        elif terminals.shape[1] < time:
+            terminals = F.pad(terminals, (0, time - terminals.shape[1]), value = False)
+        elif terminals.shape[1] > time:
+            terminals = terminals[:, :time]
+
+        continuation_masks = continuation_masks.masked_fill(terminals.bool(), 0.)
+
+    return continuation_masks
 
 # rotary embeddings for time
 
@@ -3360,7 +3465,12 @@ class DynamicsWorldModel(Module):
         ]
 
     def value_head_parameters(self):
-        return self.value_head.parameters()
+        params = [*self.value_head.parameters()]
+
+        if exists(self.critic_state_embedder):
+            params.extend(self.critic_state_embedder.parameters())
+
+        return params
 
     def parameters(self, *args, **kwargs):
         params = super().parameters(*args, **kwargs)
@@ -3935,37 +4045,11 @@ class DynamicsWorldModel(Module):
         # use soft continuation probabilities from dreams (dreamerv3-style) when available,
         # fall back to hard masks from terminals for real experience
 
-        if exists(experience.continuation_probs):
-            # dreamerv3-style: use learned continuation probability directly
-            continuation_masks = experience.continuation_probs
-
-            if is_var_len:
-                # zero out past episode length
-                len_mask = lens_to_mask((lens - 1).clamp(min = 0), time).float()
-                continuation_masks = continuation_masks * len_mask
-
-            if exists(experience.terminals):
-                terminals = experience.terminals
-
-                if terminals.ndim == 1:
-                    last_step = (experience.lens - 1).clamp(min = 0) if is_var_len else full((batch,), time - 1, device = self.device)
-                    terminals = flags_to_sequence(terminals, last_step, time)
-
-                continuation_masks = continuation_masks.masked_fill(terminals.bool(), 0.)
-        else:
-            if is_var_len:
-                continuation_masks = lens_to_mask((lens - 1).clamp(min = 0), time).float()
-            else:
-                continuation_masks = F.pad(torch.ones_like(old_values[..., :-1]), (0, 1), value = 0.).float()
-
-            if exists(experience.terminals):
-                terminals = experience.terminals
-
-                if terminals.ndim == 1:
-                    last_step = (experience.lens - 1).clamp(min = 0) if is_var_len else full((batch,), time - 1, device = self.device)
-                    terminals = flags_to_sequence(terminals, last_step, time)
-
-                continuation_masks.masked_fill_(terminals.bool(), 0.)
+        continuation_masks = build_rl_continuation_masks(
+            experience,
+            old_values,
+            learnable_lens
+        )
 
         # calculate returns
 
@@ -4115,6 +4199,20 @@ class DynamicsWorldModel(Module):
                 old_log_probs.continuous[:, :-1] if exists(old_log_probs.continuous) else None
             )
 
+        old_action_unembed_time_len = None
+
+        if exists(old_action_unembeds):
+            if exists(old_action_unembeds[0]):
+                old_action_unembed_time_len = old_action_unembeds[0].shape[1]
+            elif exists(old_action_unembeds[1]):
+                old_action_unembed_time_len = old_action_unembeds[1].shape[1]
+
+        if exists(old_action_unembed_time_len) and old_action_unembed_time_len == policy_embed.shape[1] + 1:
+            old_action_unembeds = (
+                old_action_unembeds[0][:, :-1] if exists(old_action_unembeds[0]) else None,
+                old_action_unembeds[1][:, :-1] if exists(old_action_unembeds[1]) else None
+            )
+
         old_log_probs = safe_cat(old_log_probs, dim = -1)
         log_probs = safe_cat(log_probs, dim = -1)
         entropies = safe_cat(entropies, dim = -1)
@@ -4129,11 +4227,17 @@ class DynamicsWorldModel(Module):
             mask = learn_mask
 
         policy_learn_mask = learn_mask
+        has_policy_targets = bool(policy_learn_mask.any()) if exists(policy_learn_mask) else True
 
         if use_delight_gating:
             delight_gate = ((-log_probs * advantage) / delight_temperature).sigmoid().detach()
 
-        if use_pmpo:
+        timestep_log_ratio = ratio = None
+
+        if not has_policy_targets:
+            policy_loss = log_probs.sum() * 0.
+
+        elif use_pmpo:
             pos_advantage_mask = rearrange(advantage, '... 1 -> ...') >= 0.
             neg_advantage_mask = ~pos_advantage_mask
 
@@ -4169,6 +4273,26 @@ class DynamicsWorldModel(Module):
             if self.pmpo_kl_div_loss_weight > 0.:
                 new_unembedded_actions = self.action_embedder.unembed(policy_embed, pred_head_index = 0)
 
+                kl_time_candidates = []
+
+                for action_unembed in (*new_unembedded_actions, *old_action_unembeds):
+                    if exists(action_unembed):
+                        kl_time_candidates.append(action_unembed.shape[1])
+
+                if len(kl_time_candidates) > 0:
+                    kl_time = min(kl_time_candidates)
+                    new_unembedded_actions = tuple(
+                        action_unembed[:, :kl_time] if exists(action_unembed) else None
+                        for action_unembed in new_unembedded_actions
+                    )
+                    old_action_unembeds = tuple(
+                        action_unembed[:, :kl_time] if exists(action_unembed) else None
+                        for action_unembed in old_action_unembeds
+                    )
+                    kl_learn_mask = learn_mask[:, :kl_time] if exists(learn_mask) else None
+                else:
+                    kl_learn_mask = learn_mask
+
                 kl_div_inputs, kl_div_targets = new_unembedded_actions, old_action_unembeds
 
                 if self.pmpo_reverse_kl:
@@ -4179,23 +4303,24 @@ class DynamicsWorldModel(Module):
                 kl_div_loss = 0.
 
                 if exists(discrete_kl_div):
-                    kl_div_loss = kl_div_loss + masked_mean(discrete_kl_div, learn_mask)
+                    kl_div_loss = kl_div_loss + masked_mean(discrete_kl_div, kl_learn_mask)
 
                 if exists(continuous_kl_div):
-                    kl_div_loss = kl_div_loss + masked_mean(continuous_kl_div, learn_mask)
+                    kl_div_loss = kl_div_loss + masked_mean(continuous_kl_div, kl_learn_mask)
 
                 policy_loss = policy_loss + kl_div_loss * self.pmpo_kl_div_loss_weight
 
         else:
-            ratio = (log_probs - old_log_probs).exp()
+            timestep_advantage = rearrange(advantage, 'b t 1 -> b t')
+            timestep_log_ratio = reduce(log_probs - old_log_probs, 'b t na -> b t', 'sum')
+            ratio = timestep_log_ratio.exp()
             clipped_ratio = ratio.clamp(1. - self.ppo_eps_clip, 1. + self.ppo_eps_clip)
 
-            policy_loss = -torch.min(ratio * advantage, clipped_ratio * advantage)
+            policy_loss = -torch.min(ratio * timestep_advantage, clipped_ratio * timestep_advantage)
 
             if use_delight_gating:
-                policy_loss = policy_loss * delight_gate
-
-            policy_loss = reduce(policy_loss, 'b t na -> b t', 'sum')
+                timestep_delight_gate = reduce(delight_gate, 'b t na -> b t', 'mean')
+                policy_loss = policy_loss * timestep_delight_gate
 
             policy_loss = masked_mean(policy_loss, learn_mask)
 
@@ -4204,7 +4329,7 @@ class DynamicsWorldModel(Module):
         action_entropies = reduce(entropies, 'b t na -> b t', 'sum')
         entropy_loss = -action_entropies
 
-        entropy_loss = masked_mean(entropy_loss, learn_mask)
+        entropy_loss = entropy_loss.sum() * 0. if not has_policy_targets else masked_mean(entropy_loss, learn_mask)
 
         with torch.no_grad():
             if exists(policy_learn_mask):
@@ -4274,17 +4399,17 @@ class DynamicsWorldModel(Module):
                 )
 
             if not use_pmpo:
-                log_ratio = log_probs - old_log_probs
-                clip_mask = (ratio < (1. - self.ppo_eps_clip)) | (ratio > (1. + self.ppo_eps_clip))
+                log_ratio = default(timestep_log_ratio, reduce(log_probs - old_log_probs, 'b t na -> b t', 'sum'))
+                valid_ratio_source = default(ratio, log_ratio.exp())
+                clip_mask = (valid_ratio_source < (1. - self.ppo_eps_clip)) | (valid_ratio_source > (1. + self.ppo_eps_clip))
 
                 if exists(policy_learn_mask):
-                    expanded_learn_mask = repeat(policy_learn_mask, 'b t -> b t na', na = ratio.shape[-1])
-                    valid_log_ratio = log_ratio[expanded_learn_mask]
-                    valid_ratio = ratio[expanded_learn_mask]
-                    valid_clip_mask = clip_mask[expanded_learn_mask]
+                    valid_log_ratio = log_ratio[policy_learn_mask]
+                    valid_ratio = valid_ratio_source[policy_learn_mask]
+                    valid_clip_mask = clip_mask[policy_learn_mask]
                 else:
                     valid_log_ratio = log_ratio.flatten()
-                    valid_ratio = ratio.flatten()
+                    valid_ratio = valid_ratio_source.flatten()
                     valid_clip_mask = clip_mask.flatten()
 
                 if valid_ratio.numel() == 0:
@@ -4333,11 +4458,24 @@ class DynamicsWorldModel(Module):
 
         value_logits = self.value_head(value_agent_embeds)
 
-        # align returns and old_values to value_logits length if bootstrap padded
-        if returns.shape[1] == value_logits.shape[1] + 1:
-            returns = returns[:, :-1]
-            old_values = old_values[:, :-1]
-            learn_mask = learn_mask[:, :-1] if exists(learn_mask) else None
+        value_time = min(
+            returns.shape[1],
+            old_values.shape[1],
+            value_logits.shape[1],
+            learn_mask.shape[1] if exists(learn_mask) else value_logits.shape[1]
+        )
+
+        if value_time != value_logits.shape[1]:
+            value_logits = value_logits[:, :value_time]
+
+        if value_time != returns.shape[1]:
+            returns = returns[:, :value_time]
+
+        if value_time != old_values.shape[1]:
+            old_values = old_values[:, :value_time]
+
+        if exists(learn_mask) and value_time != learn_mask.shape[1]:
+            learn_mask = learn_mask[:, :value_time]
             mask = learn_mask
 
         values = self.value_encoder.bins_to_scalar_value(value_logits)
@@ -4372,7 +4510,7 @@ class DynamicsWorldModel(Module):
                     value_target_max = returns[learn_mask].max().item(),
                 )
 
-        value_loss = value_loss[learn_mask].mean()
+        value_loss = value_logits.sum() * 0. if not bool(learn_mask.any()) else value_loss[learn_mask].mean()
 
         # maybe take value optimizer step
 
