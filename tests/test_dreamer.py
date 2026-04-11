@@ -382,6 +382,8 @@ def test_policy_diagnostics_handle_empty_learn_mask():
 
     assert actor_loss.numel() == 1
     assert critic_loss.numel() == 1
+    assert torch.isfinite(actor_loss)
+    assert torch.isfinite(critic_loss)
     assert dynamics._rl_diagnostics['policy_log_prob_delta_max_abs'] == 0.
     assert dynamics._rl_diagnostics['policy_discrete_confidence_max'] == 0.
 
@@ -799,6 +801,7 @@ def test_bc_trainer(
     trainer()
 
 def test_dream_trainer():
+    from types import MethodType
     from dreamer4.dreamer4 import DynamicsWorldModel
 
     world_model = DynamicsWorldModel(
@@ -820,6 +823,15 @@ def test_dream_trainer():
 
     from dreamer4.trainers import DreamTrainer
 
+    generate_kwargs = {}
+    original_generate = world_model.generate
+
+    def capture_generate(self, *args, **kwargs):
+        generate_kwargs.update(kwargs)
+        return original_generate(*args, **kwargs)
+
+    world_model.generate = MethodType(capture_generate, world_model)
+
     dream_trainer = DreamTrainer(
         world_model,
         batch_size = 2,
@@ -828,6 +840,9 @@ def test_dream_trainer():
     )
 
     dream_trainer()
+
+    assert generate_kwargs['return_for_policy_optimization'] is True
+    assert generate_kwargs['return_terminals'] is True
 
 def test_world_model_training_accepts_final_observation_sequences():
     from dreamer4.dreamer4 import DynamicsWorldModel
@@ -940,6 +955,28 @@ def test_dreamer_trainer_excludes_value_head_from_world_model_optimizer():
     value_param_ids = {id(param) for param in trainer.unwrapped_model.value_head_parameters()}
 
     assert world_model_param_ids.isdisjoint(value_param_ids)
+
+def test_value_head_parameters_include_critic_state_embedder():
+    from dreamer4.dreamer4 import DynamicsWorldModel
+
+    world_model = DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 16,
+        max_steps = 64,
+        num_latent_tokens = 1,
+        depth = 2,
+        time_block_every = 1,
+        num_spatial_tokens = 1,
+        pred_orig_latent = True,
+        num_discrete_actions = 4,
+        dim_critic_state = 3,
+        attn_dim_head = 16,
+    )
+
+    value_param_ids = {id(param) for param in world_model.value_head_parameters()}
+    critic_state_param_ids = {id(param) for param in world_model.critic_state_embedder.parameters()}
+
+    assert critic_state_param_ids.issubset(value_param_ids)
 
 def test_dreamer_trainer_prompt_sampling_excludes_terminal_boundary():
     from dreamer4.dreamer4 import DynamicsWorldModel, Experience, Actions
@@ -1354,6 +1391,72 @@ def test_online_rl(
 
     trainer(mock_env, num_episodes = 2, env_is_vectorized = vectorized)
 
+def test_slice_batch_experience_preserves_rl_metadata():
+    from dreamer4.dreamer4 import Experience, Actions
+    from dreamer4.trainers import slice_batch_experience
+
+    experience = Experience(
+        latents = torch.randn(3, 4, 1, 2, 3),
+        proprio = torch.randn(3, 4, 5),
+        critic_state = torch.randn(3, 4, 6),
+        agent_embed = torch.randn(3, 4, 7),
+        rewards = torch.randn(3, 4),
+        terminals = torch.tensor([True, False, True]),
+        continuation_probs = torch.rand(3, 4),
+        actions = Actions(torch.randint(0, 4, (3, 4, 1)), None),
+        log_probs = Actions(torch.randn(3, 4, 1), None),
+        old_action_unembeds = (torch.randn(3, 4, 4), None),
+        values = torch.randn(3, 4),
+        step_size = 8,
+        lens = torch.tensor([4, 3, 2]),
+        is_truncated = torch.tensor([True, False, True]),
+        agent_index = 0,
+        is_from_world_model = torch.tensor([True, False, True]),
+        episode_return = torch.randn(3),
+    )
+
+    batch_experience = slice_batch_experience(experience, torch.tensor([0, 2]))
+
+    assert torch.equal(batch_experience.lens, torch.tensor([4, 2]))
+    assert torch.equal(batch_experience.is_truncated, torch.tensor([True, True]))
+    assert torch.equal(batch_experience.terminals, torch.tensor([True, True]))
+    assert torch.equal(batch_experience.is_from_world_model, torch.tensor([True, True]))
+    assert batch_experience.continuation_probs.shape == (2, 4)
+    assert batch_experience.critic_state.shape == (2, 4, 6)
+    assert batch_experience.values.shape == (2, 4)
+
+def test_combine_experiences_does_not_mutate_inputs_and_preserves_real_continuation_fallback():
+    from dreamer4.dreamer4 import Experience, combine_experiences, build_rl_continuation_masks
+
+    dream_experience = Experience(
+        latents = torch.randn(1, 4, 1, 2, 3),
+        continuation_probs = torch.tensor([[0.9, 0.8, 0.7, 0.0]]),
+        terminals = torch.tensor([True]),
+        lens = torch.tensor([4]),
+        is_truncated = torch.tensor([True]),
+        is_from_world_model = torch.tensor([True]),
+    )
+
+    real_experience = Experience(
+        latents = torch.randn(1, 4, 1, 2, 3),
+        terminals = torch.tensor([False]),
+        lens = torch.tensor([4]),
+        is_truncated = torch.tensor([True]),
+        is_from_world_model = torch.tensor([False]),
+    )
+
+    combined = combine_experiences([dream_experience, real_experience])
+
+    assert real_experience.continuation_probs is None
+    assert combined.continuation_probs.shape == (2, 4)
+
+    old_values = torch.zeros(2, 4)
+    learnable_lens = combined.lens - combined.is_truncated.long()
+    continuation_masks = build_rl_continuation_masks(combined, old_values, learnable_lens)
+
+    assert torch.equal(continuation_masks[0], torch.tensor([0.9, 0.8, 0.0, 0.0]))
+    assert torch.equal(continuation_masks[1], torch.tensor([1., 1., 1., 0.]))
+
 @param('num_video_views', (1, 2))
 def test_proprioception(
     num_video_views
@@ -1739,6 +1842,42 @@ def test_continuous_only_policy_optimization_path():
     assert critic_loss.numel() == 1
     assert 'ppo_ratio_mean' in dynamics._rl_diagnostics
 
+def test_generate_for_policy_optimization_auto_enables_terminals_when_supported():
+    from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
+
+    tokenizer = VideoTokenizer(
+        128,
+        dim_latent = 16,
+        patch_size = 16,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        time_block_every = 1,
+        image_height = 32,
+        image_width = 32,
+        attn_kwargs = dict(query_heads = 8),
+    )
+
+    dynamics = DynamicsWorldModel(
+        128,
+        num_agents = 1,
+        video_tokenizer = tokenizer,
+        dim_latent = 16,
+        num_discrete_actions = 2,
+        depth = 1,
+        time_block_every = 1,
+        predict_terminals = True,
+    )
+
+    generations = dynamics.generate(
+        time_steps = 4,
+        batch_size = 2,
+        return_for_policy_optimization = True,
+        return_decoded_video = False,
+    )
+
+    assert exists(generations.continuation_probs)
+    assert generations.continuation_probs.shape == (2, 4)
+
 def test_calc_gae_excludes_bootstrap_delta_for_truncated_tail():
     from dreamer4.dreamer4 import calc_gae
 
@@ -1759,6 +1898,25 @@ def test_calc_gae_excludes_bootstrap_delta_for_truncated_tail():
 
     assert torch.allclose(returns[:, :2], torch.tensor([[33., 32.]]))
     assert torch.allclose(returns[:, 2:], torch.tensor([[30.]]))
+
+def test_build_rl_continuation_masks_aligns_scalar_terminals_to_last_learnable_transition():
+    from dreamer4.dreamer4 import Experience, build_rl_continuation_masks
+
+    experience = Experience(
+        latents = torch.randn(2, 4, 1, 2, 3),
+        continuation_probs = torch.ones(2, 4),
+        terminals = torch.tensor([True, True]),
+        lens = torch.tensor([4, 4]),
+        is_truncated = torch.tensor([True, False]),
+    )
+
+    old_values = torch.zeros(2, 4)
+    learnable_lens = experience.lens - experience.is_truncated.long()
+
+    continuation_masks = build_rl_continuation_masks(experience, old_values, learnable_lens)
+
+    assert torch.equal(continuation_masks[0], torch.tensor([1., 1., 0., 0.]))
+    assert torch.equal(continuation_masks[1], torch.tensor([1., 1., 1., 0.]))
 
 @param('steps', (1, 2, 4))
 def test_rac_like_tokenizer(steps):

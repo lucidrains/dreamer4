@@ -26,6 +26,7 @@ from dreamer4.dreamer4 import (
     VideoTokenizer,
     DynamicsWorldModel,
     Experience,
+    Actions,
     SelfFlow,
     combine_experiences,
     eval_decorator
@@ -54,6 +55,64 @@ def grad_norm(parameters):
         sq_norm = sq_norm + param.grad.detach().float().pow(2).sum().item()
 
     return sq_norm ** 0.5
+
+def slice_batch_experience(
+    experience: Experience,
+    batch_indices: torch.Tensor
+):
+    def maybe_index(t):
+        return t[batch_indices] if is_tensor(t) else t
+
+    actions = experience.actions
+    sliced_actions = None
+
+    if exists(actions):
+        discrete_actions, continuous_actions = actions
+        sliced_actions = Actions(
+            maybe_index(discrete_actions),
+            maybe_index(continuous_actions)
+        )
+
+    log_probs = experience.log_probs
+    sliced_log_probs = None
+
+    if exists(log_probs):
+        discrete_log_probs, continuous_log_probs = log_probs
+        sliced_log_probs = Actions(
+            maybe_index(discrete_log_probs),
+            maybe_index(continuous_log_probs)
+        )
+
+    old_action_unembeds = experience.old_action_unembeds
+    sliced_old_action_unembeds = None
+
+    if exists(old_action_unembeds):
+        discrete_old_action_unembeds, continuous_old_action_unembeds = old_action_unembeds
+        sliced_old_action_unembeds = (
+            maybe_index(discrete_old_action_unembeds),
+            maybe_index(continuous_old_action_unembeds)
+        )
+
+    return Experience(
+        latents = experience.latents[batch_indices],
+        video = maybe_index(experience.video),
+        proprio = maybe_index(experience.proprio),
+        critic_state = maybe_index(experience.critic_state),
+        agent_embed = maybe_index(experience.agent_embed),
+        rewards = maybe_index(experience.rewards),
+        terminals = maybe_index(experience.terminals),
+        continuation_probs = maybe_index(experience.continuation_probs),
+        actions = sliced_actions,
+        log_probs = sliced_log_probs,
+        old_action_unembeds = sliced_old_action_unembeds,
+        values = maybe_index(experience.values),
+        step_size = experience.step_size,
+        lens = maybe_index(experience.lens),
+        is_truncated = maybe_index(experience.is_truncated),
+        agent_index = experience.agent_index,
+        is_from_world_model = maybe_index(experience.is_from_world_model),
+        episode_return = maybe_index(experience.episode_return)
+    )
 
 def video_tensor_to_gif(
     tensor,
@@ -956,9 +1015,8 @@ class DreamTrainer(Module):
             dreams = self.unwrapped_model.generate(
                 self.generate_timesteps + 1, # plus one for bootstrap value
                 batch_size = self.batch_size,
-                return_rewards_per_frame = True,
-                return_agent_actions = True,
-                return_log_probs_and_values = True
+                return_for_policy_optimization = True,
+                return_terminals = self.unwrapped_model.predict_terminals
             )
 
             policy_head_loss, value_head_loss = self.model.learn_from_experience(dreams)
@@ -1088,104 +1146,16 @@ class SimTrainer(Module):
         experience: Experience
     ):
 
-        step_size = experience.step_size
-        agent_index = experience.agent_index
-
         latents = experience.latents
-        old_values = experience.values
-        rewards = experience.rewards
-
-        has_proprio = exists(experience.proprio)
-        proprio = experience.proprio
-
-        has_agent_embed = exists(experience.agent_embed)
-        agent_embed = experience.agent_embed
-
-        discrete_actions, continuous_actions = experience.actions
-        discrete_log_probs, continuous_log_probs = experience.log_probs
-
-        discrete_old_action_unembeds, continuous_old_action_unembeds = default(experience.old_action_unembeds, (None, None))
-
-        # handle empties
-
-        empty_tensor = torch.empty_like(rewards)
-
-        agent_embed = default(agent_embed, empty_tensor)
-        proprio = default(proprio, empty_tensor)
-
-        has_discrete = exists(discrete_actions)
-        has_continuous = exists(continuous_actions)
-
-        discrete_actions = default(discrete_actions, empty_tensor)
-        continuous_actions = default(continuous_actions, empty_tensor)
-
-        discrete_log_probs = default(discrete_log_probs, empty_tensor)
-        continuous_log_probs = default(continuous_log_probs, empty_tensor)
-
-        discrete_old_action_unembeds = default(discrete_old_action_unembeds, empty_tensor)
-        continuous_old_action_unembeds = default(continuous_old_action_unembeds, empty_tensor)
-
-        # create the dataset and dataloader
-
-        dataset = TensorDataset(
-            latents,
-            discrete_actions,
-            continuous_actions,
-            discrete_log_probs,
-            continuous_log_probs,
-            agent_embed,
-            proprio,
-            discrete_old_action_unembeds,
-            continuous_old_action_unembeds,
-            old_values,
-            rewards
-        )
+        dataset = TensorDataset(torch.arange(latents.shape[0], device = latents.device))
 
         dataloader = DataLoader(dataset, batch_size = self.batch_size, shuffle = True)
 
         for epoch in range(self.epochs):
 
-            for (
-                latents,
-                discrete_actions,
-                continuous_actions,
-                discrete_log_probs,
-                continuous_log_probs,
-                agent_embed,
-                proprio,
-                discrete_old_action_unembeds,
-                continuous_old_action_unembeds,
-                old_values,
-                rewards
-            ) in dataloader:
+            for (batch_indices,) in dataloader:
 
-                actions = (
-                    discrete_actions if has_discrete else None,
-                    continuous_actions if has_continuous else None
-                )
-
-                log_probs = (
-                    discrete_log_probs if has_discrete else None,
-                    continuous_log_probs if has_continuous else None
-                )
-
-                old_action_unembeds = (
-                    discrete_old_action_unembeds if has_discrete else None,
-                    continuous_old_action_unembeds if has_continuous else None
-                )
-
-                batch_experience = Experience(
-                    latents = latents,
-                    actions = actions,
-                    log_probs = log_probs,
-                    agent_embed = agent_embed if has_agent_embed else None,
-                    proprio = proprio if has_proprio else None,
-                    old_action_unembeds = old_action_unembeds,
-                    values = old_values,
-                    rewards = rewards,
-                    step_size = step_size,
-                    agent_index = agent_index
-                )
+                batch_experience = slice_batch_experience(experience, batch_indices)
 
                 policy_head_loss, value_head_loss = self.model.learn_from_experience(batch_experience)
 
@@ -1698,6 +1668,7 @@ class DreamerTrainer(Module):
                 dream_time_steps,
                 batch_size = self.batch_size,
                 return_for_policy_optimization = True,
+                return_terminals = self.unwrapped_model.predict_terminals,
                 return_decoded_video = False,
                 drop_prompt_from_experience = True,
                 **prompt_kwargs,
