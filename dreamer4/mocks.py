@@ -69,7 +69,11 @@ class MockEnv(Module):
         reward = empty(()).uniform_(*self.reward_range)
 
         if self.vectorized:
-            discrete, continuous = actions
+            if isinstance(actions, tuple):
+                discrete, continuous = actions
+            else:
+                discrete, continuous = actions, None
+
             assert discrete.shape[0] == self.num_envs, f'expected batch of actions for {self.num_envs} environments'
 
             state = repeat(state, '... -> b ...', b = self.num_envs)
