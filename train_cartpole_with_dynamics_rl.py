@@ -284,7 +284,8 @@ def main(
     ssl_max_epochs = 25,
     ssl_target_recon_loss = None,
     ssl_stop_after_episodes = 2000,
-    ssl_batch_size = 8,
+    ssl_batch_size = 2,
+    ssl_grad_accum_every = 8,
     ssl_max_memories = 128,
     tokenizer_learning_rate = 1e-4,
     use_attn_pool = False
@@ -313,10 +314,10 @@ def main(
         accelerator.print(msg)
 
     results_folder = Path('./results')
-    shutil.rmtree(results_folder, ignore_errors=True)
+    shutil.rmtree(results_folder, ignore_errors = True)
     results_folder.mkdir(exist_ok = True, parents = True)
 
-    env = make_env(seed, use_image_input, vectorized=vectorized, num_envs=num_envs)
+    env = make_env(seed, use_image_input, vectorized = vectorized, num_envs = num_envs)
 
     agent = TransformerPPOAgent(
         use_asym_critic = use_asym_critic,
@@ -422,7 +423,7 @@ def main(
         if exists(ssl_stop_after_episodes) and episode >= ssl_stop_after_episodes:
             should_do_ssl_now = False
 
-        # prepare ssl video from accumulated buffer
+        # prepare ssl video from accumulated buffer (kept on cpu, batched to device)
 
         ssl_video = None
         ssl_lens = None
@@ -430,8 +431,8 @@ def main(
         if should_do_ssl_now:
             ssl_exp_batch = combine_experiences(list(ssl_memories))
             if exists(ssl_exp_batch.video):
-                ssl_video = ssl_exp_batch.video.clone().to(device)
-                ssl_lens = ssl_exp_batch.lens.clone().to(device) if exists(ssl_exp_batch.lens) else None
+                ssl_video = ssl_exp_batch.video
+                ssl_lens = ssl_exp_batch.lens if exists(ssl_exp_batch.lens) else None
 
         # rl update from most recent experiences
 
@@ -520,19 +521,18 @@ def main(
 
         if should_do_ssl_now and exists(ssl_video):
             agent.train()
-
-            epoch_recon_loss = 0.
+            torch.cuda.empty_cache()
 
             ssl_pbar = tqdm(range(ssl_max_epochs), desc = 'ssl epochs', leave = False)
             for epoch in ssl_pbar:
-                batches = torch.randperm(ssl_video.shape[0], device = device).split(ssl_batch_size)
+                batches = torch.randperm(ssl_video.shape[0]).split(ssl_batch_size)
 
                 epoch_recon_loss = 0.
 
                 for i, batch_indices in enumerate(batches):
                     is_last_batch = (i + 1) == len(batches)
-                    batch_video = ssl_video[batch_indices]
-                    batch_lens = ssl_lens[batch_indices] if exists(ssl_lens) else None
+                    batch_video = ssl_video[batch_indices].to(device)
+                    batch_lens = ssl_lens[batch_indices].to(device) if exists(ssl_lens) else None
 
                     loss, (losses, recon_video) = tokenizer(
                         batch_video,
@@ -541,10 +541,10 @@ def main(
                         return_intermediates = True
                     )
 
-                    loss = loss / grad_accum_every
+                    loss = loss / ssl_grad_accum_every
                     accelerator.backward(loss)
 
-                    if divisible_by(i + 1, grad_accum_every) or is_last_batch:
+                    if divisible_by(i + 1, ssl_grad_accum_every) or is_last_batch:
                         accelerator.clip_grad_norm_(tokenizer.parameters(), max_grad_norm)
                         tokenizer_optim.step()
                         tokenizer_optim.zero_grad()
@@ -568,8 +568,8 @@ def main(
 
             with torch.no_grad():
                 agent.eval()
-                sample_video = ssl_video[:1]
-                sample_lens = ssl_lens[:1] if exists(ssl_lens) else None
+                sample_video = ssl_video[:1].to(device)
+                sample_lens = ssl_lens[:1].to(device) if exists(ssl_lens) else None
 
                 _, (_, sample_recon) = tokenizer(
                     sample_video,
@@ -584,6 +584,7 @@ def main(
                 save_image(grid, str(results_folder / f'recon_ep{episode}.png'), nrow = orig.shape[0])
 
             agent.eval()
+            torch.cuda.empty_cache()
 
         pbar.set_postfix(loss_metrics)
 
