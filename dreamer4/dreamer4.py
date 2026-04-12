@@ -94,6 +94,7 @@ except ImportError:
 # constants
 
 LinearNoBias = partial(Linear, bias = False)
+LayerNormNoBias = partial(nn.LayerNorm, bias = False)
 
 VideoTokenizerIntermediates = namedtuple('VideoTokenizerIntermediates', ('losses', 'recon'))
 
@@ -1707,6 +1708,37 @@ class AttentionPool(Module):
 
         return rearrange(out, '... 1 d -> ... d')
 
+class LearnedQueriesAttentionPool(Module):
+    def __init__(
+        self,
+        num_queries,
+        dim,
+        heads = 8,
+        dim_head = 64
+    ):
+        super().__init__()
+        self.queries = Parameter(randn(num_queries, dim) * 1e-2)
+
+        self.attn = Attention(
+            dim = dim,
+            heads = heads,
+            dim_head = dim_head,
+            gate_values = True,
+            value_residual = False,
+            belief_attn = False,
+            pre_rmsnorm = True,
+            pre_context_rmsnorm = True
+        )
+
+    def forward(self, x):
+        context, inverse_pack = pack_one(x, '* n d')
+
+        queries = repeat(self.queries, 'n d -> b n d', b = context.shape[0])
+
+        out = self.attn(queries, context = context)
+
+        return inverse_pack(out)
+
 # axial space time transformer
 
 class AxialSpaceTimeTransformer(Module):
@@ -2122,7 +2154,8 @@ class ShiftedPatchTokenization(Module):
 
         self.to_patch_tokens = Sequential(
             Rearrange('... c p1 p2 -> ... (c p1 p2)'),
-            Linear(patch_dim, dim)
+            Linear(patch_dim, dim),
+            LayerNormNoBias(dim)
         )
 
     def forward(
@@ -2230,7 +2263,8 @@ class VideoTokenizer(Module):
         else:
             self.patch_to_tokens = Sequential(
                 Rearrange('b c t (h p1) (w p2) -> b t h w (p1 p2 c)', p1 = patch_size, p2 = patch_size),
-                Linear(dim_patch, dim)
+                Linear(dim_patch, dim),
+                LayerNormNoBias(dim)
             )
 
         self.tokens_to_patch = Sequential(
@@ -2270,7 +2304,8 @@ class VideoTokenizer(Module):
             self.time_embed = Embedding(decoder_flow_steps, dim)
             self.noised_patch_to_tokens = Sequential(
                 Rearrange('b c t (h p1) (w p2) -> b t h w (p1 p2 c)', p1 = patch_size, p2 = patch_size),
-                Linear(dim_patch, dim)
+                Linear(dim_patch, dim),
+                LayerNormNoBias(dim)
             )
 
         # encoder space / time transformer
@@ -2874,7 +2909,8 @@ class DynamicsWorldModel(Module):
         latent_ar_action_conditioned = False,
         latent_ar_loss_weight = 0.,
         latent_ar_sigreg_loss_weight = 0.05,
-        latent_ar_sigreg_loss_kwargs: dict = dict(num_slices = 256)
+        latent_ar_sigreg_loss_kwargs = dict(num_slices = 256),
+        identity_latents_to_spatial = False
     ):
         super().__init__()
         self.dim = dim
@@ -2902,37 +2938,23 @@ class DynamicsWorldModel(Module):
         self.dim_latent = dim_latent
         self.latent_shape = (num_latent_tokens, dim_latent)
 
-        if num_spatial_tokens >= num_latent_tokens:
-            assert divisible_by(num_spatial_tokens, num_latent_tokens)
+        is_same_len = num_spatial_tokens == num_latent_tokens
 
-            expand_factor = num_spatial_tokens // num_latent_tokens
+        assert not identity_latents_to_spatial or dim == dim_latent, 'identity_latents_to_spatial requires dim == dim_latent'
 
+        self.latents_to_spatial_tokens = Identity()
+
+        if not is_same_len or not identity_latents_to_spatial:
             self.latents_to_spatial_tokens = Sequential(
-                Linear(dim_latent, dim * expand_factor),
-                Rearrange('... (s d) -> ... s d', s = expand_factor)
+                Linear(dim_latent, dim) if dim_latent != dim else Identity(),
+                LearnedQueriesAttentionPool(num_spatial_tokens, dim = dim, heads = attn_heads, dim_head = attn_dim_head) if not is_same_len else Identity()
             )
 
-            self.to_latent_pred = Sequential(
-                Reduce('b t v n s d -> b t v n d', 'mean'),
-                RMSNorm(dim),
-                LinearNoBias(dim, dim_latent)
-            )
-
-        else:
-            assert divisible_by(num_latent_tokens, num_spatial_tokens)
-            latent_tokens_to_space = num_latent_tokens // num_spatial_tokens
-
-            self.latents_to_spatial_tokens = Sequential(
-                Rearrange('... n d -> ... (n d)'),
-                Linear(num_latent_tokens * dim_latent, dim * num_spatial_tokens),
-                Rearrange('... (s d) -> ... s d', s = num_spatial_tokens)
-            )
-
-            self.to_latent_pred = Sequential(
-                RMSNorm(dim),
-                LinearNoBias(dim, dim_latent * latent_tokens_to_space),
-                Rearrange('b t v s (n d) -> b t v (s n) d', n = latent_tokens_to_space)
-            )
+        self.to_latent_pred = Sequential(
+            RMSNorm(dim),
+            LearnedQueriesAttentionPool(num_latent_tokens, dim = dim, heads = attn_heads, dim_head = attn_dim_head) if not is_same_len else Identity(),
+            LinearNoBias(dim, dim_latent)
+        )
 
         # number of video views, for robotics, which could have third person + wrist camera at least
 
