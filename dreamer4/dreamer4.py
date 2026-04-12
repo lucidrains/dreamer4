@@ -1245,7 +1245,17 @@ def naive_attend(
     causal_block_size = 1,
     mask = None
 ):
-    groups = q.shape[1] // k.shape[1]
+    groups = q.shape[-3] // k.shape[-3]
+    is_gqa = groups > 1
+
+    can_use_sdpa = not exists(softclamp_value) and not exists(mask) and causal_block_size == 1
+
+    if can_use_sdpa:
+        if is_gqa:
+            k = repeat(k, '... h n d -> ... (h g) n d', g = groups)
+            v = repeat(v, '... h n d -> ... (h g) n d', g = groups)
+
+        return F.scaled_dot_product_attention(q, k, v, is_causal = causal, scale = scale)
 
     if not exists(scale):
         scale = q.shape[-1] ** -0.5
@@ -1760,15 +1770,15 @@ class AxialSpaceTimeTransformer(Module):
         attn_residual_kwargs: dict = dict(),
         num_special_spatial_tokens = 1,
         special_attend_only_itself = False,  # this is set to True for the video tokenizer decoder (latents can only attend to itself while spatial modalities attend to the latents and everything)
+        full_spatial_attn = False,
         final_norm = True,
         value_residual = True,               # https://arxiv.org/abs/2410.17897 - but with learned mixing from OSS
         rnn_time = False,
         time_attention_use_pope = False,
-        use_attn_pool = True,
-        use_attn_residual = False
+        use_attn_pool = True
     ):
         super().__init__()
-        self.use_attn_residual = use_attn_residual
+        self.full_spatial_attn = full_spatial_attn
         assert depth >= time_block_every, f'depth must be at least {time_block_every}'
 
         # attention
@@ -1860,7 +1870,7 @@ class AxialSpaceTimeTransformer(Module):
         # special tokens
 
         self.num_special_spatial_tokens = num_special_spatial_tokens
-        self.should_special_cross_attend = num_special_spatial_tokens > 0 and not special_attend_only_itself
+        self.should_special_cross_attend = num_special_spatial_tokens > 0 and not special_attend_only_itself and not full_spatial_attn
 
         self.final_special_cross_attn = self.final_special_ff = None
 
@@ -1914,11 +1924,13 @@ class AxialSpaceTimeTransformer(Module):
 
         use_flex = exists(flex_attention) and tokens.is_cuda and not has_kv_cache # KV cache shape breaks flex attention TODO: Fix
 
-        attend_kwargs = dict(use_flex = use_flex, softclamp_value = self.attn_softclamp_value, special_attend_only_itself = self.special_attend_only_itself, device = device)
+        attend_kwargs = dict(softclamp_value = self.attn_softclamp_value, special_attend_only_itself = self.special_attend_only_itself, device = device)
 
-        space_attend = get_attend_fn(causal = False, seq_len = space_seq_len, k_seq_len = space_seq_len, num_special_tokens = self.num_special_spatial_tokens, **attend_kwargs) # space has an agent token on the right-hand side for reinforcement learning - cannot be attended to by modality
+        num_spatial_special = 0 if self.full_spatial_attn else self.num_special_spatial_tokens
 
-        time_attend = get_attend_fn(causal = True, seq_len = time, k_seq_len = time + token_count, **attend_kwargs)
+        space_attend = get_attend_fn(**attend_kwargs, causal = False, seq_len = space_seq_len, k_seq_len = space_seq_len, num_special_tokens = num_spatial_special, use_flex = use_flex and not self.full_spatial_attn)
+
+        time_attend = get_attend_fn(**attend_kwargs, causal = True, seq_len = time, k_seq_len = time + token_count, use_flex = use_flex)
 
         # prepare cache
 
@@ -2210,6 +2222,8 @@ class VideoTokenizer(Module):
         num_latent_tokens = 64,
         encoder_depth = 4,
         decoder_depth = 4,
+        encoder_full_spatial_attn = False,
+        decoder_full_spatial_attn = False,
         time_block_every = 4,
         attn_kwargs: dict = dict(),
         attn_dim_head = 64,
@@ -2323,6 +2337,7 @@ class VideoTokenizer(Module):
             attn_softclamp_value = attn_softclamp_value,
             time_block_every = time_block_every,
             num_special_spatial_tokens = num_latent_tokens,
+            full_spatial_attn = encoder_full_spatial_attn,
             attn_kwargs = attn_kwargs,
             ff_kwargs = ff_kwargs,
             final_norm = True,
@@ -2364,6 +2379,7 @@ class VideoTokenizer(Module):
             time_block_every = time_block_every,
             num_special_spatial_tokens = num_latent_tokens,
             special_attend_only_itself = True,
+            full_spatial_attn = decoder_full_spatial_attn,
             attn_kwargs = attn_kwargs,
             ff_kwargs = ff_kwargs,
             final_norm = True,
