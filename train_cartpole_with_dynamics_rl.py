@@ -7,6 +7,7 @@
 #     "ninja",
 #     "dreamer4",
 #     "fire",
+#     "pillow",
 #     "wandb"
 # ]
 # [tool.uv.sources]
@@ -27,6 +28,7 @@ from torchvision.utils import save_image
 
 from tqdm import tqdm
 import numpy as np
+from PIL import Image
 
 import torch
 from torch import nn, stack, tensor, is_tensor, zeros
@@ -89,42 +91,40 @@ def make_env(seed, use_image_input = False, vectorized = False, num_envs = 8):
 
 def render_frame(env):
     img = env.render()
-    img = tensor(img, dtype = torch.float32, device = 'cpu')
-    img = rearrange(img, 'h w c -> 1 c h w')
-    img = F.interpolate(img, size = (64, 64), mode = 'bilinear', align_corners = False)
-    img = img / 255.0
+    img = Image.fromarray(img).resize((64, 64), Image.BILINEAR)
+    img = torch.from_numpy(np.array(img)).permute(2, 0, 1).unsqueeze(0).float() / 255.0
     return img
 
 # conv encoder
 
 class SmallConvEncoder(nn.Module):
-    def __init__(self, num_latent_tokens=4, dim_latent=32):
+    def __init__(self, num_latent_tokens = 4, dim_latent = 32):
         super().__init__()
         self.num_latent_tokens = num_latent_tokens
         self.dim_latent = dim_latent
 
         self.net = nn.Sequential(
-            nn.Conv2d(3, 16, 4, stride=2, padding=1),
+            nn.Conv2d(3, 16, 4, stride = 2, padding = 1),
             nn.ReLU(),
-            nn.Conv2d(16, 32, 4, stride=2, padding=1),
+            nn.Conv2d(16, 32, 4, stride = 2, padding = 1),
             nn.ReLU(),
-            nn.Conv2d(32, 64, 4, stride=2, padding=1),
+            nn.Conv2d(32, 64, 4, stride = 2, padding = 1),
             nn.ReLU(),
-            nn.Conv2d(64, num_latent_tokens * dim_latent, 8, stride=1, padding=0),
+            nn.Conv2d(64, num_latent_tokens * dim_latent, 8, stride = 1, padding = 0),
             nn.Tanh()
         )
 
-    def forward(self, x, return_latents=False, time_cache=None, return_time_cache=False, **kwargs):
+    def forward(self, x, return_latents = False, time_cache = None, return_time_cache = False, **kwargs):
         is_video = x.ndim == 5
         if is_video:
             b, c, t, h, w = x.shape
             x = rearrange(x, 'b c t h w -> (b t) c h w')
 
         out = self.net(x)
-        out = rearrange(out, 'b (n d) 1 1 -> b n d', n=self.num_latent_tokens, d=self.dim_latent)
+        out = rearrange(out, 'b (n d) 1 1 -> b n d', n = self.num_latent_tokens, d = self.dim_latent)
 
         if is_video:
-            out = rearrange(out, '(b t) n d -> b t n d', b=b, t=t)
+            out = rearrange(out, '(b t) n d -> b t n d', b = b, t = t)
 
         if not return_time_cache:
             return out
@@ -144,7 +144,8 @@ class TransformerPPOAgent(nn.Module):
         use_conv_encoder = False,
         use_time_rnn = False,
         use_attn_pool = False,
-        pmpo_kl_div_loss_weight = 0.05
+        pmpo_kl_div_loss_weight = 0.05,
+        use_aux_conv_encoder = False
     ):
         super().__init__()
         self.use_image_input = use_image_input
@@ -169,19 +170,31 @@ class TransformerPPOAgent(nn.Module):
                     decoder_depth = 3,
                     time_block_every = 2,
                     use_causal_conv3d = True,
+                    use_shifted_patch_tokenization = True,
                     use_time_rnn = use_time_rnn,
                     use_loss_normalization = True,
                     decoder_flow_steps = 2,
                     lpips_loss_weight = 0.
                 )
 
+        aux_image_encoder = None
+        num_combined_latents = num_latent_tokens
+
+        if use_image_input and use_aux_conv_encoder:
+            aux_image_encoder = SmallConvEncoder(
+                num_latent_tokens = num_latent_tokens,
+                dim_latent = 32
+            )
+            num_combined_latents += num_latent_tokens
+
         self.dynamics = DynamicsWorldModel(
             video_tokenizer = tokenizer,
+            aux_image_encoder = aux_image_encoder,
             dim = 128,
             dim_latent = 32,
             dim_state = None if use_image_input else 4,
-            num_latent_tokens = num_latent_tokens,
-            num_spatial_tokens = num_latent_tokens,
+            num_latent_tokens = num_combined_latents if use_image_input else num_latent_tokens,
+            num_spatial_tokens = num_combined_latents if use_image_input else num_latent_tokens,
             num_register_tokens = 1,
             num_discrete_actions = 2,
             use_time_rnn = use_time_rnn,
@@ -244,13 +257,13 @@ def slice_experience(exp, idx):
 # training loop
 
 def main(
-    batch_size = 8,
-    grad_accum_every = 1,
+    num_episodes = 5000,
+    batch_size = 4,
+    grad_accum_every = 2,
     update_episodes = 16,
     update_epochs = 4,
     ppo_replay_updates = 2,
-    num_episodes = 10000,
-    max_timesteps = 500,
+    max_timesteps = 150,
     learning_rate = 3e-4,
     max_grad_norm = 0.5,
     target_return = 70.0,
@@ -266,7 +279,8 @@ def main(
     num_envs = 8,
     cpu = False,
     use_time_rnn = True,
-    ssl_every_rl_updates = 2,
+    use_aux_conv_encoder = False,
+    ssl_every_rl_updates = 0,
     ssl_max_epochs = 25,
     ssl_target_recon_loss = None,
     ssl_stop_after_episodes = 2000,
@@ -311,7 +325,8 @@ def main(
         use_image_input = use_image_input,
         use_conv_encoder = use_conv_encoder,
         use_time_rnn = use_time_rnn,
-        use_attn_pool = use_attn_pool
+        use_attn_pool = use_attn_pool,
+        use_aux_conv_encoder = use_aux_conv_encoder
     ).to(device)
 
     # optimizers

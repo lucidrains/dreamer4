@@ -2669,6 +2669,7 @@ class VideoTokenizer(Module):
 
             if not return_time_cache:
                 return latents
+
             return latents, next_time_cache
 
         if self.has_latent_ar and self.latent_ar_in_decoder:
@@ -2915,7 +2916,8 @@ class DynamicsWorldModel(Module):
         latent_ar_loss_weight = 0.,
         latent_ar_sigreg_loss_weight = 0.05,
         latent_ar_sigreg_loss_kwargs = dict(num_slices = 256),
-        identity_latents_to_spatial = False
+        identity_latents_to_spatial = False,
+        aux_image_encoder: Module | None = None
     ):
         super().__init__()
         self.dim = dim
@@ -2926,10 +2928,11 @@ class DynamicsWorldModel(Module):
         # can accept raw video if tokenizer is passed in
 
         self.video_tokenizer = video_tokenizer
+        self.aux_image_encoder = aux_image_encoder
+        self.has_aux_image_encoder = exists(aux_image_encoder)
 
         if exists(video_tokenizer):
             num_latent_tokens = default(num_latent_tokens, video_tokenizer.num_latent_tokens)
-            assert video_tokenizer.num_latent_tokens == num_latent_tokens, f'`num_latent_tokens` must be the same for the tokenizer and dynamics model'
 
         assert exists(num_latent_tokens), '`num_latent_tokens` must be set'
 
@@ -3289,6 +3292,13 @@ class DynamicsWorldModel(Module):
 
         return list(set(params) - set(self.video_tokenizer.parameters()))
 
+    # aux encoders
+
+    def encode_aux_image_tokens(self, video):
+        aux_out = self.aux_image_encoder(video)
+        (aux_image_tokens, *_), _ = tree_flatten(aux_out)
+        return aux_image_tokens
+
     # helpers for shortcut flow matching
 
     def get_times_from_signal_level(
@@ -3449,14 +3459,20 @@ class DynamicsWorldModel(Module):
 
             if exists(obs_to_latents_fn):
                 latents, next_tokenizer_time_cache = obs_to_latents_fn(self, obs, tokenizer_time_cache)
+
             elif exists(curr_image):
                 assert exists(self.video_tokenizer), 'video_tokenizer must be defined to automatically parse image observations'
                 latents, next_tokenizer_time_cache = self.video_tokenizer(curr_image, return_latents = True, time_cache = tokenizer_time_cache, return_time_cache = True)
+                if self.has_aux_image_encoder:
+                    aux_image_tokens = self.encode_aux_image_tokens(curr_image)
+                    latents = cat((latents, aux_image_tokens), dim = -2)
+
             elif exists(curr_state):
                 assert exists(self.state_to_latents), 'DynamicsWorldModel must have dim_state defined to automatically parse state observations'
                 latents = self.state_to_latents(curr_state)
                 latents = rearrange(latents, 'b n d -> b 1 n d') if latents.ndim == 3 else latents
                 next_tokenizer_time_cache = tokenizer_time_cache
+
             else:
                 raise ValueError('Observations must contain an image or state key, or provide a custom obs_to_latents_fn')
 
@@ -3615,8 +3631,13 @@ class DynamicsWorldModel(Module):
             if done_flag.all() and need_bootstrap.any():
                 if exists(obs_to_latents_fn):
                     bootstrap_latents, _ = obs_to_latents_fn(obs, tokenizer_time_cache)
+
                 elif exists(curr_image):
                     bootstrap_latents, _ = self.video_tokenizer(curr_image, return_latents = True, time_cache = tokenizer_time_cache, return_time_cache = True)
+                    if self.has_aux_image_encoder:
+                        aux_image_tokens = self.encode_aux_image_tokens(curr_image)
+                        bootstrap_latents = cat((bootstrap_latents, aux_image_tokens), dim = -2)
+
                 elif exists(curr_state):
                     bootstrap_latents = self.state_to_latents(curr_state)
                     bootstrap_latents = rearrange(bootstrap_latents, 'b n d -> b 1 n d') if bootstrap_latents.ndim == 3 else bootstrap_latents
@@ -3726,6 +3747,9 @@ class DynamicsWorldModel(Module):
         if not exists(latents):
             assert exists(self.video_tokenizer) and exists(experience.video)
             latents = self.video_tokenizer(experience.video, return_latents = True)
+            if self.has_aux_image_encoder:
+                aux_image_tokens = self.encode_aux_image_tokens(experience.video)
+                latents = cat((latents, aux_image_tokens), dim = -2)
 
         actions = experience.actions
         proprio = experience.proprio
