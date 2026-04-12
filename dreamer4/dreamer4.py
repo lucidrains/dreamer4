@@ -1436,6 +1436,7 @@ class Attention(Module):
         self,
         dim,
         dim_head = 64,
+        dim_kv_input = None,
         query_heads = None,
         heads = 8,
         pre_rmsnorm = True,
@@ -1447,8 +1448,10 @@ class Attention(Module):
         belief_attn = True
     ):
         super().__init__()
+        dim_kv_input = default(dim_kv_input, dim)
+
         self.norm = RMSNorm(dim) if pre_rmsnorm else Identity()
-        self.norm_context = RMSNorm(dim) if pre_context_rmsnorm else Identity()
+        self.norm_context = RMSNorm(dim_kv_input) if pre_context_rmsnorm else Identity()
 
         # setup grouped query attention
 
@@ -1464,8 +1467,8 @@ class Attention(Module):
         dim_kv_inner = dim_head * heads
 
         self.to_q = LinearNoBias(dim, dim_q_inner)
-        self.to_k = LinearNoBias(dim, dim_kv_inner)
-        self.to_v = LinearNoBias(dim, dim_kv_inner)
+        self.to_k = LinearNoBias(dim_kv_input, dim_kv_inner)
+        self.to_v = LinearNoBias(dim_kv_input, dim_kv_inner)
         self.to_out = LinearNoBias(dim_q_inner, dim)
 
         # alphafold gating per head, for attending to nothing
@@ -1713,6 +1716,7 @@ class LearnedQueriesAttentionPool(Module):
         self,
         num_queries,
         dim,
+        dim_kv_input = None,
         heads = 8,
         dim_head = 64
     ):
@@ -1721,6 +1725,7 @@ class LearnedQueriesAttentionPool(Module):
 
         self.attn = Attention(
             dim = dim,
+            dim_kv_input = dim_kv_input,
             heads = heads,
             dim_head = dim_head,
             gate_values = True,
@@ -2945,10 +2950,13 @@ class DynamicsWorldModel(Module):
         self.latents_to_spatial_tokens = Identity()
 
         if not is_same_len or not identity_latents_to_spatial:
-            self.latents_to_spatial_tokens = Sequential(
-                Linear(dim_latent, dim) if dim_latent != dim else Identity(),
-                LearnedQueriesAttentionPool(num_spatial_tokens, dim = dim, heads = attn_heads, dim_head = attn_dim_head) if not is_same_len else Identity()
-            )
+            self.latents_to_spatial_tokens = LearnedQueriesAttentionPool(
+                num_spatial_tokens,
+                dim = dim,
+                dim_kv_input = dim_latent,
+                heads = attn_heads,
+                dim_head = attn_dim_head
+            ) if not is_same_len else Linear(dim_latent, dim)
 
         self.to_latent_pred = Sequential(
             RMSNorm(dim),
