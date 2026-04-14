@@ -145,15 +145,17 @@ class TransformerPPOAgent(nn.Module):
         use_time_rnn = False,
         use_attn_pool = False,
         pmpo_kl_div_loss_weight = 0.05,
-        use_aux_conv_encoder = False
     ):
         super().__init__()
         self.use_image_input = use_image_input
 
         tokenizer = None
+        aux_image_encoder = None
+        num_combined_latents = num_latent_tokens
+
         if use_image_input:
             if use_conv_encoder:
-                tokenizer = SmallConvEncoder(
+                aux_image_encoder = SmallConvEncoder(
                     num_latent_tokens = num_latent_tokens,
                     dim_latent = 32
                 )
@@ -176,16 +178,6 @@ class TransformerPPOAgent(nn.Module):
                     decoder_flow_steps = 2,
                     lpips_loss_weight = 0.
                 )
-
-        aux_image_encoder = None
-        num_combined_latents = num_latent_tokens
-
-        if use_image_input and use_aux_conv_encoder:
-            aux_image_encoder = SmallConvEncoder(
-                num_latent_tokens = num_latent_tokens,
-                dim_latent = 32
-            )
-            num_combined_latents += num_latent_tokens
 
         self.dynamics = DynamicsWorldModel(
             video_tokenizer = tokenizer,
@@ -279,7 +271,6 @@ def main(
     num_envs = 8,
     cpu = False,
     use_time_rnn = True,
-    use_aux_conv_encoder = False,
     ssl_every_rl_updates = 0,
     ssl_max_epochs = 25,
     ssl_target_recon_loss = None,
@@ -327,7 +318,6 @@ def main(
         use_conv_encoder = use_conv_encoder,
         use_time_rnn = use_time_rnn,
         use_attn_pool = use_attn_pool,
-        use_aux_conv_encoder = use_aux_conv_encoder
     ).to(device)
 
     # optimizers
@@ -459,7 +449,7 @@ def main(
                 for i, batch_idx in enumerate(batches):
                     micro = slice_experience(exp_batch, batch_idx)
 
-                    if exists(agent.dynamics.video_tokenizer):
+                    if agent.dynamics.has_image_encoder:
                         micro.latents = None
 
                     if exists(micro.critic_state) and exists(micro.rewards) and micro.critic_state.shape[1] < micro.rewards.shape[1]:
@@ -480,8 +470,8 @@ def main(
                     is_last_batch = (i + 1) == len(batches)
 
                     if divisible_by(i + 1, grad_accum_every) or is_last_batch:
-                        if exists(agent.dynamics.video_tokenizer):
-                            conv_grad = nn.utils.clip_grad_norm_(agent.dynamics.video_tokenizer.parameters(), float('inf'))
+                        if agent.dynamics.has_image_encoder:
+                            conv_grad = nn.utils.clip_grad_norm_(agent.dynamics.image_encoder_parameters(), float('inf'))
                             epoch_conv_grad_norm += conv_grad.item() / len(batches)
 
                         accelerator.clip_grad_norm_(agent.parameters(), max_grad_norm)
@@ -497,7 +487,7 @@ def main(
 
             loss_metrics.update(policy_loss = f'{avg_policy_loss:.3f}', value_loss = f'{avg_value_loss:.3f}')
 
-            if exists(agent.dynamics.video_tokenizer):
+            if agent.dynamics.has_image_encoder:
                 loss_metrics.update(conv_grad = f'{avg_conv_grad_norm:.3f}')
 
             if use_wandb:

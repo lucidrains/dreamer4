@@ -1189,3 +1189,44 @@ def test_e2e_sequential_parallel_cache(use_time_rnn, use_causal_conv3d, use_shif
         policy_embed_sequential = torch.cat(policy_embed_sequential, dim = 1)
 
     assert torch.allclose(policy_embed_parallel, policy_embed_sequential, atol = 1e-4)
+
+@param('use_tokenizer', (False, True))
+@param('use_aux_encoder', (False, True))
+def test_aux_encoder_combinations(use_tokenizer, use_aux_encoder):
+    if not (use_tokenizer or use_aux_encoder):
+        return
+
+    import torch
+    from torch import nn
+    from dreamer4.dreamer4 import DynamicsWorldModel, VideoTokenizer
+    from dreamer4.mocks import MockEnv
+
+    class MockAuxEncoder(nn.Module):
+        def forward(self, x, **kwargs):
+            return torch.randn(x.shape[0], x.shape[2], 2, 16, device = x.device)
+
+    both = use_tokenizer and use_aux_encoder
+    num_tokens = 4 if both else 2
+
+    tokenizer = VideoTokenizer(
+        dim = 16, dim_latent = 16, patch_size = 32, image_height = 64, image_width = 64,
+        num_latent_tokens = 2, encoder_depth = 1, decoder_depth = 1,
+        time_block_every = 1, attn_heads = 1, attn_dim_head = 8
+    ) if use_tokenizer else None
+
+    dynamics = DynamicsWorldModel(
+        dim = 16, dim_latent = 16,
+        num_latent_tokens = num_tokens, num_spatial_tokens = num_tokens,
+        video_tokenizer = tokenizer,
+        aux_image_encoder = MockAuxEncoder() if use_aux_encoder else None,
+        num_discrete_actions = 2,
+        depth = 1, time_block_every = 1, attn_heads = 1, attn_dim_head = 8
+    )
+
+    loss = dynamics(video = torch.randn(1, 3, 2, 64, 64))
+    assert loss.numel() == 1
+
+    mock_env = MockEnv((64, 64), vectorized = False, num_envs = 1, terminate_after_step = 2)
+
+    experience = dynamics.interact_with_env(mock_env, max_timesteps = 2, env_is_vectorized = False)
+    assert experience.latents.shape[-2] == num_tokens
