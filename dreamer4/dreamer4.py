@@ -108,7 +108,7 @@ AttentionIntermediates = namedtuple('AttentionIntermediates', ('next_kv_cache', 
 
 TransformerIntermediates = namedtuple('TransformerIntermediates', ('next_kv_cache', 'normed_time_inputs', 'normed_space_inputs', 'next_rnn_hiddens', 'layer_hiddens', 'token_count'), defaults=(None, None, None, None, None, 0))
 
-DynamicsIntermediates = namedtuple('DynamicsIntermediates', ('main', 'actor', 'critic'), defaults=(None, None, None))
+DynamicsIntermediates = namedtuple('DynamicsIntermediates', ('main', 'actor', 'critic', 'spatial', 'action'), defaults=(None, None, None, None, None))
 
 Predictions = namedtuple('Predictions', ['flow', 'proprioception', 'state'])
 
@@ -1875,7 +1875,6 @@ class AxialSpaceTimeTransformer(Module):
         is_time = []
 
         layers = []
-        rnn_layers = []
         attn_pools = []
 
         for i in range(depth):
@@ -1946,6 +1945,8 @@ class AxialSpaceTimeTransformer(Module):
         cache: TransformerIntermediates | None = None,
         return_intermediates = False
     ): # (b t s d) | (y 2 b h t d)
+
+        tokens, inverse_pack = pack_one(tokens, 'b t * d')
 
         batch, time, space_seq_len, _, device = *tokens.shape, tokens.device
 
@@ -2130,7 +2131,7 @@ class AxialSpaceTimeTransformer(Module):
             out = cat((past_tokens, out), dim = 1)
 
         if not return_intermediates:
-            return out
+            return inverse_pack(out)
 
         intermediates = TransformerIntermediates(
             safe_stack(time_attn_kv_caches),
@@ -2141,7 +2142,7 @@ class AxialSpaceTimeTransformer(Module):
             token_count + time
         )
 
-        return out, intermediates
+        return inverse_pack(out), intermediates
 
 class CausalDepthwiseConv3d(Module):
     def __init__(
@@ -2927,6 +2928,8 @@ class DynamicsWorldModel(Module):
         critic_state_embedder: Module | None = None,
         reward_encoder_kwargs: dict = dict(),
         depth = 4,
+        spatial_pre_encoder_depth = 0,
+        action_pre_encoder_depth = 0,
         actor_depth = 0,
         critic_depth = 0,
         pred_orig_latent = True,   # directly predicting the original x0 data yield better results, rather than velocity (x-space vs v-space)
@@ -3063,6 +3066,7 @@ class DynamicsWorldModel(Module):
 
         # state
 
+        self.state_to_latents = None
         self.dim_state = dim_state
 
         if exists(dim_state):
@@ -3070,8 +3074,6 @@ class DynamicsWorldModel(Module):
                 LinearNoBias(dim_state, num_latent_tokens * dim_latent),
                 Rearrange('... (n d) -> ... n d', n = num_latent_tokens, d = dim_latent)
             )
-        else:
-            self.state_to_latents = None
 
         # asymmetric critic state embedding
 
@@ -3102,7 +3104,7 @@ class DynamicsWorldModel(Module):
 
         assert is_power_two(max_steps), '`max_steps` must be a power of 2'
         self.max_steps = max_steps
-        self.num_step_sizes_log2 = int(log2(max_steps))
+        self.num_step_sizes_log2 = int(log2(max_steps)) + 1
 
         self.signal_levels_embed = nn.Embedding(max_steps, dim_half)
         self.step_size_embed = nn.Embedding(self.num_step_sizes_log2, dim_half) # power of 2, so 1/1, 1/2, 1/4, 1/8 ... 1/Kmax
@@ -3275,6 +3277,42 @@ class DynamicsWorldModel(Module):
         )
 
         # efficient axial space / time transformer
+
+        self.spatial_pre_encoder = None
+        if spatial_pre_encoder_depth > 0:
+            self.spatial_pre_encoder = AxialSpaceTimeTransformer(
+                dim = dim,
+                depth = spatial_pre_encoder_depth,
+                attn_heads = attn_heads,
+                attn_dim_head = attn_dim_head,
+                attn_softclamp_value = attn_softclamp_value,
+                attn_kwargs = attn_kwargs,
+                ff_kwargs = ff_kwargs,
+                num_special_spatial_tokens = 0,
+                time_block_every = time_block_every,
+                final_norm = False,
+                rnn_time = use_time_rnn,
+                time_attention_use_pope = time_attention_use_pope
+            )
+
+        self.action_pre_encoder = None
+        if action_pre_encoder_depth > 0:
+            assert self.action_embedder.has_actions, 'action_pre_encoder_depth cannot be > 0 if the model does not have actions'
+
+            self.action_pre_encoder = AxialSpaceTimeTransformer(
+                dim = dim,
+                depth = action_pre_encoder_depth,
+                attn_heads = attn_heads,
+                attn_dim_head = attn_dim_head,
+                attn_softclamp_value = attn_softclamp_value,
+                attn_kwargs = attn_kwargs,
+                ff_kwargs = ff_kwargs,
+                num_special_spatial_tokens = 0,
+                time_block_every = 1,
+                final_norm = False,
+                rnn_time = use_time_rnn,
+                time_attention_use_pope = time_attention_use_pope
+            )
 
         self.transformer = AxialSpaceTimeTransformer(
             dim = dim,
@@ -5005,7 +5043,7 @@ class DynamicsWorldModel(Module):
                 # handle first timestep not having an associated past action
                 # in replay buffers for rl, typically the action paired up with the state is the very next one, not the previous one that led up to that state
                 # next_action_tokens contains the actual actions from t=1 to t=time-1
-                next_action_tokens = action_tokens[:, 1:]
+                next_action_tokens = action_tokens
                 action_tokens = pad_at_dim(action_tokens[:, :-1], (1, 0), value = 0., dim = 1)
 
             elif action_len == (time - 1):
@@ -5067,14 +5105,26 @@ class DynamicsWorldModel(Module):
             flow_token = cat((signal_embed, step_size_embed), dim = -1)
             flow_token = rearrange(flow_token, 'b t d -> b t d')
 
-            # pack to tokens for attending
-
-            tokens, packed_tokens_shape = pack([flow_token, space_tokens, proprio_token, state_pred_token, registers, action_tokens, reward_tokens, agent_tokens], 'b t * d')
+            # handle caching
 
             if not exists(time_cache):
                 time_cache = DynamicsIntermediates()
 
-            main_cache, actor_cache, critic_cache = time_cache
+            main_cache, actor_cache, critic_cache, spatial_cache, action_cache = time_cache
+
+            spatial_intermediates = action_intermediates = None
+
+            if exists(self.spatial_pre_encoder):
+                space_tokens, spatial_intermediates = self.spatial_pre_encoder(space_tokens, cache = spatial_cache, return_intermediates = True)
+
+            if exists(self.action_pre_encoder):
+                action_tokens, action_intermediates = self.action_pre_encoder(action_tokens, cache = action_cache, return_intermediates = True)
+
+            # pack to tokens for attending
+
+            tokens, packed_tokens_shape = pack([flow_token, space_tokens, proprio_token, state_pred_token, registers, action_tokens, reward_tokens, agent_tokens], 'b t * d')
+
+            # main space time transformer
 
             tokens, intermediates = self.transformer(tokens, cache = main_cache, return_intermediates = True)
 
@@ -5129,7 +5179,7 @@ class DynamicsWorldModel(Module):
             if not return_time_cache:
                 return predictions, embeds
 
-            dynamics_intermediates = DynamicsIntermediates(intermediates, actor_intermediates, critic_intermediates)
+            dynamics_intermediates = DynamicsIntermediates(intermediates, actor_intermediates, critic_intermediates, spatial_intermediates, action_intermediates)
 
             return predictions, (embeds, dynamics_intermediates, packed_tokens_shape)
 
@@ -5520,7 +5570,7 @@ class DynamicsWorldModel(Module):
         latent_ar_loss = latent_ar_sigreg_loss = self.zero
 
         if self.has_latent_ar:
-            layer_hiddens = intermediates.layer_hiddens
+            layer_hiddens = intermediates.main.layer_hiddens
 
             if isinstance(self.latent_ar_layer, tuple):
                 source_layer, target_layer = self.latent_ar_layer
