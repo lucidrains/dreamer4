@@ -108,9 +108,11 @@ AttentionIntermediates = namedtuple('AttentionIntermediates', ('next_kv_cache', 
 
 TransformerIntermediates = namedtuple('TransformerIntermediates', ('next_kv_cache', 'normed_time_inputs', 'normed_space_inputs', 'next_rnn_hiddens', 'layer_hiddens', 'token_count'), defaults=(None, None, None, None, None, 0))
 
+DynamicsIntermediates = namedtuple('DynamicsIntermediates', ('main', 'actor', 'critic'), defaults=(None, None, None))
+
 Predictions = namedtuple('Predictions', ['flow', 'proprioception', 'state'])
 
-Embeds = namedtuple('Embeds', ['agent', 'state_pred'])
+Embeds = namedtuple('Embeds', ['agent', 'state_pred', 'actor', 'critic'], defaults=(None, None))
 
 Actions = namedtuple('Actions', ['discrete', 'continuous'])
 
@@ -1003,7 +1005,7 @@ class ActionEmbedder(Module):
         if exists(continuous_targets) and exists(continuous_action_mean_log_var):
             if not exists(pred_head_index) and self.num_unembed_preds > 1:
                 # if multiple heads and no index, broadcast targets to mtp dim
-                if continuous_targets.ndim == (continuous_action_mean_log_var.ndim - 1):
+                if continuous_targets.ndim == (continuous_action_mean_log_var.ndim - 2):
                     continuous_targets = rearrange(continuous_targets, '... -> 1 ...')
 
             continuous_log_probs = self.continuous_readout.log_prob_continuous(
@@ -1789,7 +1791,6 @@ class AxialSpaceTimeTransformer(Module):
     ):
         super().__init__()
         self.full_spatial_attn = full_spatial_attn
-        assert depth >= time_block_every, f'depth must be at least {time_block_every}'
 
         # attention
 
@@ -2090,7 +2091,7 @@ class AxialSpaceTimeTransformer(Module):
             return out
 
         intermediates = TransformerIntermediates(
-            stack(time_attn_kv_caches),
+            safe_stack(time_attn_kv_caches),
             safe_stack(normed_time_attn_inputs),
             safe_stack(normed_space_attn_inputs),
             safe_stack(rnn_hiddens),
@@ -2884,6 +2885,8 @@ class DynamicsWorldModel(Module):
         critic_state_embedder: Module | None = None,
         reward_encoder_kwargs: dict = dict(),
         depth = 4,
+        actor_depth = 0,
+        critic_depth = 0,
         pred_orig_latent = True,   # directly predicting the original x0 data yield better results, rather than velocity (x-space vs v-space)
         time_block_every = 4,      # every 4th block is time
         attn_kwargs: dict = dict(),
@@ -3242,6 +3245,27 @@ class DynamicsWorldModel(Module):
             **transformer_kwargs
         )
 
+        ac_transformer_kwargs = dict(
+            dim = dim,
+            attn_heads = attn_heads,
+            attn_dim_head = attn_dim_head,
+            attn_softclamp_value = attn_softclamp_value,
+            attn_kwargs = attn_kwargs,
+            ff_kwargs = ff_kwargs,
+            num_special_spatial_tokens = num_agents,
+            time_block_every = time_block_every,
+            final_norm = False,
+            rnn_time = use_time_rnn,
+            time_attention_use_pope = time_attention_use_pope,
+            **transformer_kwargs
+        )
+
+        self.has_actor_transformer = actor_depth > 0
+        self.actor_transformer = AxialSpaceTimeTransformer(depth = actor_depth, **ac_transformer_kwargs) if self.has_actor_transformer else None
+
+        self.has_critic_transformer = critic_depth > 0
+        self.critic_transformer = AxialSpaceTimeTransformer(depth = critic_depth, **ac_transformer_kwargs) if self.has_critic_transformer else None
+
         # ppo related
 
         self.gae_use_accelerated = gae_use_accelerated
@@ -3311,16 +3335,27 @@ class DynamicsWorldModel(Module):
     # types of parameters
 
     def muon_parameters(self):
-        return self.transformer.muon_parameters()
+        params = self.transformer.muon_parameters()
+        if exists(self.actor_transformer):
+            params.extend(self.actor_transformer.muon_parameters())
+        if exists(self.critic_transformer):
+            params.extend(self.critic_transformer.muon_parameters())
+        return params
 
     def policy_head_parameters(self):
-        return [
+        params = [
             *self.policy_head.parameters(),
             *self.action_embedder.unembed_parameters() # includes the unembed from the action-embedder
         ]
+        if exists(self.actor_transformer):
+            params.extend(self.actor_transformer.parameters())
+        return params
 
     def value_head_parameters(self):
-        return self.value_head.parameters()
+        params = list(self.value_head.parameters())
+        if exists(self.critic_transformer):
+            params.extend(self.critic_transformer.parameters())
+        return params
 
     def image_encoder_parameters(self):
         params = []
@@ -3571,7 +3606,13 @@ class DynamicsWorldModel(Module):
             agent_embed = embeds.agent
             one_agent_embed = agent_embed[..., -1:, agent_index, :]
 
-            value_embed = one_agent_embed
+            actor_agent_embed = default(embeds.actor, agent_embed)
+            one_actor_agent_embed = actor_agent_embed[..., -1:, agent_index, :]
+
+            critic_agent_embed = default(embeds.critic, agent_embed)
+            one_critic_agent_embed = critic_agent_embed[..., -1:, agent_index, :]
+
+            value_embed = one_critic_agent_embed
 
             if exists(self.critic_state_embedder) and exists(state_frame):
                 critic_embed = self.critic_state_embedder(state_frame.to(device))
@@ -3581,7 +3622,7 @@ class DynamicsWorldModel(Module):
             value = self.reward_encoder.bins_to_scalar_value(value_bins)
             values = safe_cat((values, value), dim = 1)
 
-            policy_embed = self.policy_head(one_agent_embed)
+            policy_embed = self.policy_head(one_actor_agent_embed)
 
             if store_old_action_unembeds:
                 acc_policy_embed = safe_cat((acc_policy_embed, policy_embed), dim = 1)
@@ -4942,7 +4983,7 @@ class DynamicsWorldModel(Module):
 
         # main function, needs to be defined as such for shortcut training - additional calls for consistency loss
 
-        def get_prediction(noised_latents, noised_proprio, signal_levels, step_sizes_log2, state_pred_token, action_tokens, reward_tokens, agent_tokens, return_agent_tokens = False, return_time_cache = False, return_intermediates = False):
+        def get_prediction(noised_latents, noised_proprio, signal_levels, step_sizes_log2, state_pred_token, action_tokens, reward_tokens, agent_tokens, time_cache = None, return_agent_tokens = False, return_time_cache = False, return_intermediates = False):
 
             # latents to spatial tokens
 
@@ -4983,13 +5024,31 @@ class DynamicsWorldModel(Module):
 
             tokens, packed_tokens_shape = pack([flow_token, space_tokens, proprio_token, state_pred_token, registers, action_tokens, reward_tokens, agent_tokens], 'b t * d')
 
-            # attention
+            if not exists(time_cache):
+                time_cache = DynamicsIntermediates()
 
-            tokens, intermediates = self.transformer(tokens, cache = time_cache, return_intermediates = True)
+            main_cache, actor_cache, critic_cache = time_cache
+
+            tokens, intermediates = self.transformer(tokens, cache = main_cache, return_intermediates = True)
+
+            # maybe actor / critic transformer heads
+
+            actor_intermediates = critic_intermediates = None
+
+            actor_tokens = tokens
+            if self.has_actor_transformer:
+                actor_tokens, actor_intermediates = self.actor_transformer(actor_tokens, cache = actor_cache, return_intermediates = True)
+
+            critic_tokens = tokens
+            if self.has_critic_transformer:
+                critic_tokens, critic_intermediates = self.critic_transformer(critic_tokens, cache = critic_cache, return_intermediates = True)
 
             # unpack
 
             flow_token, space_tokens, proprio_token, state_pred_token, register_tokens, action_tokens, reward_tokens, agent_tokens = unpack(tokens, packed_tokens_shape, 'b t * d')
+
+            actor_agent_tokens = unpack(actor_tokens, packed_tokens_shape, 'b t * d')[-1] if self.has_actor_transformer else agent_tokens
+            critic_agent_tokens = unpack(critic_tokens, packed_tokens_shape, 'b t * d')[-1] if self.has_critic_transformer else agent_tokens
 
             # pooling
 
@@ -5015,7 +5074,7 @@ class DynamicsWorldModel(Module):
 
             predictions = Predictions(pred, pred_proprio, pred_state)
 
-            embeds = Embeds(agent_tokens, state_pred_token)
+            embeds = Embeds(agent_tokens, state_pred_token, actor_agent_tokens, critic_agent_tokens)
 
             if not return_agent_tokens:
                 return predictions
@@ -5023,11 +5082,13 @@ class DynamicsWorldModel(Module):
             if not return_time_cache:
                 return predictions, embeds
 
-            return predictions, (embeds, intermediates, packed_tokens_shape)
+            dynamics_intermediates = DynamicsIntermediates(intermediates, actor_intermediates, critic_intermediates)
+
+            return predictions, (embeds, dynamics_intermediates, packed_tokens_shape)
 
         # curry into get_prediction what does not change during first call as well as the shortcut ones
 
-        _get_prediction = partial(get_prediction, state_pred_token = state_pred_token, action_tokens = action_tokens, reward_tokens = reward_tokens, agent_tokens = agent_tokens)
+        _get_prediction = partial(get_prediction, state_pred_token = state_pred_token, action_tokens = action_tokens, reward_tokens = reward_tokens, agent_tokens = agent_tokens, time_cache = time_cache)
 
         # forward the network
 
@@ -5300,8 +5361,9 @@ class DynamicsWorldModel(Module):
 
             num_targets = pred_len - 1 if shift_action_tokens else pred_len
 
-            encoded_agent_tokens = rearrange(embeds.agent, 'b t 1 d -> b t d')
-            policy_embed = self.policy_head(encoded_agent_tokens[:, :num_targets])
+            actor_agent_tokens = default(embeds.actor, embeds.agent)
+            encoded_actor_tokens = rearrange(actor_agent_tokens, 'b t 1 d -> b t d')
+            policy_embed = self.policy_head(encoded_actor_tokens[:, :num_targets])
 
             # constitute multi token prediction targets
 

@@ -71,11 +71,13 @@ class ImageObservationWrapper(gym.ObservationWrapper):
 def make_env(seed, use_image_input = False, vectorized = False, num_envs = 8, use_continuous_actions = False):
     env_kwargs = dict(render_mode = 'rgb_array') if use_image_input else dict()
 
+    env_name = 'InvertedPendulum-v4' if use_continuous_actions else 'CartPole-v1'
+
     if vectorized:
-        env = gym.make_vec('InvertedPendulum-v4', num_envs = num_envs, **env_kwargs)
+        env = gym.make_vec(env_name, num_envs = num_envs, **env_kwargs)
         env = gym.wrappers.vector.RecordEpisodeStatistics(env)
     else:
-        env = gym.make('InvertedPendulum-v4', **env_kwargs)
+        env = gym.make(env_name, **env_kwargs)
         env = gym.wrappers.RecordEpisodeStatistics(env)
 
     if exists(seed):
@@ -150,6 +152,9 @@ class TransformerPPOAgent(nn.Module):
         continuous_dist_type: Literal['gaussian', 'squashed_gaussian', 'beta'] = 'gaussian',
         continuous_dist_kwargs: dict = dict(),
         continuous_target_action_range: tuple[float, float] | None = None,
+        depth = 3,
+        actor_depth = 0,
+        critic_depth = 0,
     ):
         super().__init__()
         self.use_image_input = use_image_input
@@ -202,8 +207,10 @@ class TransformerPPOAgent(nn.Module):
             transformer_kwargs = dict(
                 use_attn_pool = use_attn_pool
             ),
-            depth = 3,
-            time_block_every = 3,
+            depth = depth,
+            actor_depth = actor_depth,
+            critic_depth = critic_depth,
+            time_block_every = max(depth, 1),
             policy_head_mlp_depth = 2,
             value_head_mlp_depth = 2,
             gae_discount_factor = 0.99,
@@ -286,7 +293,10 @@ def main(
     ssl_grad_accum_every = 8,
     ssl_max_memories = 128,
     tokenizer_learning_rate = 1e-4,
-    use_attn_pool = False
+    use_attn_pool = False,
+    depth = 3,
+    actor_depth = 0,
+    critic_depth = 0,
 ):
     torch.manual_seed(seed)
 
@@ -327,7 +337,10 @@ def main(
         use_attn_pool = use_attn_pool,
         use_continuous_actions = use_continuous_actions,
         continuous_dist_type = continuous_dist_type,
-        continuous_target_action_range = (-1., 1.)
+        continuous_target_action_range = (-1., 1.),
+        depth = depth,
+        actor_depth = actor_depth,
+        critic_depth = critic_depth,
     ).to(device)
 
     # optimizers
