@@ -2,13 +2,13 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #     "torch",
-#     "gymnasium[classic_control]",
 #     "tqdm",
 #     "ninja",
 #     "dreamer4",
 #     "fire",
 #     "pillow",
-#     "wandb"
+#     "wandb",
+#     "gymnasium[mujoco]"
 # ]
 # [tool.uv.sources]
 # dreamer4 = { path = "." }
@@ -23,6 +23,7 @@ import wandb
 import gymnasium as gym
 
 from pathlib import Path
+from typing import Literal
 import shutil
 from torchvision.utils import save_image
 
@@ -67,14 +68,14 @@ class ImageObservationWrapper(gym.ObservationWrapper):
         img_tensor = rearrange(img_tensor, '1 c h w -> c h w')
         return dict(state = obs, image = img_tensor)
 
-def make_env(seed, use_image_input = False, vectorized = False, num_envs = 8):
+def make_env(seed, use_image_input = False, vectorized = False, num_envs = 8, use_continuous_actions = False):
     env_kwargs = dict(render_mode = 'rgb_array') if use_image_input else dict()
 
     if vectorized:
-        env = gym.make_vec('CartPole-v1', num_envs = num_envs, **env_kwargs)
+        env = gym.make_vec('InvertedPendulum-v4', num_envs = num_envs, **env_kwargs)
         env = gym.wrappers.vector.RecordEpisodeStatistics(env)
     else:
-        env = gym.make('CartPole-v1', **env_kwargs)
+        env = gym.make('InvertedPendulum-v4', **env_kwargs)
         env = gym.wrappers.RecordEpisodeStatistics(env)
 
     if exists(seed):
@@ -145,6 +146,10 @@ class TransformerPPOAgent(nn.Module):
         use_time_rnn = False,
         use_attn_pool = False,
         pmpo_kl_div_loss_weight = 0.05,
+        use_continuous_actions = False,
+        continuous_dist_type: Literal['gaussian', 'squashed_gaussian', 'beta'] = 'gaussian',
+        continuous_dist_kwargs: dict = dict(),
+        continuous_target_action_range: tuple[float, float] | None = None,
     ):
         super().__init__()
         self.use_image_input = use_image_input
@@ -188,7 +193,11 @@ class TransformerPPOAgent(nn.Module):
             num_latent_tokens = num_combined_latents if use_image_input else num_latent_tokens,
             num_spatial_tokens = num_combined_latents if use_image_input else num_latent_tokens,
             num_register_tokens = 1,
-            num_discrete_actions = 2,
+            num_discrete_actions = 0 if use_continuous_actions else 2,
+            num_continuous_actions = 1 if use_continuous_actions else 0,
+            continuous_dist_type = continuous_dist_type,
+            continuous_dist_kwargs = continuous_dist_kwargs,
+            continuous_target_action_range = continuous_target_action_range,
             use_time_rnn = use_time_rnn,
             transformer_kwargs = dict(
                 use_attn_pool = use_attn_pool
@@ -213,10 +222,6 @@ class TransformerPPOAgent(nn.Module):
     @property
     def device(self):
         return next(self.parameters()).device
-
-    @property
-    def num_discrete_actions(self):
-        return self.dynamics.action_embedder.num_discrete_actions.sum().item()
 
 # experience processing
 
@@ -270,6 +275,8 @@ def main(
     vectorized = False,
     num_envs = 8,
     cpu = False,
+    use_continuous_actions = False,
+    continuous_dist_type: Literal['gaussian', 'squashed_gaussian', 'beta'] = 'gaussian',
     use_time_rnn = True,
     ssl_every_rl_updates = 0,
     ssl_max_epochs = 25,
@@ -308,7 +315,7 @@ def main(
     shutil.rmtree(results_folder, ignore_errors = True)
     results_folder.mkdir(exist_ok = True, parents = True)
 
-    env = make_env(seed, use_image_input, vectorized = vectorized, num_envs = num_envs)
+    env = make_env(seed, use_image_input, vectorized = vectorized, num_envs = num_envs, use_continuous_actions = use_continuous_actions)
 
     agent = TransformerPPOAgent(
         use_asym_critic = use_asym_critic,
@@ -318,6 +325,9 @@ def main(
         use_conv_encoder = use_conv_encoder,
         use_time_rnn = use_time_rnn,
         use_attn_pool = use_attn_pool,
+        use_continuous_actions = use_continuous_actions,
+        continuous_dist_type = continuous_dist_type,
+        continuous_target_action_range = (-1., 1.)
     ).to(device)
 
     # optimizers

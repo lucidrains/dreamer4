@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Callable
+from typing import Callable, Iterable, NamedTuple, Tuple, Literal
 
 import numpy as np
 from math import ceil, log2
@@ -32,7 +32,8 @@ from assoc_scan import AssocScan
 
 from PoPE_pytorch import PoPE, flash_attn_with_pope
 
-from discrete_continuous_embed_readout import MultiCategorical
+from discrete_continuous_embed_readout import MultiCategorical, Readout
+from discrete_continuous_embed_readout.discrete_continuous_embed_readout import BetaDist, rescale
 
 import einx
 from torch_einops_utils import (
@@ -48,7 +49,8 @@ from torch_einops_utils import (
     safe_cat,
     slice_right_at_dim,
     slice_left_at_dim,
-    tree_flatten_with_inverse
+    tree_flatten_with_inverse,
+    tree_map_tensor
 )
 
 from torch_einops_utils.device import move_inputs_to_module_device
@@ -213,8 +215,9 @@ def default(v, d):
     return v if exists(v) else d
 
 def cast_to_tensor(t, device, dtype = None):
-    t = (t if is_tensor(t) else tensor(t)).to(device)
-    return t.to(dtype) if exists(dtype) else t
+    t = t if is_tensor(t) else tensor(t)
+    t = t.to(dtype) if exists(dtype) else t
+    return t.to(device)
 
 def cosine_distance(x, y, mask = None):
     dist = 1. - F.cosine_similarity(x, y, dim = -1)
@@ -308,32 +311,6 @@ def is_empty(t):
 
 def log(t, eps = 1e-20):
     return t.clamp(min = eps).log()
-
-def mean_log_var_to_distr(
-    mean_log_var: Tensor
-) -> Normal:
-
-    mean, log_var = mean_log_var.unbind(dim = -1)
-    std = (0.5 * log_var).exp()
-    return Normal(mean, std)
-
-class BetaDist(Module):
-    def __init__(
-        self,
-        unimodal = True
-    ):
-        super().__init__()
-        self.unimodal = unimodal
-
-    def forward(self, params):
-        alpha, beta = params.unbind(dim = -1)
-
-        offset = 1. if self.unimodal else 0.
-
-        alpha = F.softplus(alpha) + offset
-        beta = F.softplus(beta) + offset
-
-        return Beta(alpha, beta)
 
 def safe_squeeze_first(t):
     if not exists(t):
@@ -733,6 +710,9 @@ class ActionEmbedder(Module):
         num_discrete_actions: int | tuple[int, ...] = 0,
         num_continuous_actions  = 0,
         continuous_norm_stats: tuple[tuple[float, float], ...] | None = None,
+        continuous_dist_type: Literal['gaussian', 'squashed_gaussian', 'beta'] = 'gaussian',
+        continuous_dist_kwargs: dict = dict(),
+        continuous_target_action_range: tuple[float, float] | None = None,
         can_unembed = False,
         unembed_dim = None,
         num_unembed_preds = 1,
@@ -764,6 +744,31 @@ class ActionEmbedder(Module):
 
         if self.continuous_need_norm:
             self.register_buffer('continuous_norm_stats', tensor(continuous_norm_stats))
+
+        self.continuous_dist_type = continuous_dist_type
+
+        continuous_dist_kwargs = dict(continuous_dist_kwargs)
+        if continuous_dist_type == 'beta':
+            continuous_dist_kwargs = dict(unimodal = True, **continuous_dist_kwargs)
+
+        # only bounded distributions (beta, squashed_gaussian) can be rescaled to a target action range
+
+        is_bounded = continuous_dist_type in ('beta', 'squashed_gaussian')
+        self.continuous_target_action_range = continuous_target_action_range if is_bounded else None
+
+        readout_squashed = continuous_dist_type == 'squashed_gaussian'
+        readout_dist_type = 'gaussian' if readout_squashed else continuous_dist_type
+
+        self.continuous_readout = None
+        if self.num_continuous_action_types > 0:
+            self.continuous_readout = Readout(
+                dim = None,
+                num_continuous = num_continuous_actions,
+                continuous_mean_std = tensor(continuous_norm_stats) if self.continuous_need_norm else None,
+                continuous_dist_type = readout_dist_type,
+                continuous_dist_kwargs = continuous_dist_kwargs,
+                continuous_squashed = readout_squashed
+            )
 
         # defaults
 
@@ -942,18 +947,17 @@ class ActionEmbedder(Module):
             sampled_discrete = dist.sample(temperature = discrete_temperature)
 
         if exists(continuous_mean_log_var):
-            mean, log_var = continuous_mean_log_var.unbind(dim = -1)
-            std = (0.5 * log_var).exp()
-
-            sampled_continuous = mean + std * torch.randn_like(mean) * continuous_temperature
-
-            # maybe inverse norm
-
-            if inverse_norm_continuous:
-                norm_mean, norm_std = self.continuous_norm_stats.unbind(dim = -1)
-                sampled_continuous = (sampled_continuous * norm_std) + norm_mean
+            sampled_continuous = self.continuous_readout.sample_continuous(
+                continuous_mean_log_var,
+                selector = self.continuous_readout.get_selector(),
+                temperature = continuous_temperature
+            )
 
         return sampled_discrete, sampled_continuous
+
+    def rescale_for_env(self, actions):
+        """ rescale actions from native distribution range to target environment range """
+        return self.continuous_readout.rescale_from_native(actions, self.continuous_target_action_range)
 
     def log_probs(
         self,
@@ -1002,11 +1006,17 @@ class ActionEmbedder(Module):
                 if continuous_targets.ndim == (continuous_action_mean_log_var.ndim - 1):
                     continuous_targets = rearrange(continuous_targets, '... -> 1 ...')
 
-            distr = mean_log_var_to_distr(continuous_action_mean_log_var)
-            continuous_log_probs = distr.log_prob(continuous_targets)
+            continuous_log_probs = self.continuous_readout.log_prob_continuous(
+                continuous_action_mean_log_var,
+                continuous_targets,
+                selector = self.continuous_readout.get_selector()
+            )
 
             if return_entropies:
-                continuous_entropies = distr.entropy()
+                continuous_entropies = self.continuous_readout.entropy_continuous(
+                    continuous_action_mean_log_var,
+                    selector = self.continuous_readout.get_selector()
+                )
 
         log_probs = (discrete_log_probs, continuous_log_probs)
 
@@ -1045,8 +1055,8 @@ class ActionEmbedder(Module):
         continuous_kl = None
 
         if exists(src_params) and exists(tgt_params):
-            src_distr = mean_log_var_to_distr(src_params)
-            tgt_distr = mean_log_var_to_distr(tgt_params)
+            src_distr = self.continuous_readout.continuous_dist.dist(src_params)
+            tgt_distr = self.continuous_readout.continuous_dist.dist(tgt_params)
 
             continuous_kl = kl.kl_divergence(src_distr, tgt_distr)
 
@@ -2896,6 +2906,9 @@ class DynamicsWorldModel(Module):
         num_discrete_actions: int | tuple[int, ...] = 0,
         num_continuous_actions = 0,
         continuous_norm_stats = None,
+        continuous_dist_type: Literal['gaussian', 'squashed_gaussian', 'beta'] = 'gaussian',
+        continuous_dist_kwargs: dict = dict(),
+        continuous_target_action_range: tuple[float, float] | None = None,
         multi_token_pred_len = 8,                   # they do multi-token prediction of 8 steps forward
         value_head_mlp_depth = 3,
         policy_head_mlp_depth = 3,
@@ -3114,6 +3127,9 @@ class DynamicsWorldModel(Module):
             num_discrete_actions = num_discrete_actions,
             num_continuous_actions = num_continuous_actions,
             continuous_norm_stats = continuous_norm_stats,
+            continuous_dist_type = continuous_dist_type,
+            continuous_dist_kwargs = continuous_dist_kwargs,
+            continuous_target_action_range = continuous_target_action_range,
             can_unembed = True,
             unembed_dim = dim * 4,
             num_unembed_preds = multi_token_pred_len,
@@ -3585,13 +3601,29 @@ class DynamicsWorldModel(Module):
             discrete_log_probs = safe_cat((discrete_log_probs, one_discrete_log_probs), dim = 1)
             continuous_log_probs = safe_cat((continuous_log_probs, one_continuous_log_probs), dim = 1)
 
-            if env_is_vectorized:
-                if not exists(sampled_continuous_actions):
-                    action_out = sampled_discrete_actions.cpu().numpy().reshape(-1)
-                else:
-                    action_out = (sampled_discrete_actions.cpu().numpy(), sampled_continuous_actions.cpu().numpy())
+            # format actions for the environment, rescaling bounded distributions to target range
+
+            env_continuous_actions = sampled_continuous_actions
+
+            if exists(env_continuous_actions) and exists(self.action_embedder.continuous_target_action_range):
+                env_continuous_actions = self.action_embedder.rescale_for_env(env_continuous_actions)
+
+            if not exists(env_continuous_actions):
+                action_out = sampled_discrete_actions
+            elif not exists(sampled_discrete_actions):
+                action_out = env_continuous_actions
             else:
-                action_out = int(sampled_discrete_actions.item()) if sampled_discrete_actions.shape[-1] == 1 else (sampled_discrete_actions, sampled_continuous_actions)
+                action_out = (sampled_discrete_actions, env_continuous_actions)
+
+            if env_is_vectorized:
+                action_out = tree_map_tensor(lambda t: rearrange(t, 'b 1 ... -> b ...'), action_out)
+            else:
+                action_out = tree_map_tensor(lambda t: rearrange(t, '1 1 ... -> ...'), action_out)
+
+            action_out = tree_map_tensor(lambda t: t.cpu().numpy(), action_out)
+
+            if not env_is_vectorized and not exists(sampled_continuous_actions) and getattr(action_out, 'size', None) == 1:
+                action_out = int(action_out.item())
 
             env_step_out = env.step(action_out)
 
@@ -3956,20 +3988,25 @@ class DynamicsWorldModel(Module):
 
         # align actions with policy embed if latents had a bootstrap state appended
 
-        if exists(discrete_actions) and discrete_actions.shape[1] == latents.shape[1] and discrete_actions.shape[1] == policy_embed.shape[1] + 1:
-            discrete_actions = discrete_actions[:, :-1]
-            if exists(continuous_actions):
-                continuous_actions = continuous_actions[:, :-1]
+        has_padded_discrete_actions = exists(discrete_actions) and discrete_actions.shape[1] == policy_embed.shape[1] + 1
+        has_padded_continuous_actions = exists(continuous_actions) and continuous_actions.shape[1] == policy_embed.shape[1] + 1
+
+        if has_padded_discrete_actions or has_padded_continuous_actions:
+            discrete_actions = discrete_actions[:, :-1] if exists(discrete_actions) else None
+            continuous_actions = continuous_actions[:, :-1] if exists(continuous_actions) else None
 
         log_probs, entropies = self.action_embedder.log_probs(policy_embed, pred_head_index = 0, discrete_targets = discrete_actions, continuous_targets = continuous_actions, return_entropies = True)
 
         # concat discrete and continuous actions into one for optimizing
 
-        if exists(old_log_probs) and old_log_probs.discrete.shape[1] == policy_embed.shape[1] + 1:
-            old_log_probs = Actions(
-                old_log_probs.discrete[:, :-1] if exists(old_log_probs.discrete) else None,
-                old_log_probs.continuous[:, :-1] if exists(old_log_probs.continuous) else None
-            )
+        if exists(old_log_probs):
+            has_padded_discrete = exists(old_log_probs.discrete) and old_log_probs.discrete.shape[1] == policy_embed.shape[1] + 1
+            has_padded_continuous = exists(old_log_probs.continuous) and old_log_probs.continuous.shape[1] == policy_embed.shape[1] + 1
+            if has_padded_discrete or has_padded_continuous:
+                old_log_probs = Actions(
+                    old_log_probs.discrete[:, :-1] if exists(old_log_probs.discrete) else None,
+                    old_log_probs.continuous[:, :-1] if exists(old_log_probs.continuous) else None
+                )
 
         old_log_probs = safe_cat(old_log_probs, dim = -1)
         log_probs = safe_cat(log_probs, dim = -1)
@@ -5214,7 +5251,7 @@ class DynamicsWorldModel(Module):
         if self.should_pred_state:
             pred_latent, latent_to_pred = state_pred_logits[:, :-1], latents[:, 1:]
 
-            dist = self.state_beta_dist(pred_latent)
+            dist = self.state_beta_dist.dist(pred_latent)
 
             # scale latent from tanh-ed (-1, 1) to (0, 1)
 
@@ -5340,7 +5377,7 @@ class DynamicsWorldModel(Module):
             latent_to_pred = (latent_to_pred + 1.) / 2.
             latent_to_pred = latent_to_pred.clamp(min = self.eps_latent_pred, max = 1. - self.eps_latent_pred)
 
-            dist = self.agent_state_beta_dist(pred_latent)
+            dist = self.agent_state_beta_dist.dist(pred_latent)
             agent_state_pred_losses = -dist.log_prob(latent_to_pred)
 
             if is_var_len:
