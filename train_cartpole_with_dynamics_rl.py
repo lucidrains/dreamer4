@@ -155,6 +155,7 @@ class TransformerPPOAgent(nn.Module):
         depth = 3,
         actor_depth = 0,
         critic_depth = 0,
+        agent_predicts_latent = True,
     ):
         super().__init__()
         self.use_image_input = use_image_input
@@ -224,6 +225,7 @@ class TransformerPPOAgent(nn.Module):
             reward_encoder_kwargs = dict(reward_range = (-10., 10.)),
             dim_critic_state = 4 if use_asym_critic else None,
             pmpo_kl_div_loss_weight = pmpo_kl_div_loss_weight,
+            agent_predicts_state = agent_predicts_latent,
         )
 
     @property
@@ -297,6 +299,7 @@ def main(
     depth = 3,
     actor_depth = 0,
     critic_depth = 0,
+    agent_predicts_latent = False
 ):
     torch.manual_seed(seed)
 
@@ -341,6 +344,7 @@ def main(
         depth = depth,
         actor_depth = actor_depth,
         critic_depth = critic_depth,
+        agent_predicts_latent = agent_predicts_latent,
     ).to(device)
 
     # optimizers

@@ -602,6 +602,48 @@ def ramp_weight(times, slope = 0.9, intercept = 0.1):
     # equation (8) paper, their "ramp" loss weighting
     return slope * times + intercept
 
+# simplicial embeddings
+# Lavoie et al - https://arxiv.org/abs/2204.00616
+
+class SEM(Module):
+    def __init__(
+        self,
+        dim,
+        dim_in = None,
+        project_in = None,
+        project_out = None,
+        temperature = 0.1,
+        dim_simplex = 8,
+        pre_layernorm = False
+    ):
+        super().__init__()
+        assert divisible_by(dim, dim_simplex), f'{dim} must be divisible by {dim_simplex}'
+
+        dim_in = default(dim_in, dim)
+        project_in = default(project_in, dim_in != dim)
+        project_out = default(project_out, dim_in != dim)
+
+        self.embedder = Linear(dim_in, dim, bias = False) if project_in else nn.Identity()
+
+        self.dim = dim
+        self.dim_simplex = dim_simplex
+        self.temperature = temperature
+
+        self.norm = nn.LayerNorm(dim, bias = False) if pre_layernorm else nn.Identity()
+
+        self.project_out = Linear(dim, dim_in, bias = False) if project_out else nn.Identity()
+
+    def forward(
+        self,
+        t
+    ):
+        t = self.embedder(t)
+        t = self.norm(t)
+        t = rearrange(t, '... (l v) -> ... l v', v = self.dim_simplex)
+        t = (t / self.temperature).softmax(dim = -1)
+        t = rearrange(t, '... l v -> ... (l v)')
+        return self.project_out(t)
+
 # reinforcement learning related
 
 # rewards
@@ -2950,7 +2992,8 @@ class DynamicsWorldModel(Module):
         latent_ar_loss_weight = 0.,
         latent_ar_sigreg_loss_weight = 0.05,
         latent_ar_sigreg_loss_kwargs = dict(num_slices = 256),
-        identity_latents_to_spatial = False
+        identity_latents_to_spatial = False,
+        agent_predict_sem_kwargs: dict = dict()
     ):
         super().__init__()
         self.dim = dim
@@ -3168,11 +3211,15 @@ class DynamicsWorldModel(Module):
             dim_agent_state_in = dim * 2 if self.action_embedder.has_actions else dim
 
             self.to_agent_state_pred = Sequential(
-                nn.Linear(dim_agent_state_in, dim_agent_state_in),
-                nn.SiLU(),
-                nn.Linear(dim_agent_state_in, dim),
-                RMSNorm(dim),
-                nn.Linear(dim, num_latent_tokens * dim_latent * 2),
+                Linear(dim_agent_state_in, dim_agent_state_in),
+                RMSNorm(dim_agent_state_in),
+                SEM(dim = dim, dim_in = dim_agent_state_in, **agent_predict_sem_kwargs),
+                create_mlp(
+                    dim_in = dim_agent_state_in,
+                    dim = dim_agent_state_in * 2,
+                    dim_out = num_latent_tokens * dim_latent * 2,
+                    depth = 2
+                ),
                 Rearrange('... (n d two) -> ... n d two', n = num_latent_tokens, two = 2)
             )
 
@@ -5145,10 +5192,10 @@ class DynamicsWorldModel(Module):
 
         if is_v_space_pred:
             pred_target = data - noise
-            pred = packed_pred
+            pred_flow = packed_pred
         else:
             pred_target = data
-            pred = packed_pred
+            pred_flow = packed_pred
 
         # flow loss
 
@@ -5157,7 +5204,7 @@ class DynamicsWorldModel(Module):
         if is_x_space:
             flow_loss_weight = (1. - times) ** 2
 
-        flow_losses = F.mse_loss(pred, pred_target, reduction = 'none')
+        flow_losses = F.mse_loss(pred_flow, pred_target, reduction = 'none')
 
         if is_tensor(flow_loss_weight):
             flow_loss_weight, _ = align_dims_left((flow_loss_weight, flow_losses))
@@ -5310,7 +5357,7 @@ class DynamicsWorldModel(Module):
         state_pred_loss = self.zero
 
         if self.should_pred_state:
-            pred_latent, latent_to_pred = state_pred_logits[:, :-1], latents[:, 1:]
+            pred_latent, latent_to_pred = pred.state[:, :-1], latents[:, 1:]
 
             dist = self.state_beta_dist.dist(pred_latent)
 

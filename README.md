@@ -238,4 +238,16 @@ Passing `--condition_on_actions True` lets you explicitly prompt with velocity a
 }
 ```
 
+```bibtex
+@misc{lavoie2022simplicialembeddingsselfsupervisedlearning,
+    title   = {Simplicial Embeddings in Self-Supervised Learning and Downstream Classification},
+    author  = {Samuel Lavoie and Christos Tsirigotis and Max Schwarzer and Ankit Vani and Michael Noukhovitch and Kenji Kawaguchi and Aaron Courville},
+    year    = {2022},
+    eprint  = {2204.00616},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2204.00616},
+}
+```
+
 *the conquest of nature is to be achieved through number and measure - angels to Descartes in a dream*
