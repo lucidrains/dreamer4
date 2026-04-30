@@ -250,4 +250,28 @@ Passing `--condition_on_actions True` lets you explicitly prompt with velocity a
 }
 ```
 
+```bibtex
+@misc{schmidt2024learningactactions,
+    title   = {Learning to Act without Actions},
+    author  = {Dominik Schmidt and Minqi Jiang},
+    year    = {2024},
+    eprint  = {2312.10812},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2312.10812},
+}
+```
+
+```bibtex
+@misc{whittington2022relatingtransformersmodelsneural,
+    title   = {Relating transformers to models and neural representations of the hippocampal formation},
+    author  = {James C. R. Whittington and Joseph Warren and Timothy E. J. Behrens},
+    year    = {2022},
+    eprint  = {2112.04035},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.NE},
+    url     = {https://arxiv.org/abs/2112.04035},
+}
+```
+
 *the conquest of nature is to be achieved through number and measure - angels to Descartes in a dream*

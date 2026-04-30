@@ -102,13 +102,13 @@ VideoTokenizerIntermediates = namedtuple('VideoTokenizerIntermediates', ('losses
 
 TokenizerLosses = namedtuple('TokenizerLosses', ('recon', 'lpips', 'time_decorr', 'space_decorr', 'latent_ar', 'latent_ar_sigreg'))
 
-WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'shortcut', 'rewards', 'terminals', 'discrete_actions', 'continuous_actions', 'state_pred', 'agent_state_pred', 'latent_ar', 'latent_ar_sigreg'))
+WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'shortcut', 'rewards', 'terminals', 'discrete_actions', 'continuous_actions', 'state_pred', 'agent_state_pred', 'latent_ar', 'latent_ar_sigreg', 'lapo_action', 'lapo_fdm', 'lapo_raw_latent_fdm', 'tem'))
 
 AttentionIntermediates = namedtuple('AttentionIntermediates', ('next_kv_cache', 'normed_inputs'))
 
 TransformerIntermediates = namedtuple('TransformerIntermediates', ('next_kv_cache', 'normed_time_inputs', 'normed_space_inputs', 'next_rnn_hiddens', 'layer_hiddens', 'token_count'), defaults=(None, None, None, None, None, 0))
 
-DynamicsIntermediates = namedtuple('DynamicsIntermediates', ('main', 'actor', 'critic', 'spatial', 'action'), defaults=(None, None, None, None, None))
+DynamicsIntermediates = namedtuple('DynamicsIntermediates', ('main', 'actor', 'critic', 'spatial', 'action', 'pre_encoded_spatial', 'pre_encoded_action'), defaults=(None, None, None, None, None, None, None))
 
 Predictions = namedtuple('Predictions', ['flow', 'proprioception', 'state'])
 
@@ -1808,6 +1808,135 @@ class LearnedQueriesAttentionPool(Module):
 
         return inverse_pack(out)
 
+# ssl
+
+# Dominik Schmidt https://arxiv.org/abs/2312.10812
+
+class LAPO(Module):
+    def __init__(
+        self,
+        dim_embed,
+        dim_latent_action,
+        dim_project = None,
+        dim_raw_latent = None,
+        num_raw_latent_tokens = None,
+        num_discrete_actions = 0,
+        num_continuous_actions = 0,
+        sem_dim_simplex = 4,
+        sem_temperature = 0.1,
+        expansion_factor = 4,
+        pred_actions = True,
+        use_fdm = True,
+    ):
+        super().__init__()
+        assert num_discrete_actions > 0 or num_continuous_actions > 0
+        assert pred_actions or use_fdm, 'LAPO must have at least one of action prediction or forward dynamics'
+
+        dim_project = default(dim_project, dim_embed)
+        dim_mlp_hidden = int(dim_embed * expansion_factor)
+
+        # state + next state projected embeddings -> latent action - IDM
+
+        self.state_norm = RMSNorm(dim_embed)
+        self.to_latent_action_embed = MLP(dim_embed * 2, dim_mlp_hidden, dim_latent_action, activation = nn.SiLU())
+
+        # simplicial embed for action bottleneck
+
+        assert divisible_by(dim_latent_action, sem_dim_simplex)
+        self.sem = SEM(dim_latent_action, temperature = sem_temperature, dim_simplex = sem_dim_simplex)
+
+        # action prediction loss
+
+        self.pred_actions = pred_actions
+        self.action_readout = Readout(dim_latent_action, num_discrete = num_discrete_actions, num_continuous = num_continuous_actions, auto_squeeze_single_output = False) if pred_actions else None
+
+        # forward dynamics model - projected space
+
+        self.use_fdm = use_fdm
+        self.to_pred_next_state_embed = MLP(dim_embed + dim_latent_action, dim_mlp_hidden, dim_project, activation = nn.SiLU()) if use_fdm else None
+
+        # forward dynamics model - raw latent space
+
+        self.has_raw_latent_fdm = use_fdm and exists(dim_raw_latent) and exists(num_raw_latent_tokens)
+        self.to_pred_raw_latent = None
+
+        if self.has_raw_latent_fdm:
+            dim_raw_latent_concat = dim_raw_latent * num_raw_latent_tokens
+            self.to_pred_raw_latent = MLP(dim_embed + dim_latent_action, dim_mlp_hidden, dim_mlp_hidden, dim_raw_latent_concat, activation = nn.SiLU())
+            self.num_raw_latent_tokens = num_raw_latent_tokens
+            self.dim_raw_latent = dim_raw_latent
+
+        self.register_buffer('zero', tensor(0.), persistent = False)
+
+    def forward(
+        self,
+        space_tokens,
+        actions = None,
+        raw_latents = None,
+    ):
+        # pool spatial tokens
+
+        state_embed = reduce(space_tokens, 'b t n d -> b t d', 'mean')
+
+        # consecutive state pairs
+
+        state, next_state = state_embed[:, :-1], state_embed[:, 1:]
+
+        state = self.state_norm(state)
+        next_state = self.state_norm(next_state)
+
+        # inverse dynamics model
+
+        latent_action = self.sem(self.to_latent_action_embed(cat((state, next_state), dim = -1)))
+
+        # action prediction loss
+
+        pred_action_loss = self.zero
+
+        if self.pred_actions and exists(actions):
+            seq_len = latent_action.shape[1]
+            maybe_slice = maybe(lambda t: t[:, :seq_len])
+
+            discrete_targets = maybe_slice(actions.discrete)
+            continuous_targets = maybe_slice(actions.continuous)
+
+            targets = safe_cat([t for t in (discrete_targets, continuous_targets) if exists(t)], dim = -1)
+
+            pred_action_loss = self.action_readout(latent_action, targets = targets, return_loss = True)
+
+        # forward dynamics model - projected space
+
+        fdm_loss = self.zero
+
+        if self.use_fdm:
+            pred_next_state = self.to_pred_next_state_embed(cat((state, latent_action), dim = -1))
+            fdm_loss = F.mse_loss(l2norm(pred_next_state), l2norm(next_state).detach())
+
+        # forward dynamics model - raw latent space
+
+        raw_latent_fdm_loss = self.zero
+
+        if self.has_raw_latent_fdm and exists(raw_latents):
+            raw_latents, _ = pack_one(raw_latents, 'b t * d')
+            raw_latent_concat = rearrange(raw_latents, 'b t n d -> b t (n d)')
+            target_raw = raw_latent_concat[:, 1:]
+
+            pred_raw = self.to_pred_raw_latent(cat((state, latent_action), dim = -1))
+            raw_latent_fdm_loss = F.mse_loss(pred_raw, target_raw.detach())
+
+        return pred_action_loss, fdm_loss, raw_latent_fdm_loss
+
+# James Whittington - https://arxiv.org/abs/2112.04035
+
+class TEM(Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+        self.register_buffer('zero', tensor(0.), persistent = False)
+
+    def forward(self, action_tokens, *args, **kwargs):
+        return self.zero
+
 # axial space time transformer
 
 class AxialSpaceTimeTransformer(Module):
@@ -2996,7 +3125,15 @@ class DynamicsWorldModel(Module):
         latent_ar_sigreg_loss_weight = 0.05,
         latent_ar_sigreg_loss_kwargs = dict(num_slices = 256),
         identity_latents_to_spatial = False,
-        agent_predict_sem_kwargs: dict = dict()
+        agent_predict_sem_kwargs: dict = dict(),
+        ssl_lapo = False,
+        lapo_pred_actions = True,
+        lapo_use_fdm = True,
+        ssl_tem = False,
+        lapo_action_loss_weight = 1.,
+        lapo_fdm_loss_weight = 1.,
+        lapo_raw_latent_fdm_loss_weight = 1.,
+        tem_loss_weight = 1.
     ):
         super().__init__()
         self.dim = dim
@@ -3104,7 +3241,7 @@ class DynamicsWorldModel(Module):
 
         assert is_power_two(max_steps), '`max_steps` must be a power of 2'
         self.max_steps = max_steps
-        self.num_step_sizes_log2 = int(log2(max_steps)) + 1
+        self.num_step_sizes_log2 = int(log2(max_steps))
 
         self.signal_levels_embed = nn.Embedding(max_steps, dim_half)
         self.step_size_embed = nn.Embedding(self.num_step_sizes_log2, dim_half) # power of 2, so 1/1, 1/2, 1/4, 1/8 ... 1/Kmax
@@ -3192,6 +3329,11 @@ class DynamicsWorldModel(Module):
         self.latent_ar_loss_weight = latent_ar_loss_weight
         self.latent_ar_sigreg_loss_weight = latent_ar_sigreg_loss_weight
 
+        self.lapo_action_loss_weight = lapo_action_loss_weight
+        self.lapo_fdm_loss_weight = lapo_fdm_loss_weight
+        self.lapo_raw_latent_fdm_loss_weight = lapo_raw_latent_fdm_loss_weight
+        self.tem_loss_weight = tem_loss_weight
+
         self.latent_ar = None
 
         if self.has_latent_ar:
@@ -3276,7 +3418,7 @@ class DynamicsWorldModel(Module):
             depth = value_head_mlp_depth,
         )
 
-        # efficient axial space / time transformer
+        # pre encoder and ssl modules
 
         self.spatial_pre_encoder = None
         if spatial_pre_encoder_depth > 0:
@@ -3313,6 +3455,27 @@ class DynamicsWorldModel(Module):
                 rnn_time = use_time_rnn,
                 time_attention_use_pope = time_attention_use_pope
             )
+
+        self.has_lapo = ssl_lapo
+        if ssl_lapo:
+            assert exists(self.spatial_pre_encoder), 'LAPO requires the spatial pre-encoder'
+            self.ssl_lapo = LAPO(
+                dim,
+                dim_latent_action = dim,
+                dim_raw_latent = dim_latent,
+                num_raw_latent_tokens = num_latent_tokens,
+                num_discrete_actions = num_discrete_actions,
+                num_continuous_actions = num_continuous_actions,
+                pred_actions = lapo_pred_actions,
+                use_fdm = lapo_use_fdm,
+            )
+
+        self.has_tem = ssl_tem
+        if ssl_tem:
+            assert exists(self.action_pre_encoder), 'TEM requires the action pre-encoder'
+            self.ssl_tem = TEM(dim)
+
+        # efficient axial space / time transformer
 
         self.transformer = AxialSpaceTimeTransformer(
             dim = dim,
@@ -5110,12 +5273,16 @@ class DynamicsWorldModel(Module):
             if not exists(time_cache):
                 time_cache = DynamicsIntermediates()
 
-            main_cache, actor_cache, critic_cache, spatial_cache, action_cache = time_cache
+            main_cache, actor_cache, critic_cache, spatial_cache, action_cache, *_ = time_cache
 
             spatial_intermediates = action_intermediates = None
 
+            # spatial pre-encoding
+
             if exists(self.spatial_pre_encoder):
                 space_tokens, spatial_intermediates = self.spatial_pre_encoder(space_tokens, cache = spatial_cache, return_intermediates = True)
+
+            # action pre-encoding
 
             if exists(self.action_pre_encoder):
                 action_tokens, action_intermediates = self.action_pre_encoder(action_tokens, cache = action_cache, return_intermediates = True)
@@ -5179,7 +5346,7 @@ class DynamicsWorldModel(Module):
             if not return_time_cache:
                 return predictions, embeds
 
-            dynamics_intermediates = DynamicsIntermediates(intermediates, actor_intermediates, critic_intermediates, spatial_intermediates, action_intermediates)
+            dynamics_intermediates = DynamicsIntermediates(intermediates, actor_intermediates, critic_intermediates, spatial_intermediates, action_intermediates, space_tokens, action_tokens)
 
             return predictions, (embeds, dynamics_intermediates, packed_tokens_shape)
 
@@ -5593,6 +5760,28 @@ class DynamicsWorldModel(Module):
 
             latent_ar_loss, latent_ar_sigreg_loss, _ = self.latent_ar(space_source_hiddens, target = space_target_hiddens, mask = loss_mask, cond = cond_action)
 
+        # maybe ssl losses
+
+        # predict actions from states - LAPO (Dominik Schmidt)
+
+        lapo_action_loss = self.zero
+        lapo_fdm_loss = self.zero
+        lapo_raw_latent_fdm_loss = self.zero
+
+        if self.has_lapo:
+            space_tokens_for_lapo = intermediates.pre_encoded_spatial
+
+            raw_actions = Actions(discrete_actions, continuous_actions) if (exists(discrete_actions) or exists(continuous_actions)) else None
+            lapo_action_loss, lapo_fdm_loss, lapo_raw_latent_fdm_loss = self.ssl_lapo(space_tokens_for_lapo, raw_actions, raw_latents = latents)
+
+        # predict states from actions - TEM (James Whittington)
+
+        tem_loss = self.zero
+
+        if self.has_tem:
+            action_tokens_for_tem = intermediates.pre_encoded_action
+            tem_loss = self.ssl_tem(action_tokens_for_tem)  # use the pre-encoded action tokens
+
         # gather losses - they sum across the multi token prediction steps for rewards and actions - eq (9)
 
         total_loss = (
@@ -5605,10 +5794,14 @@ class DynamicsWorldModel(Module):
             (state_pred_loss * self.state_pred_loss_weight) +
             (agent_state_pred_loss * self.agent_state_pred_loss_weight) +
             (latent_ar_loss * self.latent_ar_loss_weight) +
-            (latent_ar_sigreg_loss * self.latent_ar_sigreg_loss_weight)
+            (latent_ar_sigreg_loss * self.latent_ar_sigreg_loss_weight) +
+            (lapo_action_loss * self.lapo_action_loss_weight) +
+            (lapo_fdm_loss * self.lapo_fdm_loss_weight) +
+            (lapo_raw_latent_fdm_loss * self.lapo_raw_latent_fdm_loss_weight) +
+            (tem_loss * self.tem_loss_weight)
         )
 
-        losses = WorldModelLosses(flow_loss, shortcut_flow_loss, reward_loss, state_terminal_loss, discrete_action_loss, continuous_action_loss, state_pred_loss, agent_state_pred_loss, latent_ar_loss, latent_ar_sigreg_loss)
+        losses = WorldModelLosses(flow_loss, shortcut_flow_loss, reward_loss, state_terminal_loss, discrete_action_loss, continuous_action_loss, state_pred_loss, agent_state_pred_loss, latent_ar_loss, latent_ar_sigreg_loss, lapo_action_loss, lapo_fdm_loss, lapo_raw_latent_fdm_loss, tem_loss)
 
         if not (return_all_losses or return_intermediates):
             return total_loss

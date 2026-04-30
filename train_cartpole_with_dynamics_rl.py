@@ -155,7 +155,13 @@ class TransformerPPOAgent(nn.Module):
         depth = 3,
         actor_depth = 0,
         critic_depth = 0,
+        spatial_pre_encoder_depth = 0,
+        action_pre_encoder_depth = 0,
         agent_predicts_latent = True,
+        ssl_lapo = False,
+        ssl_lapo_use_fdm = True,
+        ssl_lapo_pred_actions = True,
+        ssl_tem = False,
     ):
         super().__init__()
         self.use_image_input = use_image_input
@@ -211,6 +217,8 @@ class TransformerPPOAgent(nn.Module):
             depth = depth,
             actor_depth = actor_depth,
             critic_depth = critic_depth,
+            spatial_pre_encoder_depth = spatial_pre_encoder_depth,
+            action_pre_encoder_depth = action_pre_encoder_depth,
             time_block_every = max(depth, 1),
             policy_head_mlp_depth = 2,
             value_head_mlp_depth = 2,
@@ -226,6 +234,10 @@ class TransformerPPOAgent(nn.Module):
             dim_critic_state = 4 if use_asym_critic else None,
             pmpo_kl_div_loss_weight = pmpo_kl_div_loss_weight,
             agent_predicts_state = agent_predicts_latent,
+            ssl_lapo = ssl_lapo,
+            lapo_use_fdm = ssl_lapo_use_fdm,
+            lapo_pred_actions = ssl_lapo_pred_actions,
+            ssl_tem = ssl_tem,
         )
 
     @property
@@ -299,7 +311,13 @@ def main(
     depth = 3,
     actor_depth = 0,
     critic_depth = 0,
-    agent_predicts_latent = False
+    spatial_pre_encoder_depth = 0,
+    action_pre_encoder_depth = 0,
+    agent_predicts_latent = False,
+    lapo = False,
+    lapo_use_fdm = True,
+    lapo_pred_actions = True,
+    tem = False,
 ):
     torch.manual_seed(seed)
 
@@ -344,7 +362,13 @@ def main(
         depth = depth,
         actor_depth = actor_depth,
         critic_depth = critic_depth,
+        spatial_pre_encoder_depth = spatial_pre_encoder_depth,
+        action_pre_encoder_depth = action_pre_encoder_depth,
         agent_predicts_latent = agent_predicts_latent,
+        ssl_lapo = lapo,
+        ssl_lapo_use_fdm = lapo_use_fdm,
+        ssl_lapo_pred_actions = lapo_pred_actions,
+        ssl_tem = tem
     ).to(device)
 
     # optimizers
