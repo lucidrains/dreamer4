@@ -1929,13 +1929,188 @@ class LAPO(Module):
 # James Whittington - https://arxiv.org/abs/2112.04035
 
 class TEM(Module):
-    def __init__(self, dim):
+    def __init__(
+        self,
+        dim_action_embed,
+        dim_raw_latent,
+        num_raw_latent_tokens,
+        dim_structure = None,
+        dim_encoded_sensory = None,
+        heads = 8,
+        dim_head = 64,
+        talking_heads = True
+    ):
         super().__init__()
-        self.dim = dim
+
+        dim_structure = default(dim_structure, dim_action_embed)
+        dim_encoded_sensory = default(dim_encoded_sensory, dim_structure)
+
+        # path integration
+
+        self.gru = nn.GRU(dim_action_embed, dim_structure, batch_first = True)
+        self.init_hiddens = Parameter(randn(1, 1, dim_structure) * 1e-2)
+
+        # sensory encoder
+
+        self.sensory_encoder = MLP(
+            dim_raw_latent,
+            dim_structure,
+            dim_encoded_sensory,
+            activation = nn.SiLU()
+        )
+
+        self.structural_norm = RMSNorm(dim_structure)
+        self.sensory_norm = RMSNorm(dim_encoded_sensory)
+
+        # implicit mlp memory (depth 2)
+
+        self.heads = heads
+        dim_inner = heads * dim_head
+
+        self.split_heads = Rearrange('b t (h d) -> b h t d', h = heads)
+        self.merge_heads = Rearrange('b h t d -> b t (h d)')
+
+        self.to_q = LinearNoBias(dim_structure, dim_inner)
+
+        # layer 1: structural -> hidden
+
+        self.to_k1 = LinearNoBias(dim_structure, dim_inner)
+        self.to_v1 = LinearNoBias(dim_encoded_sensory, dim_inner)
+
+        # layer 2: hidden -> sensory
+
+        self.to_k2 = LinearNoBias(dim_encoded_sensory, dim_inner)
+        self.to_v2 = LinearNoBias(dim_encoded_sensory, dim_inner)
+
+        self.talking_heads = nn.Conv2d(heads, heads, 1, bias = False) if talking_heads else nn.Identity()
+
+        if talking_heads:
+            nn.init.dirac_(self.talking_heads.weight)
+
+        self.activation = nn.SiLU()
+
+        # dummy tokens for shifted attention to mask diagonal
+
+        self.dummy_k1 = Parameter(randn(1, 1, dim_inner) * 1e-2)
+        self.dummy_v1 = Parameter(randn(1, 1, dim_inner) * 1e-2)
+
+        self.dummy_k2 = Parameter(randn(1, 1, dim_inner) * 1e-2)
+        self.dummy_v2 = Parameter(randn(1, 1, dim_inner) * 1e-2)
+
+        self.to_out = LinearNoBias(dim_inner, dim_structure)
+
+        self.to_gates = Sequential(
+            LinearNoBias(dim_structure, heads),
+            Rearrange('b t h -> b h t 1'),
+            nn.Sigmoid()
+        )
+
+        # sensory decoder
+
+        self.sensory_decoder = MLP(
+            dim_structure,
+            dim_structure,
+            dim_raw_latent * num_raw_latent_tokens,
+            activation = nn.SiLU()
+        )
+
         self.register_buffer('zero', tensor(0.), persistent = False)
 
-    def forward(self, action_tokens, *args, **kwargs):
-        return self.zero
+    def forward(
+        self,
+        action_tokens,
+        raw_latents,
+        return_preds = False
+    ):
+        raw_latents, _ = pack_one(raw_latents, 'b t * d')
+
+        # pool and encode spatial latents
+
+        pooled_latents = reduce(raw_latents, 'b t n d -> b t d', 'mean')
+        encoded_sensory = self.sensory_encoder(pooled_latents)
+
+        # path integration
+
+        batch = action_tokens.shape[0]
+        init_hiddens = repeat(self.init_hiddens, '1 1 d -> 1 b d', b = batch)
+
+        structural_codes, _ = self.gru(action_tokens, init_hiddens)
+
+        # rmsnorm both
+
+        structural_codes = self.structural_norm(structural_codes)
+        encoded_sensory = self.sensory_norm(encoded_sensory)
+
+        structural_and_sensory = cat((structural_codes, encoded_sensory), dim = -1)
+
+        # implicit mlp memory (depth 2)
+
+        q = self.to_q(structural_codes)
+
+        k1 = self.to_k1(structural_codes)
+        v1 = self.to_v1(encoded_sensory)
+
+        k2 = self.to_k2(encoded_sensory)
+        v2 = self.to_v2(encoded_sensory)
+
+        # prepend dummy tokens and shift to mask diagonal
+
+        def shift_kv(k, v, dummy_k, dummy_v):
+            dk = repeat(dummy_k, '1 1 d -> b 1 d', b = batch)
+            dv = repeat(dummy_v, '1 1 d -> b 1 d', b = batch)
+            k_shifted = cat((dk, k[:, :-1]), dim = 1)
+            v_shifted = cat((dv, v[:, :-1]), dim = 1)
+            return k_shifted, v_shifted
+
+        k1, v1 = shift_kv(k1, v1, self.dummy_k1, self.dummy_v1)
+        k2, v2 = shift_kv(k2, v2, self.dummy_k2, self.dummy_v2)
+
+        # split heads
+
+        q, k1, v1, k2, v2 = map(self.split_heads, (q, k1, v1, k2, v2))
+
+        # layer 1
+
+        out = F.scaled_dot_product_attention(q, k1, v1, is_causal = True)
+
+        out = self.talking_heads(out)
+        out = self.activation(out)
+
+        # layer 2
+
+        out = F.scaled_dot_product_attention(out, k2, v2, is_causal = True)
+
+        # gate aggregated values
+
+        out = out * self.to_gates(structural_codes)
+
+        # merge heads
+
+        out = self.merge_heads(out)
+        out = self.to_out(out)
+
+        # decode and loss
+
+        pred_raw_concat = self.sensory_decoder(out)
+
+        target_raw_concat = rearrange(raw_latents, 'b t n d -> b t (n d)')
+
+        # omit the very first token
+
+        pred_raw_concat_sliced = pred_raw_concat[:, 1:]
+        target_raw_concat_sliced = target_raw_concat[:, 1:]
+
+        loss = F.mse_loss(pred_raw_concat_sliced, target_raw_concat_sliced.detach())
+
+        if not return_preds:
+            return loss
+
+        # restore predictions to raw latents shape for external use
+
+        _, _, n, d = raw_latents.shape
+        pred_raw_latents = rearrange(pred_raw_concat, 'b t (n d) -> b t n d', n = n, d = d)
+
+        return loss, pred_raw_latents
 
 # axial space time transformer
 
@@ -3473,7 +3648,11 @@ class DynamicsWorldModel(Module):
         self.has_tem = ssl_tem
         if ssl_tem:
             assert exists(self.action_pre_encoder), 'TEM requires the action pre-encoder'
-            self.ssl_tem = TEM(dim)
+            self.ssl_tem = TEM(
+                dim_action_embed = dim,
+                dim_raw_latent = dim_latent,
+                num_raw_latent_tokens = num_latent_tokens
+            )
 
         # efficient axial space / time transformer
 
@@ -4956,7 +5135,8 @@ class DynamicsWorldModel(Module):
         latent_has_view_dim = False,
         seed = None,
         agent_token_cond = None,         # (b t d) optional conditioning to be summed to agent tokens
-        time_modifier_fn: Callable | None = None
+        time_modifier_fn: Callable | None = None,
+        return_tem_preds = False
     ):
         # handle video or latents
 
@@ -5780,7 +5960,9 @@ class DynamicsWorldModel(Module):
 
         if self.has_tem:
             action_tokens_for_tem = intermediates.pre_encoded_action
-            tem_loss = self.ssl_tem(action_tokens_for_tem)  # use the pre-encoded action tokens
+            tem_loss, tem_pred_latents = self.ssl_tem(action_tokens_for_tem, raw_latents = latents, return_preds = True)
+        else:
+            tem_pred_latents = None
 
         # gather losses - they sum across the multi token prediction steps for rewards and actions - eq (9)
 
@@ -5813,5 +5995,8 @@ class DynamicsWorldModel(Module):
 
         if return_intermediates:
             ret = (*ret, intermediates)
+
+        if return_tem_preds:
+            ret = (*ret, tem_pred_latents)
 
         return ret
