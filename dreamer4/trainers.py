@@ -1,4 +1,6 @@
 from __future__ import annotations
+from typing import Literal
+
 import math
 from collections import OrderedDict
 from random import randint
@@ -868,6 +870,7 @@ class DreamTrainer(Module):
         max_grad_norm = 0.5,
         num_train_steps = 10_000,
         weight_decay = 0.,
+        objective: Literal['ppo', 'pmpo', 'spo'] = 'ppo',
         accelerate_kwargs: dict = dict(),
         optim_kwargs: dict = dict(),
         cpu = False,
@@ -889,6 +892,7 @@ class DreamTrainer(Module):
             self.accelerator.init_trackers(project_name)
 
         self.model = model
+        self.objective = objective
 
         optim_kwargs = dict(
             lr = learning_rate,
@@ -950,7 +954,7 @@ class DreamTrainer(Module):
                 return_log_probs_and_values = True
             )
 
-            policy_head_loss, value_head_loss = self.model.learn_from_experience(dreams)
+            policy_head_loss, value_head_loss = self.model.learn_from_experience(dreams, objective = self.objective)
 
             self.print(f'policy head loss: {policy_head_loss.item():.3f} | value head loss: {value_head_loss.item():.3f}')
 
@@ -1003,6 +1007,7 @@ class SimTrainer(Module):
         max_grad_norm = None,
         epochs = 2,
         weight_decay = 0.,
+        objective: Literal['ppo', 'pmpo', 'spo'] = 'ppo',
         accelerate_kwargs: dict = dict(),
         optim_kwargs: dict = dict(),
         cpu = False,
@@ -1024,6 +1029,7 @@ class SimTrainer(Module):
             self.accelerator.init_trackers(project_name)
 
         self.model = model
+        self.objective = objective
 
         optim_kwargs = dict(
             lr = learning_rate,
@@ -1176,7 +1182,7 @@ class SimTrainer(Module):
                     agent_index = agent_index
                 )
 
-                policy_head_loss, value_head_loss = self.model.learn_from_experience(batch_experience)
+                policy_head_loss, value_head_loss = self.model.learn_from_experience(batch_experience, objective = self.objective)
 
                 self.print(f'policy head loss: {policy_head_loss.item():.3f} | value head loss: {value_head_loss.item():.3f}')
 

@@ -290,7 +290,7 @@ def main(
     agent_policy_gradient_frac = 1.0,
     seed = 42,
     use_wandb = False,
-    use_pmpo = False,
+    objective: Literal['ppo', 'pmpo', 'spo'] = 'ppo',
     use_image_input = False,
     use_conv_encoder = False,
     vectorized = False,
@@ -318,6 +318,7 @@ def main(
     lapo_use_fdm = True,
     lapo_pred_actions = True,
     tem = False,
+    use_delight_gating = True
 ):
     torch.manual_seed(seed)
 
@@ -512,7 +513,8 @@ def main(
                     policy_loss, value_loss = agent.dynamics.learn_from_experience(
                         experience = micro,
                         only_learn_policy_value_heads = False,
-                        use_pmpo = use_pmpo
+                        objective = objective,
+                        use_delight_gating = use_delight_gating
                     )
 
                     total_loss = (policy_loss + value_loss) / grad_accum_every

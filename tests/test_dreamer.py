@@ -681,14 +681,14 @@ def test_cache_generate():
     generated, time_cache = dynamics.generate(1, time_cache = time_cache, return_time_cache = True)
 
 @param('vectorized', (False, True))
-@param('use_pmpo', (False, True))
+@param('objective', ('ppo', 'pmpo', 'spo'))
 @param('env_can_terminate', (False, True))
 @param('env_can_truncate', (False, True))
 @param('store_agent_embed', (False, True))
 @param('predict_terminals', (False, True))
 def test_online_rl(
     vectorized,
-    use_pmpo,
+    objective,
     env_can_terminate,
     env_can_truncate,
     store_agent_embed,
@@ -755,7 +755,7 @@ def test_online_rl(
     if store_agent_embed:
         assert exists(combined_experience.agent_embed)
 
-    actor_loss, critic_loss = world_model_and_policy.learn_from_experience(combined_experience, use_pmpo = use_pmpo)
+    actor_loss, critic_loss = world_model_and_policy.learn_from_experience(combined_experience, objective = objective)
 
     actor_loss.backward()
     critic_loss.backward()

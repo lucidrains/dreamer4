@@ -4253,7 +4253,7 @@ class DynamicsWorldModel(Module):
         # calculate episode return
 
         step_mask = lens_to_mask(episode_lens, time_dim)
-        episode_return = rewards.masked_fill(~step_mask, 0.).sum(dim = -1)
+        episode_return = einsum(rewards, step_mask.float(), 'b t, b t -> b')
 
         one_experience = Experience(
             latents = acc_latents,
@@ -4285,7 +4285,7 @@ class DynamicsWorldModel(Module):
         policy_optim: Optimizer | None = None,
         value_optim: Optimizer | None = None,
         only_learn_policy_value_heads = True, # in the paper, they do not finetune the entire dynamics model, they just learn the heads
-        use_pmpo = True,
+        objective: Literal['ppo', 'pmpo', 'spo'] = 'ppo',
         use_delight_gating = None,
         delight_temperature = None,
         normalize_advantages = None,
@@ -4407,14 +4407,14 @@ class DynamicsWorldModel(Module):
 
         # if using pmpo, do not normalize advantages, but can be overridden
 
-        normalize_advantages = default(normalize_advantages, not use_pmpo)
+        normalize_advantages = default(normalize_advantages, objective != 'pmpo')
 
         if normalize_advantages:
             advantage = z_score(advantage, mask = mask, eps = eps)
 
         # https://arxiv.org/abs/2410.04166v1
 
-        if use_pmpo:
+        if objective == 'pmpo':
             pos_advantage_mask = advantage >= 0.
             neg_advantage_mask = ~pos_advantage_mask
 
@@ -4456,25 +4456,18 @@ class DynamicsWorldModel(Module):
 
         # align actions with policy embed if latents had a bootstrap state appended
 
-        has_padded_discrete_actions = exists(discrete_actions) and discrete_actions.shape[1] == policy_embed.shape[1] + 1
-        has_padded_continuous_actions = exists(continuous_actions) and continuous_actions.shape[1] == policy_embed.shape[1] + 1
+        def maybe_slice_time(t):
+            return t[:, :-1] if exists(t) and t.shape[1] == policy_embed.shape[1] + 1 else t
 
-        if has_padded_discrete_actions or has_padded_continuous_actions:
-            discrete_actions = discrete_actions[:, :-1] if exists(discrete_actions) else None
-            continuous_actions = continuous_actions[:, :-1] if exists(continuous_actions) else None
+        discrete_actions = maybe_slice_time(discrete_actions)
+        continuous_actions = maybe_slice_time(continuous_actions)
 
         log_probs, entropies = self.action_embedder.log_probs(policy_embed, pred_head_index = 0, discrete_targets = discrete_actions, continuous_targets = continuous_actions, return_entropies = True)
 
         # concat discrete and continuous actions into one for optimizing
 
         if exists(old_log_probs):
-            has_padded_discrete = exists(old_log_probs.discrete) and old_log_probs.discrete.shape[1] == policy_embed.shape[1] + 1
-            has_padded_continuous = exists(old_log_probs.continuous) and old_log_probs.continuous.shape[1] == policy_embed.shape[1] + 1
-            if has_padded_discrete or has_padded_continuous:
-                old_log_probs = Actions(
-                    old_log_probs.discrete[:, :-1] if exists(old_log_probs.discrete) else None,
-                    old_log_probs.continuous[:, :-1] if exists(old_log_probs.continuous) else None
-                )
+            old_log_probs = Actions(*(maybe_slice_time(t) for t in old_log_probs))
 
         old_log_probs = safe_cat(old_log_probs, dim = -1)
         log_probs = safe_cat(log_probs, dim = -1)
@@ -4501,7 +4494,7 @@ class DynamicsWorldModel(Module):
         # seems to be weighted across batch and time, iiuc
         # eq (10) in https://arxiv.org/html/2410.04166v1
 
-        if use_pmpo:
+        if objective == 'pmpo':
 
             maybe_gated_log_prob = log_probs
 
@@ -4562,7 +4555,25 @@ class DynamicsWorldModel(Module):
 
                 policy_loss = policy_loss + kl_div_loss * self.pmpo_kl_div_loss_weight
 
-        else:
+        elif objective == 'spo':
+
+            # spo clipped surrogate loss
+
+            ratio = (log_probs - old_log_probs).exp()
+
+            policy_loss = -(
+                ratio * advantage -
+                (advantage.abs() * (ratio - 1.).square()) / (2 * self.ppo_eps_clip)
+            )
+
+            if use_delight_gating:
+                policy_loss = policy_loss * delight_gate
+
+            policy_loss = reduce(policy_loss, 'b t na -> b t', 'sum')
+
+            policy_loss = masked_mean(policy_loss, mask)
+
+        elif objective == 'ppo':
 
             # ppo clipped surrogate loss
 
@@ -4577,6 +4588,9 @@ class DynamicsWorldModel(Module):
             policy_loss = reduce(policy_loss, 'b t na -> b t', 'sum')
 
             policy_loss = masked_mean(policy_loss, mask)
+
+        else:
+            raise ValueError(f'unknown objective {objective}')
 
         # handle entropy loss for naive exploration bonus
 
@@ -5072,9 +5086,19 @@ class DynamicsWorldModel(Module):
 
         # returning agent actions, rewards, and log probs + values for policy optimization
 
-        batch, device = latents.shape[0], latents.device
+        batch, time_dim, device = *latents.shape[:2], latents.device
 
         is_truncated = ~decoded_terminals
+
+        # derive episode return
+
+        episode_return = None
+
+        if exists(decoded_rewards):
+            step_mask = lens_to_mask(decoded_lens, time_dim)
+            episode_return = einsum(decoded_rewards, step_mask.float(), 'b t, b t -> b')
+
+        # experience
 
         gen = Experience(
             latents = latents,
@@ -5087,7 +5111,8 @@ class DynamicsWorldModel(Module):
             lens = decoded_lens,
             is_truncated = is_truncated,
             terminals = decoded_terminals,
-            is_from_world_model = True
+            is_from_world_model = True,
+            episode_return = episode_return
         )
 
         if return_rewards_per_frame:

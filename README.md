@@ -274,4 +274,16 @@ Passing `--condition_on_actions True` lets you explicitly prompt with velocity a
 }
 ```
 
+```bibtex
+@misc{xie2025simplepolicyoptimization,
+    title   = {Simple Policy Optimization},
+    author  = {Zhengpeng Xie and Qiang Zhang and Fan Yang and Marco Hutter and Renjing Xu},
+    year    = {2025},
+    eprint  = {2401.16025},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2401.16025},
+}
+```
+
 *the conquest of nature is to be achieved through number and measure - angels to Descartes in a dream*
