@@ -112,6 +112,16 @@ The baseline will synthesize unconditionally digits floating in a random directi
 
 Passing `--condition_on_actions True` lets you explicitly prompt with velocity actions to command the digit's trajectory. The conditioned samples display a digit with action velocities arranged in the position of the grid, with center being zerod velocities (staying still).
 
+## HalfCheetah Imagination RL
+
+For a raw-observation MuJoCo run, the HalfCheetah script pretrains a 17-dimensional observation tokenizer, then loops over real rollouts, world-model updates, and detached policy/value learning from generated imagination experience. Reward and value bins use HL-Gauss by default, with separate supports for per-step rewards and horizon-scale returns.
+
+```bash
+$ uv run train_halfcheetah_imagination_rl.py
+```
+
+Training scalars are written to a fresh timestamped TensorBoard directory under `runs/halfcheetah_imagination` by default.
+
 ## Citation
 
 ```bibtex
