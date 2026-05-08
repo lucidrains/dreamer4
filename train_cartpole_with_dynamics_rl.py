@@ -157,7 +157,7 @@ class TransformerPPOAgent(nn.Module):
         critic_depth = 0,
         spatial_pre_encoder_depth = 0,
         action_pre_encoder_depth = 0,
-        agent_predicts_latent = True,
+        agent_predicts_latent = False,
         ssl_lapo = False,
         ssl_lapo_use_fdm = True,
         ssl_lapo_pred_actions = True,
