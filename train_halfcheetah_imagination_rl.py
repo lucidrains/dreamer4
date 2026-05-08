@@ -642,6 +642,7 @@ def main(
     dim_latent = 32,
     model_dim = 128,
     depth = 3,
+    final_special_cross_attn = False,
     reward_encoder_type: Literal["symexp_two_hot", "hl_gauss"] = "hl_gauss",
     world_model_batch_size = 32,
     world_model_train_steps = 13,
@@ -756,6 +757,7 @@ def main(
         use_loss_normalization = False,
         attn_heads = 4,
         attn_dim_head = 16,
+        final_special_cross_attn = final_special_cross_attn,
         policy_head_mlp_depth = 2,
         value_head_mlp_depth = 2,
     ).to(device)

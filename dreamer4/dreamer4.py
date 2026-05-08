@@ -2205,6 +2205,7 @@ class AxialSpaceTimeTransformer(Module):
         num_special_spatial_tokens = 1,
         special_attend_only_itself = False,  # this is set to True for the video tokenizer decoder (latents can only attend to itself while spatial modalities attend to the latents and everything)
         full_spatial_attn = False,
+        final_special_cross_attn = True,
         final_norm = True,
         value_residual = True,               # https://arxiv.org/abs/2410.17897 - but with learned mixing from OSS
         rnn_time = False,
@@ -2302,7 +2303,7 @@ class AxialSpaceTimeTransformer(Module):
         # special tokens
 
         self.num_special_spatial_tokens = num_special_spatial_tokens
-        self.should_special_cross_attend = num_special_spatial_tokens > 0 and not special_attend_only_itself and not full_spatial_attn
+        self.should_special_cross_attend = final_special_cross_attn and num_special_spatial_tokens > 0 and not special_attend_only_itself and not full_spatial_attn
 
         self.final_special_cross_attn = self.final_special_ff = None
 
@@ -3322,6 +3323,7 @@ class DynamicsWorldModel(Module):
         attn_heads = 8,
         attn_dim_head = 64,
         attn_softclamp_value = 50.,
+        final_special_cross_attn = True,
         ff_kwargs: dict = dict(),
         use_time_rnn = False,
         loss_weight_fn: Callable = ramp_weight,
@@ -3655,9 +3657,11 @@ class DynamicsWorldModel(Module):
             learned_embedding = False
         )
 
+        reward_pred_dim = dim * 2 if self.action_embedder.has_actions else dim
+
         to_reward_pred = Sequential(
-            RMSNorm(dim),
-            LinearNoBias(dim, self.reward_encoder.num_bins)
+            RMSNorm(reward_pred_dim),
+            LinearNoBias(reward_pred_dim, self.reward_encoder.num_bins)
         )
 
         self.to_reward_pred = Ensemble(
@@ -3767,6 +3771,7 @@ class DynamicsWorldModel(Module):
             ff_kwargs = ff_kwargs,
             num_special_spatial_tokens = num_agents,
             time_block_every = time_block_every,
+            final_special_cross_attn = final_special_cross_attn,
             final_norm = False,
             rnn_time = use_time_rnn,
             time_attention_use_pope = time_attention_use_pope,
@@ -3782,6 +3787,7 @@ class DynamicsWorldModel(Module):
             ff_kwargs = ff_kwargs,
             num_special_spatial_tokens = num_agents,
             time_block_every = time_block_every,
+            final_special_cross_attn = final_special_cross_attn,
             final_norm = False,
             rnn_time = use_time_rnn,
             time_attention_use_pope = time_attention_use_pope,
@@ -3861,6 +3867,22 @@ class DynamicsWorldModel(Module):
         return exists(self.video_tokenizer) or self.has_aux_image_encoder
 
     # types of parameters
+
+    def reward_pred_input(
+        self,
+        agent_tokens,
+        action_tokens = None
+    ):
+        if not self.action_embedder.has_actions:
+            return agent_tokens
+
+        if not exists(action_tokens):
+            action_tokens = torch.zeros_like(agent_tokens)
+        else:
+            action_tokens = pad_right_at_dim_to(action_tokens, agent_tokens.shape[-2], dim = -2)
+            action_tokens = action_tokens[..., :agent_tokens.shape[-2], :]
+
+        return cat((agent_tokens, action_tokens), dim = -1)
 
     def muon_parameters(self):
         params = self.transformer.muon_parameters()
@@ -4880,8 +4902,9 @@ class DynamicsWorldModel(Module):
         # maybe return actions
 
         return_agent_actions |= return_log_probs_and_values
+        sample_agent_actions = self.action_embedder.has_actions and (return_agent_actions or return_rewards_per_frame)
 
-        if return_agent_actions:
+        if sample_agent_actions:
             num_discrete_action_types = self.action_embedder.num_discrete_action_types
             decoded_discrete_actions = prompt_discrete_actions.clone() if exists(prompt_discrete_actions) else empty((batch_size, 0, num_discrete_action_types), device = self.device, dtype = torch.long) if num_discrete_action_types > 0 else None
 
@@ -4935,7 +4958,7 @@ class DynamicsWorldModel(Module):
                 use_time_cache or
                 return_rewards_per_frame or
                 store_agent_embed or
-                return_agent_actions
+                sample_agent_actions
             )
 
             # prepare noised latent / proprio inputs
@@ -5056,16 +5079,10 @@ class DynamicsWorldModel(Module):
 
             # predictions off agent token embedding on the last denoising step
 
-            needs_agent_embed = return_rewards_per_frame or should_predict_terminals or store_agent_embed or return_agent_actions
+            needs_agent_embed = return_rewards_per_frame or should_predict_terminals or store_agent_embed or sample_agent_actions
 
             if needs_agent_embed:
                 one_agent_embed = embeds.agent[:, -1:, agent_index]
-
-            if return_rewards_per_frame:
-                reward_logits = self.to_reward_pred.forward_one(one_agent_embed, id = 0)
-                pred_reward = self.reward_encoder.bins_to_scalar_value(reward_logits)
-
-                decoded_rewards = cat((decoded_rewards, pred_reward), dim = 1)
 
             # maybe predict terminals
 
@@ -5089,14 +5106,16 @@ class DynamicsWorldModel(Module):
 
             # decode the agent actions if needed
 
-            if return_agent_actions:
+            sampled_action_token = None
+
+            if sample_agent_actions:
                 assert self.action_embedder.has_actions
 
                 policy_embed = self.policy_head(one_agent_embed)
 
                 # maybe store old actions
 
-                if store_old_action_unembeds:
+                if return_agent_actions and store_old_action_unembeds:
                     acc_policy_embed = safe_cat((acc_policy_embed, policy_embed), dim = 1)
 
                 # sample actions
@@ -5111,6 +5130,12 @@ class DynamicsWorldModel(Module):
 
                 decoded_discrete_actions = safe_cat((decoded_discrete_actions, sampled_discrete_actions), dim = 1)
                 decoded_continuous_actions = safe_cat((decoded_continuous_actions, sampled_continuous_actions), dim = 1)
+
+                sampled_action_token = self.action_embedder(
+                    discrete_actions = sampled_discrete_actions,
+                    continuous_actions = sampled_continuous_actions
+                )
+                sampled_action_token = add('1 d, b t d', self.action_learned_embed, sampled_action_token)
 
                 if return_log_probs_and_values:
                     discrete_log_probs, continuous_log_probs = self.action_embedder.log_probs(
@@ -5127,6 +5152,13 @@ class DynamicsWorldModel(Module):
                     values = self.value_encoder.bins_to_scalar_value(value_bins)
 
                     decoded_values = safe_cat((decoded_values, values), dim = 1)
+
+            if return_rewards_per_frame:
+                reward_input = self.reward_pred_input(one_agent_embed, sampled_action_token)
+                reward_logits = self.to_reward_pred.forward_one(reward_input, id = 0)
+                pred_reward = self.reward_encoder.bins_to_scalar_value(reward_logits)
+
+                decoded_rewards = cat((decoded_rewards, pred_reward), dim = 1)
 
             # concat the denoised latent
 
@@ -5837,11 +5869,20 @@ class DynamicsWorldModel(Module):
             agent_tokens_shifted = encoded_agent_tokens[:, :-1]
 
         if exists(rewards):
-            reward_pred = self.to_reward_pred(agent_tokens_shifted)
+            reward_agent_tokens = agent_tokens_shifted
+            reward_action_tokens = next_action_tokens
+
+            if exists(reward_action_tokens):
+                reward_action_tokens = reward_action_tokens[:, :reward_agent_tokens.shape[1]]
+
+            reward_input = self.reward_pred_input(reward_agent_tokens, reward_action_tokens)
+            reward_pred_time = reward_input.shape[-2]
+
+            reward_pred = self.to_reward_pred(reward_input)
 
             reward_pred = rearrange(reward_pred, 'mtp b t l -> b l t mtp')
 
-            reward_targets, reward_loss_mask = create_multi_token_prediction_targets(two_hot_encoding[:, :-1], self.multi_token_pred_len)
+            reward_targets, reward_loss_mask = create_multi_token_prediction_targets(two_hot_encoding[:, :reward_pred_time], self.multi_token_pred_len)
 
             reward_targets = rearrange(reward_targets, 'b t mtp l -> b l t mtp')
 
@@ -5850,7 +5891,7 @@ class DynamicsWorldModel(Module):
             reward_losses = reward_losses.masked_fill(~reward_loss_mask, 0.)
 
             if is_var_len:
-                reward_loss = reward_losses[loss_mask_without_last].mean(dim = 0)
+                reward_loss = reward_losses[loss_mask_without_last[:, :reward_pred_time]].mean(dim = 0)
             else:
                 reward_loss = reduce(reward_losses, '... mtp -> mtp', 'mean') # they sum across the prediction steps (mtp dimension) - eq(9)
 
