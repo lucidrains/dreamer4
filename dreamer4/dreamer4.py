@@ -34,6 +34,7 @@ from PoPE_pytorch import PoPE, flash_attn_with_pope
 
 from discrete_continuous_embed_readout import MultiCategorical, Readout
 from discrete_continuous_embed_readout.discrete_continuous_embed_readout import BetaDist, rescale
+from hl_gauss_pytorch import HLGaussLoss
 
 import einx
 from torch_einops_utils import (
@@ -741,6 +742,72 @@ class SymExpTwoHot(Module):
         encoded.scatter_(-1, right_indices, right_logit_value)
 
         return inverse_pack(encoded, '* l')
+
+class HLGaussRewardEncoder(Module):
+    def __init__(
+        self,
+        reward_range = (-20., 20.),
+        num_bins = 255,
+        sigma = None,
+        sigma_to_bin_ratio = 2.,
+        eps = 1e-10,
+        clamp_to_range = True,
+        min_max_value_on_bin_center = False,
+        learned_embedding = False,
+        dim_embed = None,
+    ):
+        super().__init__()
+
+        min_value, max_value = reward_range
+
+        self.reward_range = reward_range
+        self.loss = HLGaussLoss(
+            min_value,
+            max_value,
+            num_bins,
+            sigma = sigma,
+            sigma_to_bin_ratio = sigma_to_bin_ratio,
+            eps = eps,
+            clamp_to_range = clamp_to_range,
+            min_max_value_on_bin_center = min_max_value_on_bin_center,
+        )
+
+        self.num_bins = self.loss.num_bins
+        self.learned_embedding = learned_embedding
+
+        if learned_embedding:
+            assert exists(dim_embed)
+            self.bin_embeds = nn.Embedding(self.num_bins, dim_embed)
+
+    @property
+    def device(self):
+        return self.loss.support.device
+
+    def embed(
+        self,
+        probs,
+    ):
+        assert self.learned_embedding, f'can only embed if `learned_embedding` is True'
+        return einsum(probs, self.bin_embeds.weight, '... l, l d -> ... d')
+
+    def bins_to_scalar_value(
+        self,
+        logits,
+        normalize = True
+    ):
+        if normalize:
+            return self.loss.transform_from_logits(logits)
+
+        return self.loss.transform_from_probs(logits)
+
+    def forward(
+        self,
+        values
+    ):
+        if values.numel() == 0:
+            return values.new_empty((*values.shape, self.num_bins))
+
+        return self.loss.transform_to_probs(values)
 
 # action related
 
@@ -3229,8 +3296,10 @@ class DynamicsWorldModel(Module):
         dim_proprio = None,
         dim_state = None,
         dim_critic_state = None,
+        reward_encoder_type: Literal['hl_gauss', 'symexp_two_hot'] = 'hl_gauss',
         critic_state_embedder: Module | None = None,
         reward_encoder_kwargs: dict = dict(),
+        value_encoder_kwargs: dict | None = None,
         depth = 4,
         spatial_pre_encoder_depth = 0,
         action_pre_encoder_depth = 0,
@@ -3553,10 +3622,25 @@ class DynamicsWorldModel(Module):
         self.add_reward_embed_to_agent_token = add_reward_embed_to_agent_token
         self.add_reward_embed_dropout = add_reward_embed_dropout
 
-        self.reward_encoder = SymExpTwoHot(
+        reward_encoder_klass = dict(
+            symexp_two_hot = SymExpTwoHot,
+            hl_gauss = HLGaussRewardEncoder,
+        ).get(reward_encoder_type)
+
+        assert exists(reward_encoder_klass), f'unknown reward_encoder_type {reward_encoder_type}'
+
+        self.reward_encoder = reward_encoder_klass(
             **reward_encoder_kwargs,
             dim_embed = dim,
             learned_embedding = add_reward_embed_to_agent_token
+        )
+
+        value_encoder_kwargs = default(value_encoder_kwargs, reward_encoder_kwargs)
+
+        self.value_encoder = reward_encoder_klass(
+            **value_encoder_kwargs,
+            dim_embed = dim,
+            learned_embedding = False
         )
 
         to_reward_pred = Sequential(
@@ -3589,7 +3673,7 @@ class DynamicsWorldModel(Module):
         self.value_head = create_mlp(
             dim_in = dim,
             dim = dim * 4,
-            dim_out = self.reward_encoder.num_bins,
+            dim_out = self.value_encoder.num_bins,
             depth = value_head_mlp_depth,
         )
 
@@ -3780,6 +3864,8 @@ class DynamicsWorldModel(Module):
 
     def value_head_parameters(self):
         params = list(self.value_head.parameters())
+        if exists(self.critic_state_embedder):
+            params.extend(self.critic_state_embedder.parameters())
         if exists(self.critic_transformer):
             params.extend(self.critic_transformer.parameters())
         return params
@@ -4046,7 +4132,7 @@ class DynamicsWorldModel(Module):
                 value_embed = value_embed + rearrange(critic_embed, 'b d -> b 1 d')
 
             value_bins = self.value_head(value_embed)
-            value = self.reward_encoder.bins_to_scalar_value(value_bins)
+            value = self.value_encoder.bins_to_scalar_value(value_bins)
             values = safe_cat((values, value), dim = 1)
 
             policy_embed = self.policy_head(one_actor_agent_embed)
@@ -4181,7 +4267,7 @@ class DynamicsWorldModel(Module):
 
             if done_flag.all() and need_bootstrap.any():
                 if exists(obs_to_latents_fn):
-                    bootstrap_latents, _ = obs_to_latents_fn(obs, tokenizer_time_cache)
+                    bootstrap_latents, _ = obs_to_latents_fn(self, obs, tokenizer_time_cache)
 
                 elif exists(curr_image):
                     bootstrap_latents = None
@@ -4221,7 +4307,7 @@ class DynamicsWorldModel(Module):
                     value_embed = value_embed + rearrange(critic_embed, 'b d -> b 1 d')
 
                 value_bins = self.value_head(value_embed)
-                bootstrap_value = self.reward_encoder.bins_to_scalar_value(value_bins)
+                bootstrap_value = self.value_encoder.bins_to_scalar_value(value_bins)
                 values = torch.cat((values, bootstrap_value), dim = 1)
 
                 # pad everything out for the truncated state
@@ -4630,14 +4716,14 @@ class DynamicsWorldModel(Module):
         # value head prediction
 
         value_bins = self.value_head(value_agent_embeds)
-        values = self.reward_encoder.bins_to_scalar_value(value_bins)
+        values = self.value_encoder.bins_to_scalar_value(value_bins)
 
         # align returns and old_values to value_bins length if bootstrap padded
         if returns.shape[1] == value_bins.shape[1] + 1:
             returns = returns[:, :-1]
             old_values = old_values[:, :-1]
 
-        return_bins = self.reward_encoder(returns)
+        return_bins = self.value_encoder(returns)
 
         value_bins, return_bins = tuple(rearrange(t, 'b t l -> b l t') for t in (value_bins, return_bins))
 
@@ -4647,7 +4733,7 @@ class DynamicsWorldModel(Module):
 
         if self.clip_values:
             clipped_values = old_values + (values - old_values).clamp(-self.value_clip, self.value_clip)
-            clipped_value_bins = self.reward_encoder(clipped_values)
+            clipped_value_bins = self.value_encoder(clipped_values)
             clipped_value_bins = rearrange(clipped_value_bins, 'b t l -> b l t')
 
             clipped_value_loss = -(return_bins * log(clipped_value_bins)).sum(dim = 1)
@@ -5018,7 +5104,7 @@ class DynamicsWorldModel(Module):
                     decoded_continuous_log_probs = safe_cat((decoded_continuous_log_probs, continuous_log_probs), dim = 1)
 
                     value_bins = self.value_head(one_agent_embed)
-                    values = self.reward_encoder.bins_to_scalar_value(value_bins)
+                    values = self.value_encoder.bins_to_scalar_value(value_bins)
 
                     decoded_values = safe_cat((decoded_values, values), dim = 1)
 
