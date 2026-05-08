@@ -4515,6 +4515,8 @@ class DynamicsWorldModel(Module):
         if normalize_advantages:
             advantage = z_score(advantage, mask = mask, eps = eps)
 
+        pos_advantage_mask = neg_advantage_mask = None
+
         # https://arxiv.org/abs/2410.04166v1
 
         if objective == 'pmpo':
@@ -4586,12 +4588,6 @@ class DynamicsWorldModel(Module):
             pos_advantage_mask = pos_advantage_mask[:, :-1] if exists(pos_advantage_mask) else None
             neg_advantage_mask = neg_advantage_mask[:, :-1] if exists(neg_advantage_mask) else None
 
-        # calculate delight
-        # Ian Osband - https://arxiv.org/abs/2603.14608v1
-
-        if use_delight_gating:
-            delight_gate = ((-log_probs * advantage) / delight_temperature).sigmoid().detach()
-
         # maybe pmpo
         # pmpo - weighting the positive and negative advantages equally - ignoring magnitude of advantage and taking the sign
         # seems to be weighted across batch and time, iiuc
@@ -4602,6 +4598,8 @@ class DynamicsWorldModel(Module):
             maybe_gated_log_prob = log_probs
 
             if use_delight_gating:
+                # Ian Osband - https://arxiv.org/abs/2603.14608v1
+                delight_gate = ((-log_probs * advantage) / delight_temperature).sigmoid().detach()
                 maybe_gated_log_prob = log_probs * delight_gate
 
             pos = pos_advantage_mask
@@ -4670,6 +4668,7 @@ class DynamicsWorldModel(Module):
             )
 
             if use_delight_gating:
+                delight_gate = ((-log_probs * advantage) / delight_temperature).sigmoid().detach()
                 policy_loss = policy_loss * delight_gate
 
             policy_loss = reduce(policy_loss, 'b t na -> b t', 'sum')
@@ -4678,17 +4677,21 @@ class DynamicsWorldModel(Module):
 
         elif objective == 'ppo':
 
-            # ppo clipped surrogate loss
+            # ppo clipped surrogate loss, matching CleanRL continuous PPO by
+            # forming a joint action log-prob before ratio clipping
 
-            ratio = (log_probs - old_log_probs).exp()
+            joint_log_probs = reduce(log_probs, 'b t na -> b t', 'sum')
+            joint_old_log_probs = reduce(old_log_probs, 'b t na -> b t', 'sum')
+            scalar_advantage = rearrange(advantage, 'b t 1 -> b t')
+
+            ratio = (joint_log_probs - joint_old_log_probs).exp()
             clipped_ratio = ratio.clamp(1. - self.ppo_eps_clip, 1. + self.ppo_eps_clip)
 
-            policy_loss = -torch.min(ratio * advantage, clipped_ratio * advantage)
+            policy_loss = -torch.min(ratio * scalar_advantage, clipped_ratio * scalar_advantage)
 
             if use_delight_gating:
+                delight_gate = ((-joint_log_probs * scalar_advantage) / delight_temperature).sigmoid().detach()
                 policy_loss = policy_loss * delight_gate
-
-            policy_loss = reduce(policy_loss, 'b t na -> b t', 'sum')
 
             policy_loss = masked_mean(policy_loss, mask)
 

@@ -390,7 +390,7 @@ def agent_approx_kl_metrics(world_model: DynamicsWorldModel, dream: Experience):
     old_log_probs = cat_existing(old_log_probs, dim = -1)
     log_probs = cat_existing(log_probs, dim = -1)
 
-    log_ratio = log_probs - old_log_probs
+    log_ratio = log_probs.sum(dim = -1) - old_log_probs.sum(dim = -1)
     approx_kl = log_ratio.exp() - 1. - log_ratio
 
     lens = dream.lens
@@ -398,7 +398,6 @@ def agent_approx_kl_metrics(world_model: DynamicsWorldModel, dream: Experience):
         is_truncated = dream.is_truncated if exists(dream.is_truncated) else torch.ones_like(lens, dtype = torch.bool)
         learnable_lens = (lens - is_truncated.long()).clamp(min = 0, max = policy_time)
         mask = torch.arange(policy_time, device = approx_kl.device)[None, :] < learnable_lens[:, None]
-        mask = mask[:, :, None].expand_as(approx_kl)
         approx_kl = approx_kl[mask]
     else:
         approx_kl = approx_kl.reshape(-1)
