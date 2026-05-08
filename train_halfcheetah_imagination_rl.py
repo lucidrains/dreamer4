@@ -459,6 +459,42 @@ def train_tokenizer(
     return last_loss
 
 
+@torch.no_grad()
+def eval_tokenizer_on_experience(
+    tokenizer: ObservationTokenizer,
+    exp: Experience,
+    *,
+    max_samples: int,
+):
+    states = exp.critic_state
+
+    if not exists(states):
+        return None
+
+    batch, time = states.shape[:2]
+    device = states.device
+
+    if exists(exp.lens):
+        mask = torch.arange(time, device = device)[None, :] < exp.lens[:, None]
+        states = states[mask]
+    else:
+        states = states.reshape(batch * time, states.shape[-1])
+
+    if states.numel() == 0:
+        return None
+
+    if max_samples > 0 and states.shape[0] > max_samples:
+        indices = torch.randperm(states.shape[0], device = device)[:max_samples]
+        states = states[indices]
+
+    was_training = tokenizer.training
+    tokenizer.eval()
+    loss = tokenizer(states)
+    tokenizer.train(was_training)
+
+    return loss.item()
+
+
 def train_world_model(
     world_model: DynamicsWorldModel,
     optimizer: AdamW,
@@ -653,13 +689,15 @@ def main(
     imagination_generate_steps = 4,
     agent_learning_rate = 3e-4,
     objective: Literal["ppo", "pmpo", "spo"] = "ppo",
-    use_delight_gating = True,
+    use_delight_gating = False,
     agent_predicts_state = True,
     agent_state_pred_loss_weight = 0.1,
     pretrain_tokenizer_steps = 1000,
     pretrain_tokenizer_observations = 8192,
     tokenizer_batch_size = 256,
     tokenizer_learning_rate = 3e-4,
+    tokenizer_eval_every = 10,
+    tokenizer_eval_batch_size = 2048,
     max_grad_norm = 0.5,
     use_tensorboard = True,
     log_dir = "runs/halfcheetah_imagination",
@@ -790,6 +828,7 @@ def main(
 
     for loop in pbar:
         world_model.eval()
+        tokenizer_eval_losses = []
 
         for rollout_idx in range(rollouts_per_loop):
             exp = world_model.interact_with_env(
@@ -802,11 +841,22 @@ def main(
                 obs_to_latents_fn = obs_to_latents_fn(tokenizer),
             )
 
+            if tokenizer_eval_every > 0 and divisible_by(loop, tokenizer_eval_every):
+                tokenizer_eval_loss = eval_tokenizer_on_experience(
+                    tokenizer,
+                    exp,
+                    max_samples = tokenizer_eval_batch_size,
+                )
+
+                if exists(tokenizer_eval_loss):
+                    tokenizer_eval_losses.append(tokenizer_eval_loss)
+
             replay.append(exp.to("cpu"))
             recent_returns.extend(exp.episode_return.detach().cpu().tolist())
 
         avg_return = float(np.mean(recent_returns)) if len(recent_returns) > 0 else 0.
         avg_length = float(np.mean([exp.lens.float().mean().item() for exp in replay])) if len(replay) > 0 else 0.
+        tokenizer_policy_recon_loss = float(np.mean(tokenizer_eval_losses)) if len(tokenizer_eval_losses) > 0 else None
 
         log_scalars(
             writer,
@@ -814,6 +864,7 @@ def main(
                 "rollout/average_return_20": avg_return,
                 "rollout/replay_size": len(replay),
                 "rollout/average_length": avg_length,
+                "tokenizer/policy_recon_loss": tokenizer_policy_recon_loss,
             },
             loop,
         )
