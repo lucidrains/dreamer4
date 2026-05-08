@@ -723,7 +723,7 @@ def main(
     action_highs = np.asarray(single_action_space.high)
 
     assert np.allclose(action_lows, -1.) and np.allclose(action_highs, 1.), (
-        "this script expects the native squashed Gaussian policy range to match the env action range [-1, 1]"
+        "this script expects the native policy target range to match the env action range [-1, 1]"
     )
 
     reward_range = (-20., 20.)
@@ -741,7 +741,8 @@ def main(
         time_block_every = max(depth, 1),
         num_discrete_actions = 0,
         num_continuous_actions = action_dim,
-        continuous_dist_type = "squashed_gaussian",
+        continuous_dist_type = "beta",
+        continuous_target_action_range = (-1., 1.),
         reward_encoder_type = reward_encoder_type,
         reward_encoder_kwargs = dict(reward_range = reward_range),
         value_encoder_kwargs = dict(reward_range = value_range),
