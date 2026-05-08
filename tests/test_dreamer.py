@@ -320,6 +320,120 @@ def test_action_with_world_model():
     actor_loss.backward(retain_graph = True)
     critic_loss.backward()
 
+def test_action_conditioned_prompt_rewards_from_post_transition_tokens():
+    from dreamer4.dreamer4 import DynamicsWorldModel
+
+    dynamics = DynamicsWorldModel(
+        dim = 32,
+        dim_latent = 8,
+        max_steps = 16,
+        num_latent_tokens = 2,
+        num_spatial_tokens = 2,
+        depth = 1,
+        time_block_every = 1,
+        attn_heads = 2,
+        attn_dim_head = 8,
+        num_discrete_actions = 4,
+        predict_terminals = False
+    )
+
+    prompt_latents = torch.randn(2, 2, 1, 2, 8)
+    prompt_actions = torch.randint(0, 4, (2, 2, 1))
+
+    gen = dynamics.generate(
+        6,
+        batch_size = 2,
+        prompt_latents = prompt_latents,
+        prompt_discrete_actions = prompt_actions,
+        return_decoded_video = False,
+        return_rewards_per_frame = True,
+        return_agent_actions = True
+    )
+
+    assert gen.latents.shape == (2, 6, 2, 8)
+    assert gen.rewards.shape == (2, 6)
+    assert gen.actions.discrete.shape == (2, 6, 1)
+
+    with pytest.raises(AssertionError):
+        dynamics.generate(
+            2,
+            batch_size = 2,
+            prompt_latents = prompt_latents,
+            return_decoded_video = False,
+            return_rewards_per_frame = True,
+            return_agent_actions = True
+        )
+
+def test_action_conditioned_reward_embed_short_mtp_loss():
+    from dreamer4.dreamer4 import DynamicsWorldModel
+
+    dynamics = DynamicsWorldModel(
+        dim = 32,
+        dim_latent = 8,
+        max_steps = 16,
+        num_latent_tokens = 2,
+        num_spatial_tokens = 2,
+        depth = 1,
+        time_block_every = 1,
+        attn_heads = 2,
+        attn_dim_head = 8,
+        num_discrete_actions = 4,
+        add_reward_embed_to_agent_token = True,
+        multi_token_pred_len = 2,
+        use_loss_normalization = True,
+        predict_terminals = False
+    )
+
+    latents = torch.randn(2, 1, 2, 8)
+    actions = torch.randint(0, 4, (2, 1, 1))
+    rewards = torch.randn(2, 1)
+
+    loss, losses = dynamics(
+        latents = latents,
+        discrete_actions = actions,
+        rewards = rewards,
+        return_all_losses = True
+    )
+
+    assert loss.numel() == 1
+    assert losses.rewards.shape == (2,)
+    assert losses.discrete_actions.shape == (2,)
+
+def test_actionless_reward_generation_keeps_current_alignment():
+    from dreamer4.dreamer4 import DynamicsWorldModel
+
+    dynamics = DynamicsWorldModel(
+        dim = 32,
+        dim_latent = 8,
+        max_steps = 16,
+        num_latent_tokens = 2,
+        num_spatial_tokens = 2,
+        depth = 1,
+        time_block_every = 1,
+        attn_heads = 2,
+        attn_dim_head = 8,
+        predict_terminals = False
+    )
+
+    latents = torch.randn(2, 4, 2, 8)
+    rewards = torch.randn(2, 4)
+
+    loss = dynamics(
+        latents = latents,
+        rewards = rewards
+    )
+
+    gen = dynamics.generate(
+        4,
+        batch_size = 2,
+        return_decoded_video = False,
+        return_rewards_per_frame = True
+    )
+
+    assert loss.numel() == 1
+    assert gen.latents.shape == (2, 4, 2, 8)
+    assert gen.rewards.shape == (2, 4)
+
 def test_action_embedder():
     from dreamer4.dreamer4 import ActionEmbedder
 

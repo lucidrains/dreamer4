@@ -3657,11 +3657,9 @@ class DynamicsWorldModel(Module):
             learned_embedding = False
         )
 
-        reward_pred_dim = dim * 2 if self.action_embedder.has_actions else dim
-
         to_reward_pred = Sequential(
-            RMSNorm(reward_pred_dim),
-            LinearNoBias(reward_pred_dim, self.reward_encoder.num_bins)
+            RMSNorm(dim),
+            LinearNoBias(dim, self.reward_encoder.num_bins)
         )
 
         self.to_reward_pred = Ensemble(
@@ -3867,22 +3865,6 @@ class DynamicsWorldModel(Module):
         return exists(self.video_tokenizer) or self.has_aux_image_encoder
 
     # types of parameters
-
-    def reward_pred_input(
-        self,
-        agent_tokens,
-        action_tokens = None
-    ):
-        if not self.action_embedder.has_actions:
-            return agent_tokens
-
-        if not exists(action_tokens):
-            action_tokens = torch.zeros_like(agent_tokens)
-        else:
-            action_tokens = pad_right_at_dim_to(action_tokens, agent_tokens.shape[-2], dim = -2)
-            action_tokens = action_tokens[..., :agent_tokens.shape[-2], :]
-
-        return cat((agent_tokens, action_tokens), dim = -1)
 
     def muon_parameters(self):
         params = self.transformer.muon_parameters()
@@ -4903,6 +4885,7 @@ class DynamicsWorldModel(Module):
 
         return_agent_actions |= return_log_probs_and_values
         sample_agent_actions = self.action_embedder.has_actions and (return_agent_actions or return_rewards_per_frame)
+        reward_from_post_transition = return_rewards_per_frame and self.action_embedder.has_actions
 
         if sample_agent_actions:
             num_discrete_action_types = self.action_embedder.num_discrete_action_types
@@ -4913,6 +4896,15 @@ class DynamicsWorldModel(Module):
         else:
             decoded_discrete_actions = prompt_discrete_actions
             decoded_continuous_actions = prompt_continuous_actions
+
+        def decoded_action_len():
+            if exists(decoded_discrete_actions):
+                return decoded_discrete_actions.shape[1]
+
+            if exists(decoded_continuous_actions):
+                return decoded_continuous_actions.shape[1]
+
+            return 0
 
         # policy optimization related
 
@@ -4937,6 +4929,45 @@ class DynamicsWorldModel(Module):
             else:
                 decoded_rewards = empty((batch_size, 0), device = self.device, dtype = torch.float32)
 
+        if reward_from_post_transition and latents.shape[1] > 0:
+            action_len = decoded_action_len()
+            required_action_len = min(latents.shape[1], time_steps)
+
+            assert action_len >= required_action_len, 'action-conditioned prompted generation requires prompt actions through the last prompt state'
+
+            prompt_reward_len = min(latents.shape[1] - 1, time_steps)
+
+            if prompt_reward_len > decoded_rewards.shape[1]:
+                prompt_discrete = decoded_discrete_actions[:, :latents.shape[1]] if exists(decoded_discrete_actions) else None
+                prompt_continuous = decoded_continuous_actions[:, :latents.shape[1]] if exists(decoded_continuous_actions) else None
+
+                _, (prompt_embeds, _) = self.forward(
+                    latents = latents,
+                    signal_levels = self.max_steps - 1,
+                    step_sizes = step_size,
+                    rewards = decoded_rewards,
+                    tasks = tasks,
+                    latent_gene_ids = latent_gene_ids,
+                    discrete_actions = prompt_discrete,
+                    continuous_actions = prompt_continuous,
+                    proprio = proprio if has_proprio else None,
+                    latent_is_noised = True,
+                    latent_has_view_dim = True,
+                    return_pred_only = True,
+                    return_intermediates = True,
+                )
+
+                prompt_agent_embed = prompt_embeds.agent
+
+                if prompt_agent_embed.ndim == 4:
+                    prompt_agent_embed = prompt_agent_embed[:, :, agent_index]
+
+                reward_logits = self.to_reward_pred.forward_one(prompt_agent_embed[:, 1:(prompt_reward_len + 1)], id = 0)
+                prompt_pred_rewards = self.reward_encoder.bins_to_scalar_value(reward_logits)
+                prompt_pred_rewards = prompt_pred_rewards[:, decoded_rewards.shape[1]:prompt_reward_len]
+
+                decoded_rewards = cat((decoded_rewards, prompt_pred_rewards), dim = 1)
+
         # maybe return terminals
 
         decoded_terminals = torch.zeros((batch_size,), device = self.device, dtype = torch.bool)
@@ -4946,7 +4977,9 @@ class DynamicsWorldModel(Module):
 
         # while all the frames of the video (per latent) is not generated
 
-        while latents.shape[1] < time_steps:
+        generation_time_steps = time_steps + int(reward_from_post_transition)
+
+        while latents.shape[1] < generation_time_steps:
 
             curr_time_steps = latents.shape[1]
 
@@ -5086,7 +5119,7 @@ class DynamicsWorldModel(Module):
 
             # maybe predict terminals
 
-            if should_predict_terminals:
+            if should_predict_terminals and (not reward_from_post_transition or curr_time_steps > 0):
                 pooled_latents = reduce(denoised_latent, 'b t v n d -> b t d', 'mean')
                 state_terminal_logits = self.to_state_terminal_pred(pooled_latents)
 
@@ -5096,69 +5129,83 @@ class DynamicsWorldModel(Module):
                 is_terminal = rearrange(is_terminal, 'b 1 -> b')
 
                 just_terminated = is_terminal & ~decoded_terminals
-                decoded_lens.masked_fill_(just_terminated, curr_time_steps + 1)
+                terminal_lens = curr_time_steps if reward_from_post_transition else curr_time_steps + 1
+                terminal_lens = max(1, min(terminal_lens, time_steps))
+                decoded_lens.masked_fill_(just_terminated, terminal_lens)
                 decoded_terminals |= is_terminal
 
             # maybe store agent embed
 
-            if store_agent_embed:
+            if store_agent_embed and not sample_agent_actions:
                 acc_agent_embed = safe_cat((acc_agent_embed, one_agent_embed), dim = 1)
 
             # decode the agent actions if needed
-
-            sampled_action_token = None
 
             if sample_agent_actions:
                 assert self.action_embedder.has_actions
 
                 policy_embed = self.policy_head(one_agent_embed)
 
-                # maybe store old actions
+                num_sampled_actions = decoded_action_len()
 
-                if return_agent_actions and store_old_action_unembeds:
-                    acc_policy_embed = safe_cat((acc_policy_embed, policy_embed), dim = 1)
+                if num_sampled_actions < time_steps:
 
-                # sample actions
+                    # maybe store old actions
 
-                sampled_discrete_actions, sampled_continuous_actions = self.action_embedder.sample(
-                    policy_embed,
-                    pred_head_index = 0,
-                    squeeze = True,
-                    discrete_temperature = discrete_temperature,
-                    continuous_temperature = continuous_temperature
-                )
+                    if return_agent_actions and store_old_action_unembeds:
+                        acc_policy_embed = safe_cat((acc_policy_embed, policy_embed), dim = 1)
 
-                decoded_discrete_actions = safe_cat((decoded_discrete_actions, sampled_discrete_actions), dim = 1)
-                decoded_continuous_actions = safe_cat((decoded_continuous_actions, sampled_continuous_actions), dim = 1)
+                    # sample actions
 
-                sampled_action_token = self.action_embedder(
-                    discrete_actions = sampled_discrete_actions,
-                    continuous_actions = sampled_continuous_actions
-                )
-                sampled_action_token = add('1 d, b t d', self.action_learned_embed, sampled_action_token)
-
-                if return_log_probs_and_values:
-                    discrete_log_probs, continuous_log_probs = self.action_embedder.log_probs(
+                    sampled_discrete_actions, sampled_continuous_actions = self.action_embedder.sample(
                         policy_embed,
                         pred_head_index = 0,
-                        discrete_targets = sampled_discrete_actions,
-                        continuous_targets = sampled_continuous_actions,
+                        squeeze = True,
+                        discrete_temperature = discrete_temperature,
+                        continuous_temperature = continuous_temperature
                     )
 
-                    decoded_discrete_log_probs = safe_cat((decoded_discrete_log_probs, discrete_log_probs), dim = 1)
-                    decoded_continuous_log_probs = safe_cat((decoded_continuous_log_probs, continuous_log_probs), dim = 1)
+                    decoded_discrete_actions = safe_cat((decoded_discrete_actions, sampled_discrete_actions), dim = 1)
+                    decoded_continuous_actions = safe_cat((decoded_continuous_actions, sampled_continuous_actions), dim = 1)
 
-                    value_bins = self.value_head(one_agent_embed)
-                    values = self.value_encoder.bins_to_scalar_value(value_bins)
+                    if store_agent_embed:
+                        acc_agent_embed = safe_cat((acc_agent_embed, one_agent_embed), dim = 1)
 
-                    decoded_values = safe_cat((decoded_values, values), dim = 1)
+                    if return_log_probs_and_values:
+                        discrete_log_probs, continuous_log_probs = self.action_embedder.log_probs(
+                            policy_embed,
+                            pred_head_index = 0,
+                            discrete_targets = sampled_discrete_actions,
+                            continuous_targets = sampled_continuous_actions,
+                        )
+
+                        decoded_discrete_log_probs = safe_cat((decoded_discrete_log_probs, discrete_log_probs), dim = 1)
+                        decoded_continuous_log_probs = safe_cat((decoded_continuous_log_probs, continuous_log_probs), dim = 1)
+
+                        value_bins = self.value_head(one_agent_embed)
+                        values = self.value_encoder.bins_to_scalar_value(value_bins)
+
+                        decoded_values = safe_cat((decoded_values, values), dim = 1)
 
             if return_rewards_per_frame:
-                reward_input = self.reward_pred_input(one_agent_embed, sampled_action_token)
-                reward_logits = self.to_reward_pred.forward_one(reward_input, id = 0)
-                pred_reward = self.reward_encoder.bins_to_scalar_value(reward_logits)
+                should_decode_reward = True
 
-                decoded_rewards = cat((decoded_rewards, pred_reward), dim = 1)
+                if reward_from_post_transition:
+                    num_rewards = decoded_rewards.shape[1]
+                    num_actions = decoded_action_len()
+
+                    should_decode_reward = (
+                        curr_time_steps > 0 and
+                        num_rewards == curr_time_steps - 1 and
+                        num_actions > num_rewards and
+                        num_rewards < time_steps
+                    )
+
+                if should_decode_reward:
+                    reward_logits = self.to_reward_pred.forward_one(one_agent_embed, id = 0)
+                    pred_reward = self.reward_encoder.bins_to_scalar_value(reward_logits)
+
+                    decoded_rewards = cat((decoded_rewards, pred_reward), dim = 1)
 
             # concat the denoised latent
 
@@ -5183,6 +5230,39 @@ class DynamicsWorldModel(Module):
         # restore state
 
         self.train(was_training)
+
+        public_time_steps = time_steps
+
+        if reward_from_post_transition and exists(decoded_rewards):
+            public_time_steps = min(public_time_steps, decoded_rewards.shape[1])
+
+        decoded_lens = decoded_lens.clamp(max = public_time_steps)
+
+        latents = latents[:, :public_time_steps]
+
+        if has_proprio:
+            proprio = proprio[:, :public_time_steps]
+
+        if exists(decoded_rewards):
+            decoded_rewards = decoded_rewards[:, :public_time_steps]
+
+        if exists(decoded_discrete_actions):
+            decoded_discrete_actions = decoded_discrete_actions[:, :public_time_steps]
+
+        if exists(decoded_continuous_actions):
+            decoded_continuous_actions = decoded_continuous_actions[:, :public_time_steps]
+
+        if exists(decoded_discrete_log_probs):
+            decoded_discrete_log_probs = decoded_discrete_log_probs[:, :public_time_steps]
+
+        if exists(decoded_continuous_log_probs):
+            decoded_continuous_log_probs = decoded_continuous_log_probs[:, :public_time_steps]
+
+        if exists(decoded_values):
+            decoded_values = decoded_values[:, :public_time_steps]
+
+        if exists(acc_agent_embed):
+            acc_agent_embed = acc_agent_embed[:, :public_time_steps]
 
         # returning video
 
@@ -5347,8 +5427,10 @@ class DynamicsWorldModel(Module):
 
         if exists(rewards):
             rewards_len = rewards.shape[1]
-            assert rewards_len in {time, time - 1}, f'rewards must have time length of either {time} or {time - 1}, but got {rewards_len}'
-            assert return_pred_only or rewards_len == time, f'during training, rewards must perfectly align with video length {time}, got {rewards_len}'
+            if return_pred_only:
+                assert 0 <= rewards_len <= time, f'during prediction, rewards must have time length from 0 to {time}, but got {rewards_len}'
+            else:
+                assert rewards_len == time, f'during training, rewards must perfectly align with video length {time}, got {rewards_len}'
 
         # signal and step size related input conforming
 
@@ -5487,12 +5569,18 @@ class DynamicsWorldModel(Module):
 
                 reward_tokens = self.reward_encoder.embed(two_hot_encoding)
 
-                pop_last_reward = int(reward_tokens.shape[1] == agent_tokens.shape[1]) # the last reward is popped off during training, during inference, it is not known yet, so need to handle this edge case
-
                 is_sequential_step = exists(time_cache) and time == 1 and reward_tokens.shape[1] == 1
 
                 if not is_sequential_step:
-                    reward_tokens = pad_at_dim(reward_tokens, (1, -pop_last_reward), dim = -2, value = 0.)  # shift as each agent token predicts the next reward
+                    # Shift rewards right so agent token t receives only already-known rewards.
+                    # Action-conditioned reward heads train from post-transition token t + 1,
+                    # so world-model training needs a second pad to avoid feeding reward t
+                    # into the token used to predict it. Policy replay and sequential env
+                    # interaction keep the one-step shift, preserving previous-reward context.
+                    reward_shift = 2 if self.action_embedder.has_actions and not return_pred_only else 1
+                    reward_tokens = pad_at_dim(reward_tokens, (reward_shift, 0), dim = -2, value = 0.)
+                    reward_tokens = pad_right_at_dim_to(reward_tokens, agent_tokens.shape[1], dim = -2)
+                    reward_tokens = reward_tokens[:, :agent_tokens.shape[1]]
 
                 reward_tokens = add('1 d, b t d', self.reward_learned_embed, reward_tokens)
 
@@ -5855,7 +5943,7 @@ class DynamicsWorldModel(Module):
 
         # now take care of the agent token losses
 
-        reward_loss = self.zero
+        reward_loss = torch.zeros((self.multi_token_pred_len,), device = device)
         state_terminal_loss = self.zero
 
         needs_agent_pred = exists(rewards)
@@ -5866,34 +5954,35 @@ class DynamicsWorldModel(Module):
             if encoded_agent_tokens.ndim == 4:
                 encoded_agent_tokens = reduce(encoded_agent_tokens, 'b t g d -> b t d', 'mean')
 
-            agent_tokens_shifted = encoded_agent_tokens[:, :-1]
-
         if exists(rewards):
-            reward_agent_tokens = agent_tokens_shifted
-            reward_action_tokens = next_action_tokens
-
-            if exists(reward_action_tokens):
-                reward_action_tokens = reward_action_tokens[:, :reward_agent_tokens.shape[1]]
-
-            reward_input = self.reward_pred_input(reward_agent_tokens, reward_action_tokens)
-            reward_pred_time = reward_input.shape[-2]
-
-            reward_pred = self.to_reward_pred(reward_input)
-
-            reward_pred = rearrange(reward_pred, 'mtp b t l -> b l t mtp')
-
-            reward_targets, reward_loss_mask = create_multi_token_prediction_targets(two_hot_encoding[:, :reward_pred_time], self.multi_token_pred_len)
-
-            reward_targets = rearrange(reward_targets, 'b t mtp l -> b l t mtp')
-
-            reward_losses = -(reward_targets * reward_pred.log_softmax(dim = 1)).sum(dim = 1)
-
-            reward_losses = reward_losses.masked_fill(~reward_loss_mask, 0.)
-
-            if is_var_len:
-                reward_loss = reward_losses[loss_mask_without_last[:, :reward_pred_time]].mean(dim = 0)
+            if self.action_embedder.has_actions:
+                # Predict transition rewards from post-transition agent tokens.
+                # With shifted action tokens, agent[t + 1] has seen action[t] in
+                # the transformer backbone, without leaking action[t] into policy[t].
+                reward_agent_tokens = encoded_agent_tokens[:, 1:]
             else:
-                reward_loss = reduce(reward_losses, '... mtp -> mtp', 'mean') # they sum across the prediction steps (mtp dimension) - eq(9)
+                reward_agent_tokens = encoded_agent_tokens[:, :-1]
+
+            reward_pred_time = min(reward_agent_tokens.shape[1], rewards.shape[1])
+
+            if reward_pred_time > 0:
+                reward_agent_tokens = reward_agent_tokens[:, :reward_pred_time]
+                reward_pred = self.to_reward_pred(reward_agent_tokens)
+
+                reward_pred = rearrange(reward_pred, 'mtp b t l -> b l t mtp')
+
+                reward_targets, reward_loss_mask = create_multi_token_prediction_targets(two_hot_encoding[:, :reward_pred_time], self.multi_token_pred_len)
+
+                reward_targets = rearrange(reward_targets, 'b t mtp l -> b l t mtp')
+
+                reward_losses = -(reward_targets * reward_pred.log_softmax(dim = 1)).sum(dim = 1)
+
+                reward_losses = reward_losses.masked_fill(~reward_loss_mask, 0.)
+
+                if is_var_len:
+                    reward_loss = reward_losses[loss_mask_without_last[:, :reward_pred_time]].mean(dim = 0)
+                else:
+                    reward_loss = reduce(reward_losses, '... mtp -> mtp', 'mean') # they sum across the prediction steps (mtp dimension) - eq(9)
 
         # terminal prediction loss
 
@@ -5944,8 +6033,8 @@ class DynamicsWorldModel(Module):
 
         # maybe autoregressive action loss
 
-        discrete_action_loss = self.zero
-        continuous_action_loss = self.zero
+        discrete_action_loss = torch.zeros((self.multi_token_pred_len,), device = device)
+        continuous_action_loss = torch.zeros((self.multi_token_pred_len,), device = device)
 
         has_action_loss_weight = (self.discrete_action_loss_weight.sum() + self.continuous_action_loss_weight.sum()) > 0
 
