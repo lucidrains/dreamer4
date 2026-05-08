@@ -484,15 +484,17 @@ def eval_tokenizer_on_experience(
         return None
 
     if max_samples > 0 and states.shape[0] > max_samples:
-        indices = torch.randperm(states.shape[0], device = device)[:max_samples]
+        indices = torch.linspace(0, states.shape[0] - 1, max_samples, device = device).long()
         states = states[indices]
+
+    sample_count = states.shape[0]
 
     was_training = tokenizer.training
     tokenizer.eval()
     loss = tokenizer(states)
     tokenizer.train(was_training)
 
-    return loss.item()
+    return loss.item(), sample_count
 
 
 def train_world_model(
@@ -828,7 +830,8 @@ def main(
 
     for loop in pbar:
         world_model.eval()
-        tokenizer_eval_losses = []
+        tokenizer_eval_loss_sum = 0.
+        tokenizer_eval_sample_count = 0
 
         for rollout_idx in range(rollouts_per_loop):
             exp = world_model.interact_with_env(
@@ -849,14 +852,16 @@ def main(
                 )
 
                 if exists(tokenizer_eval_loss):
-                    tokenizer_eval_losses.append(tokenizer_eval_loss)
+                    loss, sample_count = tokenizer_eval_loss
+                    tokenizer_eval_loss_sum += loss * sample_count
+                    tokenizer_eval_sample_count += sample_count
 
             replay.append(exp.to("cpu"))
             recent_returns.extend(exp.episode_return.detach().cpu().tolist())
 
         avg_return = float(np.mean(recent_returns)) if len(recent_returns) > 0 else 0.
         avg_length = float(np.mean([exp.lens.float().mean().item() for exp in replay])) if len(replay) > 0 else 0.
-        tokenizer_policy_recon_loss = float(np.mean(tokenizer_eval_losses)) if len(tokenizer_eval_losses) > 0 else None
+        tokenizer_policy_recon_loss = tokenizer_eval_loss_sum / tokenizer_eval_sample_count if tokenizer_eval_sample_count > 0 else None
 
         log_scalars(
             writer,
