@@ -481,6 +481,64 @@ def test_action_embedder():
 
     assert action_embed.shape == (2, 3, 512)
 
+    embedder = ActionEmbedder(
+        512,
+        num_continuous_actions = 2,
+        continuous_dist_type = "beta",
+        continuous_target_action_range = (-1., 1.)
+    )
+
+    action_types = embedder.default_continuous_action_types
+    conditioned_actions = embedder.condition_continuous_actions(
+        torch.tensor([[[0.5, 0.25]]]),
+        action_types
+    )
+
+    assert torch.allclose(conditioned_actions, torch.tensor([[[0., -0.5]]]))
+
+    embedder = ActionEmbedder(
+        2,
+        num_continuous_actions = 1,
+        continuous_dist_type = "beta",
+        continuous_target_action_range = (-1., 1.)
+    )
+
+    with torch.no_grad():
+        embedder.continuous_action_embed.weight.copy_(torch.tensor([[1.], [0.]]))
+        embedder.continuous_action_embed_scale.fill_(1.)
+
+    small_action = embedder(continuous_actions = torch.tensor([[[0.55]]]))
+    large_action = embedder(continuous_actions = torch.tensor([[[1.]]]))
+
+    assert large_action.norm() > small_action.norm() * 5.
+
+    embedder = ActionEmbedder(
+        3,
+        num_continuous_actions = 3,
+        continuous_dist_type = "beta",
+        continuous_target_action_range = (-1., 1.)
+    )
+
+    with torch.no_grad():
+        embedder.continuous_action_embed.weight.copy_(torch.eye(3))
+        embedder.continuous_action_embed_scale.fill_(1.)
+
+    subset_action_embed = embedder(
+        continuous_actions = torch.tensor([[[0.5, 1.]]]),
+        continuous_action_types = (0, 2)
+    )
+
+    assert torch.allclose(subset_action_embed, torch.tensor([[[0., 0., 1.]]]))
+
+    subset_action_embeds = embedder(
+        continuous_actions = torch.tensor([[[0.5, 1.]]]),
+        continuous_action_types = (0, 2),
+        return_sum_pooled_embeds = False
+    )
+
+    assert subset_action_embeds.continuous.shape == (1, 1, 2, 3)
+    assert torch.allclose(subset_action_embeds.continuous, torch.tensor([[[[0., 0., 0.], [0., 0., 1.]]]]))
+
     # 2 discrete actions with 4 choices each and 2 continuous actions
 
     embedder = ActionEmbedder(

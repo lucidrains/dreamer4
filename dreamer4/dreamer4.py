@@ -858,7 +858,13 @@ class ActionEmbedder(Module):
         # continuous actions
 
         self.num_continuous_action_types = num_continuous_actions
-        self.continuous_action_embed = Embedding(num_continuous_actions, dim)
+        self.continuous_action_embed = None
+        self.continuous_action_embed_scale = None
+
+        if self.num_continuous_action_types > 0:
+            self.continuous_action_embed = Linear(num_continuous_actions, dim, bias = False)
+            nn.init.normal_(self.continuous_action_embed.weight, std = (num_continuous_actions * dim) ** -0.5)
+            self.continuous_action_embed_scale = Parameter(tensor(1.))
 
         self.continuous_need_norm = exists(continuous_norm_stats)
 
@@ -939,9 +945,18 @@ class ActionEmbedder(Module):
         self.continuous_action_unembed = Parameter(torch.randn(num_continuous_actions, num_unembed_preds, unembed_dim, 2) * 1e-2)
 
     def embed_parameters(self):
-        return set([*self.discrete_action_embed.parameters(), *self.continuous_action_embed.parameters()])
+        params = [*self.discrete_action_embed.parameters()]
+
+        if exists(self.continuous_action_embed):
+            params.extend(self.continuous_action_embed.parameters())
+            params.append(self.continuous_action_embed_scale)
+
+        return set(params)
 
     def unembed_parameters(self):
+        if not self.can_unembed:
+            return set()
+
         return set([self.discrete_action_unembed, self.continuous_action_unembed])
 
     @property
@@ -967,6 +982,37 @@ class ActionEmbedder(Module):
             action_types = tensor(action_types, device = self.device)
 
         return action_types
+
+    def condition_continuous_actions(
+        self,
+        continuous_actions,
+        continuous_action_types
+    ):
+        if exists(self.continuous_target_action_range):
+            native_range = (0., 1.) if self.continuous_dist_type == 'beta' else (-1., 1.)
+            continuous_actions = rescale(continuous_actions, native_range, self.continuous_target_action_range)
+
+        if self.continuous_need_norm:
+            norm_mean, norm_std = self.continuous_norm_stats[continuous_action_types].unbind(dim = -1)
+            continuous_actions = (continuous_actions - norm_mean) / norm_std.clamp(min = 1e-6)
+
+        return continuous_actions
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        continuous_embed_key = prefix + 'continuous_action_embed.weight'
+        continuous_scale_key = prefix + 'continuous_action_embed_scale'
+
+        if exists(self.continuous_action_embed) and continuous_embed_key in state_dict:
+            loaded_weight = state_dict[continuous_embed_key]
+            current_weight = self.continuous_action_embed.weight
+
+            if loaded_weight.shape == current_weight.T.shape:
+                state_dict[continuous_embed_key] = loaded_weight.T.contiguous()
+
+        if exists(self.continuous_action_embed_scale) and continuous_scale_key not in state_dict:
+            state_dict[continuous_scale_key] = self.continuous_action_embed_scale.detach().clone()
+
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
 
     def unembed(
         self,
@@ -1216,18 +1262,14 @@ class ActionEmbedder(Module):
             continuous_action_types = default(continuous_action_types, self.default_continuous_action_types)
 
             continuous_action_types = self.cast_action_types(continuous_action_types)
+            continuous_action_types = continuous_action_types.to(device = continuous_actions.device)
 
             assert continuous_action_types.shape[-1] == continuous_actions.shape[-1], 'mismatched number of continuous actions'
 
-            continuous_action_embed = self.continuous_action_embed(continuous_action_types)
+            continuous_actions = self.condition_continuous_actions(continuous_actions, continuous_action_types)
 
-            # maybe normalization
-
-            if self.continuous_need_norm:
-                norm_mean, norm_std = self.continuous_norm_stats.unbind(dim = -1)
-                continuous_actions = (continuous_actions - norm_mean) / norm_std.clamp(min = 1e-6)
-
-            # continuous embed is just the selected continuous action type with the scale
+            continuous_action_embed = rearrange(self.continuous_action_embed.weight[:, continuous_action_types], 'd na -> na d')
+            continuous_action_embed = continuous_action_embed * self.continuous_action_embed_scale
 
             continuous_embeds = multiply('na d, ... na -> ... na d', continuous_action_embed, continuous_actions)
 
