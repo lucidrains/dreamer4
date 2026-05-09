@@ -900,7 +900,6 @@ def train_agent_in_imagination(
             "imagination/action_std": action_std,
             "imagination/prompt_length": prompt_length if exists(prompts) else 0,
             "imagination/grad_norm": float(norm),
-            "imagination/agent_grad_norm": float(norm),
             "imagination/approx_kl_mean": agent_metrics["approx_kl_mean"].item(),
             "imagination/approx_kl_min": agent_metrics["approx_kl_min"].item(),
             "imagination/approx_kl_max": agent_metrics["approx_kl_max"].item(),
@@ -1151,7 +1150,6 @@ def main(
     policy_prior = FrozenPolicyPrior(world_model).to(device) if objective == "pmpo" else None
 
     replay: deque[Experience] = deque(maxlen = replay_size)
-    recent_returns = deque(maxlen = 20)
     wm_step = 0
     imagination_step = 0
 
@@ -1166,6 +1164,7 @@ def main(
         world_model.eval()
         tokenizer_eval_loss_sum = 0.
         tokenizer_eval_sample_count = 0
+        rollout_returns = []
 
         for rollout_idx in range(rollouts_per_loop):
             exp = world_model.interact_with_env(
@@ -1191,16 +1190,16 @@ def main(
                     tokenizer_eval_sample_count += sample_count
 
             replay.append(exp.to("cpu"))
-            recent_returns.extend(exp.episode_return.detach().cpu().tolist())
+            rollout_returns.extend(exp.episode_return.detach().cpu().tolist())
 
-        avg_return = float(np.mean(recent_returns)) if len(recent_returns) > 0 else 0.
+        avg_return = float(np.mean(rollout_returns)) if len(rollout_returns) > 0 else 0.
         avg_length = float(np.mean([exp.lens.float().mean().item() for exp in replay])) if len(replay) > 0 else 0.
         tokenizer_policy_recon_loss = tokenizer_eval_loss_sum / tokenizer_eval_sample_count if tokenizer_eval_sample_count > 0 else None
 
         log_scalars(
             writer,
             {
-                "rollout/average_return_20": avg_return,
+                "rollout/average_return": avg_return,
                 "rollout/replay_size": len(replay),
                 "rollout/average_length": avg_length,
                 "tokenizer/policy_recon_loss": tokenizer_policy_recon_loss,
