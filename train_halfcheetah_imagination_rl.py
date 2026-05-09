@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import random
 import shutil
+from copy import deepcopy
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -354,10 +355,163 @@ def sample_experience_batch(replay: deque[Experience], batch_size: int):
     return slice_experience(exp, indices)
 
 
+def sample_imagination_prompts(
+    replay: deque[Experience],
+    batch_size: int,
+    prompt_length: int,
+    *,
+    device: torch.device,
+):
+    if prompt_length <= 0 or len(replay) == 0:
+        return None
+
+    exp = combine_experiences(sample_experiences(replay, batch_size)).to(device)
+    assert exists(exp.latents)
+    assert exists(exp.actions)
+    assert exists(exp.rewards)
+
+    lens = exp.lens if exists(exp.lens) else torch.full((exp.latents.shape[0],), exp.latents.shape[1], device = device)
+    valid_indices = torch.nonzero(lens >= prompt_length, as_tuple = False).flatten()
+
+    if valid_indices.numel() == 0:
+        return None
+
+    selected = valid_indices[torch.randint(valid_indices.numel(), (batch_size,), device = device)]
+    selected_lens = lens[selected].long()
+    max_starts = (selected_lens - prompt_length).clamp(min = 0)
+    starts = (torch.rand((batch_size,), device = device) * (max_starts + 1).float()).floor().long()
+
+    def take_window(t: Tensor | None, length: int, offset: int = 0):
+        if not exists(t):
+            return None
+
+        if length == 0:
+            return t.new_empty((batch_size, 0, *t.shape[2:]))
+
+        time = starts[:, None] + offset + torch.arange(length, device = device)
+        return t[selected[:, None], time]
+
+    return dict(
+        prompt_latents = take_window(exp.latents, prompt_length),
+        prompt_proprio = take_window(exp.proprio, prompt_length) if exists(exp.proprio) else None,
+        prompt_discrete_actions = take_window(exp.actions.discrete, prompt_length) if exists(exp.actions.discrete) else None,
+        prompt_continuous_actions = take_window(exp.actions.continuous, prompt_length) if exists(exp.actions.continuous) else None,
+        prompt_rewards = take_window(exp.rewards, prompt_length - 1),
+    )
+
+
+def trim_prompt_from_dream(dream: Experience, prompt_length: int, horizon: int):
+    if prompt_length <= 0:
+        return dream
+
+    prompted_tensors = (
+        dream.latents,
+        dream.video,
+        dream.proprio,
+        dream.critic_state,
+        dream.rewards,
+        dream.actions.discrete if exists(dream.actions) else None,
+        dream.actions.continuous if exists(dream.actions) else None,
+    )
+    generated_tensors = (
+        dream.agent_embed,
+        dream.values,
+        dream.log_probs.discrete if exists(dream.log_probs) else None,
+        dream.log_probs.continuous if exists(dream.log_probs) else None,
+        *(dream.old_action_unembeds or ()),
+    )
+
+    available_lengths = [
+        t.shape[1] - prompt_length
+        for t in prompted_tensors
+        if exists(t)
+    ]
+    available_lengths.extend([
+        t.shape[1]
+        for t in generated_tensors
+        if exists(t)
+    ])
+
+    actual_horizon = min(horizon, *available_lengths)
+
+    def trim_prompted(t: Tensor | None):
+        return t[:, prompt_length:prompt_length + actual_horizon] if exists(t) else None
+
+    def trim_generated(t: Tensor | None):
+        return t[:, :actual_horizon] if exists(t) else None
+
+    actions = Actions(
+        trim_prompted(dream.actions.discrete),
+        trim_prompted(dream.actions.continuous),
+    ) if exists(dream.actions) else None
+
+    log_probs = Actions(
+        trim_generated(dream.log_probs.discrete),
+        trim_generated(dream.log_probs.continuous),
+    ) if exists(dream.log_probs) else None
+
+    old_action_unembeds = tuple(trim_generated(t) for t in dream.old_action_unembeds) if exists(dream.old_action_unembeds) else None
+
+    lens = None
+    if exists(dream.lens):
+        lens = (dream.lens - prompt_length).clamp(min = 0, max = actual_horizon)
+
+    rewards = trim_prompted(dream.rewards)
+    episode_return = None
+    if exists(rewards):
+        if exists(lens):
+            mask = torch.arange(actual_horizon, device = rewards.device)[None, :] < lens[:, None]
+            episode_return = (rewards * mask.float()).sum(dim = 1)
+        else:
+            episode_return = rewards.sum(dim = 1)
+
+    return Experience(
+        latents = trim_prompted(dream.latents),
+        video = trim_prompted(dream.video),
+        proprio = trim_prompted(dream.proprio),
+        critic_state = trim_prompted(dream.critic_state),
+        agent_embed = trim_generated(dream.agent_embed),
+        rewards = rewards,
+        terminals = dream.terminals,
+        actions = actions,
+        log_probs = log_probs,
+        old_action_unembeds = old_action_unembeds,
+        values = trim_generated(dream.values),
+        step_size = dream.step_size,
+        lens = lens,
+        is_truncated = dream.is_truncated,
+        agent_index = dream.agent_index,
+        is_from_world_model = dream.is_from_world_model,
+        episode_return = episode_return,
+    )
+
+
 def cat_existing(tensors: tuple[Tensor | None, ...], dim: int = -1):
     tensors = tuple(t for t in tensors if exists(t))
     assert len(tensors) > 0
     return tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim = dim)
+
+
+class FrozenPolicyPrior(nn.Module):
+    def __init__(self, world_model: DynamicsWorldModel):
+        super().__init__()
+        self.policy_head = deepcopy(world_model.policy_head)
+        self.action_embedder = deepcopy(world_model.action_embedder)
+        self.requires_grad_(False)
+        self.eval()
+
+    @torch.no_grad()
+    def refresh_from(self, world_model: DynamicsWorldModel):
+        self.policy_head.load_state_dict(world_model.policy_head.state_dict())
+        self.action_embedder.load_state_dict(world_model.action_embedder.state_dict())
+        self.to(world_model.device)
+        self.requires_grad_(False)
+        self.eval()
+
+    @torch.no_grad()
+    def action_unembeds(self, agent_embeds: Tensor):
+        policy_embed = self.policy_head(agent_embeds.detach())
+        return self.action_embedder.unembed(policy_embed, pred_head_index = 0)
 
 
 @torch.no_grad()
@@ -410,6 +564,56 @@ def agent_approx_kl_metrics(world_model: DynamicsWorldModel, dream: Experience):
         "approx_kl_min": approx_kl.min(),
         "approx_kl_max": approx_kl.max(),
     }
+
+
+@torch.no_grad()
+def agent_prior_kl_metrics(world_model: DynamicsWorldModel, dream: Experience, policy_prior: FrozenPolicyPrior):
+    assert exists(dream.agent_embed)
+
+    agent_embeds = dream.agent_embed.detach()
+    policy_embed = world_model.policy_head(agent_embeds)
+    current_unembeds = world_model.action_embedder.unembed(policy_embed, pred_head_index = 0)
+    prior_unembeds = policy_prior.action_unembeds(agent_embeds)
+
+    if world_model.pmpo_reverse_kl:
+        current_unembeds, prior_unembeds = prior_unembeds, current_unembeds
+
+    kl_values = None
+    for kl_term in world_model.action_embedder.kl_div(current_unembeds, prior_unembeds):
+        if not exists(kl_term):
+            continue
+
+        if kl_term.ndim == 3 and kl_term.shape[-1] == 1:
+            kl_term = rearrange(kl_term, "b t 1 -> b t")
+
+        kl_values = kl_term if not exists(kl_values) else kl_values + kl_term
+
+    assert exists(kl_values)
+
+    lens = dream.lens
+    if exists(lens):
+        policy_time = kl_values.shape[1]
+        is_truncated = dream.is_truncated if exists(dream.is_truncated) else torch.ones_like(lens, dtype = torch.bool)
+        learnable_lens = (lens - is_truncated.long()).clamp(min = 0, max = policy_time)
+        mask = torch.arange(policy_time, device = kl_values.device)[None, :] < learnable_lens[:, None]
+        kl_values = kl_values[mask]
+    else:
+        kl_values = kl_values.reshape(-1)
+
+    if kl_values.numel() == 0:
+        kl_values = agent_embeds.new_zeros((1,))
+
+    return {
+        "prior_kl_mean": kl_values.mean(),
+        "prior_kl_min": kl_values.min(),
+        "prior_kl_max": kl_values.max(),
+    }
+
+
+def attach_policy_prior_unembeds(dream: Experience, policy_prior: FrozenPolicyPrior):
+    assert exists(dream.agent_embed)
+    dream.old_action_unembeds = policy_prior.action_unembeds(dream.agent_embed)
+    return dream
 
 
 def train_tokenizer(
@@ -558,10 +762,14 @@ def train_world_model(
 def train_agent_in_imagination(
     world_model: DynamicsWorldModel,
     optimizer: AdamW,
+    policy_prior: FrozenPolicyPrior | None,
+    replay: deque[Experience],
     *,
     steps: int,
     batch_size: int,
     horizon: int,
+    prompt_length: int,
+    prompt_probability: float,
     generate_steps: int,
     max_grad_norm: float,
     objective: Literal["ppo", "pmpo", "spo"],
@@ -578,16 +786,35 @@ def train_agent_in_imagination(
 
     for _ in pbar:
         with torch.no_grad():
+            use_prompt = random.random() < prompt_probability
+            prompts = sample_imagination_prompts(
+                replay,
+                batch_size,
+                prompt_length,
+                device = world_model.device,
+            ) if use_prompt else None
+
+            generation_horizon = horizon + prompt_length if exists(prompts) else horizon
+
             dream = world_model.generate(
-                horizon,
+                generation_horizon,
                 num_steps = generate_steps,
                 batch_size = batch_size,
                 return_decoded_video = False,
-                return_for_policy_optimization = True,
-                return_terminals = True,
+                return_agent_actions = True,
+                return_log_probs_and_values = True,
+                return_rewards_per_frame = True,
+                return_terminals = False,
                 store_agent_embed = True,
-                store_old_action_unembeds = True,
+                store_old_action_unembeds = objective == "pmpo" and not exists(policy_prior),
+                **(prompts or {}),
             )
+
+            if exists(prompts):
+                dream = trim_prompt_from_dream(dream, prompt_length, horizon)
+
+            if objective == "pmpo" and exists(policy_prior):
+                dream = attach_policy_prior_unembeds(dream, policy_prior)
 
         policy_loss, value_loss = world_model.learn_from_experience(
             dream,
@@ -604,6 +831,8 @@ def train_agent_in_imagination(
         optimizer.zero_grad()
 
         agent_metrics = agent_approx_kl_metrics(world_model, dream)
+        if objective == "pmpo" and exists(policy_prior):
+            agent_metrics.update(agent_prior_kl_metrics(world_model, dream, policy_prior))
 
         dream_return = dream.episode_return.mean().item() if exists(dream.episode_return) else 0.
         dream_len = dream.lens.float().mean().item() if exists(dream.lens) else horizon
@@ -616,11 +845,15 @@ def train_agent_in_imagination(
             "imagination/dream_return": dream_return,
             "imagination/dream_length": dream_len,
             "imagination/action_std": action_std,
+            "imagination/prompt_length": prompt_length if exists(prompts) else 0,
             "imagination/grad_norm": float(norm),
             "imagination/agent_grad_norm": float(norm),
             "imagination/approx_kl_mean": agent_metrics["approx_kl_mean"].item(),
             "imagination/approx_kl_min": agent_metrics["approx_kl_min"].item(),
             "imagination/approx_kl_max": agent_metrics["approx_kl_max"].item(),
+            "imagination/prior_kl_mean": agent_metrics.get("prior_kl_mean", torch.tensor(0.)).item(),
+            "imagination/prior_kl_min": agent_metrics.get("prior_kl_min", torch.tensor(0.)).item(),
+            "imagination/prior_kl_max": agent_metrics.get("prior_kl_max", torch.tensor(0.)).item(),
         }
         last_metrics.update({
             f"imagination/{key}": value
@@ -685,12 +918,16 @@ def main(
     world_model_batch_size = 32,
     world_model_train_steps = 13,
     world_model_learning_rate = 3e-4,
-    imagination_batch_size = 64,
+    imagination_batch_size = 128,
     imagination_horizon = 32,
-    imagination_train_steps = 5,
+    imagination_prompt_length = 8,
+    imagination_prompt_probability = 1.,
+    imagination_train_steps = 3,
     imagination_generate_steps = 4,
     agent_learning_rate = 3e-4,
-    objective: Literal["ppo", "pmpo", "spo"] = "ppo",
+    objective: Literal["ppo", "pmpo", "spo"] = "pmpo",
+    pmpo_pos_to_neg_weight = 0.5,
+    pmpo_kl_div_loss_weight = 0.3,
     use_delight_gating = False,
     agent_predicts_state = True,
     agent_state_pred_loss_weight = 0.1,
@@ -792,6 +1029,8 @@ def main(
         agent_predicts_state = agent_predicts_state,
         agent_state_pred_loss_weight = agent_state_pred_loss_weight,
         gae_discount_factor = 0.99,
+        pmpo_pos_to_neg_weight = pmpo_pos_to_neg_weight,
+        pmpo_kl_div_loss_weight = pmpo_kl_div_loss_weight,
         ppo_eps_clip = 0.2,
         normalize_advantages = True,
         policy_entropy_weight = 0.01,
@@ -815,6 +1054,8 @@ def main(
         world_optimizer.load_state_dict(pkg["world_optimizer"])
         agent_optimizer.load_state_dict(pkg["agent_optimizer"])
         start_loop = int(pkg.get("loop", 0)) + 1
+
+    policy_prior = FrozenPolicyPrior(world_model).to(device) if objective == "pmpo" else None
 
     replay: deque[Experience] = deque(maxlen = replay_size)
     recent_returns = deque(maxlen = 20)
@@ -887,12 +1128,19 @@ def main(
         )
 
         world_model.train()
+        if exists(policy_prior):
+            policy_prior.refresh_from(world_model)
+
         imagination_step, imagination_metrics = train_agent_in_imagination(
             world_model,
             agent_optimizer,
+            policy_prior,
+            replay,
             steps = imagination_train_steps,
             batch_size = imagination_batch_size,
             horizon = imagination_horizon,
+            prompt_length = imagination_prompt_length,
+            prompt_probability = imagination_prompt_probability,
             generate_steps = imagination_generate_steps,
             max_grad_norm = max_grad_norm,
             objective = objective,

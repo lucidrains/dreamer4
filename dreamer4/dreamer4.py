@@ -3363,6 +3363,8 @@ class DynamicsWorldModel(Module):
         pmpo_pos_to_neg_weight = 0.5, # pos and neg equal weight
         pmpo_reverse_kl = True,
         pmpo_kl_div_loss_weight = .3,
+        spo_eps_low = 0.2,
+        spo_eps_high = 0.28,
         use_delight_gating = True,
         delight_temperature = 1.,
         normalize_advantages = None,
@@ -3817,6 +3819,8 @@ class DynamicsWorldModel(Module):
         self.pmpo_pos_to_neg_weight = pmpo_pos_to_neg_weight
         self.pmpo_kl_div_loss_weight = pmpo_kl_div_loss_weight
         self.pmpo_reverse_kl = pmpo_reverse_kl
+        self.spo_eps_low = spo_eps_low
+        self.spo_eps_high = spo_eps_high
 
         # delight related
 
@@ -4398,7 +4402,7 @@ class DynamicsWorldModel(Module):
         normalize_advantages = None,
         eps = 1e-6
     ):
-        use_delight_gating = default(use_delight_gating, self.use_delight_gating)
+        use_delight_gating = default(use_delight_gating, False if objective == 'pmpo' else self.use_delight_gating)
         delight_temperature = default(delight_temperature, self.delight_temperature)
 
         assert isinstance(experience, Experience)
@@ -4524,8 +4528,8 @@ class DynamicsWorldModel(Module):
         # https://arxiv.org/abs/2410.04166v1
 
         if objective == 'pmpo':
-            pos_advantage_mask = advantage >= 0.
-            neg_advantage_mask = ~pos_advantage_mask
+            pos_advantage_mask = advantage > 0.
+            neg_advantage_mask = advantage < 0.
 
         # replay for the action logits and values
         # but only do so if fine tuning the entire world model for RL
@@ -4599,12 +4603,13 @@ class DynamicsWorldModel(Module):
 
         if objective == 'pmpo':
 
-            maybe_gated_log_prob = log_probs
+            joint_log_probs = reduce(log_probs, 'b t na -> b t', 'sum')
+            scalar_advantage = rearrange(advantage, 'b t 1 -> b t')
 
             if use_delight_gating:
                 # Ian Osband - https://arxiv.org/abs/2603.14608v1
-                delight_gate = ((-log_probs * advantage) / delight_temperature).sigmoid().detach()
-                maybe_gated_log_prob = log_probs * delight_gate
+                delight_gate = ((-joint_log_probs * scalar_advantage) / delight_temperature).sigmoid().detach()
+                joint_log_probs = joint_log_probs * delight_gate
 
             pos = pos_advantage_mask
             neg = neg_advantage_mask
@@ -4613,24 +4618,17 @@ class DynamicsWorldModel(Module):
                 pos = pos & mask
                 neg = neg & mask
 
-            scaled_action_log_probs = maybe_gated_log_prob * advantage.tanh().abs()
-
-            num_actions = scaled_action_log_probs.shape[-1]
-            pos = repeat(pos, 'b t -> b t na', na = num_actions)
-            neg = repeat(neg, 'b t -> b t na', na = num_actions)
-
-            pos_loss, neg_loss = 0., 0.
+            pos_loss = joint_log_probs.new_zeros(())
+            neg_loss = joint_log_probs.new_zeros(())
 
             if pos.any():
-                pos_loss = scaled_action_log_probs[pos].sum()
+                pos_loss = -joint_log_probs[pos].mean()
 
             if neg.any():
-                neg_loss = scaled_action_log_probs[neg].sum()
-
-            num_advantages = max(1., mask.sum().item() if exists(mask) else advantage.numel())
+                neg_loss = joint_log_probs[neg].mean()
 
             α = self.pmpo_pos_to_neg_weight
-            policy_loss = -α * (pos_loss - neg_loss) / num_advantages
+            policy_loss = α * pos_loss + (1. - α) * neg_loss
 
             # take care of kl
 
@@ -4662,20 +4660,30 @@ class DynamicsWorldModel(Module):
 
         elif objective == 'spo':
 
-            # spo clipped surrogate loss
+            # SPO trust-region objective using joint action probability ratios.
+            # The asymmetric epsilon gives more room when the policy moves in
+            # the advantage-improving direction and keeps opposing drift tight.
 
-            ratio = (log_probs - old_log_probs).exp()
+            joint_log_probs = reduce(log_probs, 'b t na -> b t', 'sum')
+            joint_old_log_probs = reduce(old_log_probs, 'b t na -> b t', 'sum')
+            scalar_advantage = rearrange(advantage, 'b t 1 -> b t')
+
+            ratio = (joint_log_probs - joint_old_log_probs).exp()
+            ratio_diff = ratio - 1.
+            eps = torch.where(
+                scalar_advantage * ratio_diff > 0.,
+                torch.full_like(scalar_advantage, self.spo_eps_high),
+                torch.full_like(scalar_advantage, self.spo_eps_low)
+            )
 
             policy_loss = -(
-                ratio * advantage -
-                (advantage.abs() * (ratio - 1.).square()) / (2 * self.ppo_eps_clip)
+                scalar_advantage * ratio -
+                scalar_advantage.abs() * ratio_diff.square() / (2. * eps)
             )
 
             if use_delight_gating:
-                delight_gate = ((-log_probs * advantage) / delight_temperature).sigmoid().detach()
+                delight_gate = ((-joint_log_probs * scalar_advantage) / delight_temperature).sigmoid().detach()
                 policy_loss = policy_loss * delight_gate
-
-            policy_loss = reduce(policy_loss, 'b t na -> b t', 'sum')
 
             policy_loss = masked_mean(policy_loss, mask)
 
