@@ -1268,17 +1268,19 @@ class ActionEmbedder(Module):
 
             continuous_actions = self.condition_continuous_actions(continuous_actions, continuous_action_types)
 
-            continuous_action_embed = rearrange(self.continuous_action_embed.weight[:, continuous_action_types], 'd na -> na d')
-            continuous_action_embed = continuous_action_embed * self.continuous_action_embed_scale
+            continuous_action_weight = self.continuous_action_embed.weight[:, continuous_action_types]
+            continuous_embeds = F.linear(continuous_actions, continuous_action_weight) * self.continuous_action_embed_scale
 
-            continuous_embeds = multiply('na d, ... na -> ... na d', continuous_action_embed, continuous_actions)
+            if not return_sum_pooled_embeds:
+                continuous_action_embed = rearrange(continuous_action_weight, 'd na -> na d') * self.continuous_action_embed_scale
+                continuous_embeds = multiply('na d, ... na -> ... na d', continuous_action_embed, continuous_actions)
 
         # return not pooled
 
         if not return_sum_pooled_embeds:
             return ActionEmbeds(discrete_embeds, continuous_embeds)
 
-        # handle sum pooling, which is what they did in the paper for all the actions
+        # handle joint action projection / pooling, which is what they did in the paper for all the actions
 
         pooled = 0.
 
@@ -1286,7 +1288,7 @@ class ActionEmbedder(Module):
             pooled = pooled + reduce(discrete_embeds, '... na d -> ... d', 'sum')
 
         if exists(continuous_embeds):
-            pooled = pooled + reduce(continuous_embeds, '... na d -> ... d', 'sum')
+            pooled = pooled + continuous_embeds
 
         return pooled
 
@@ -3372,6 +3374,7 @@ class DynamicsWorldModel(Module):
         prob_shortcut_train = None,                  # probability of shortcut training, defaults to 1 - 1 / num_step_sizes
         add_reward_embed_to_agent_token = False,
         add_reward_embed_dropout = 0.1,
+        add_action_embed_to_agent_token = False,
         add_state_pred_head = False,
         state_pred_loss_weight = 0.1,
         state_entropy_bonus_weight = 0.05,
@@ -3680,6 +3683,9 @@ class DynamicsWorldModel(Module):
         self.add_reward_embed_to_agent_token = add_reward_embed_to_agent_token
         self.add_reward_embed_dropout = add_reward_embed_dropout
 
+        self.add_action_embed_to_agent_token = add_action_embed_to_agent_token
+        self.action_to_agent_embed_scale = Parameter(tensor(1.)) if add_action_embed_to_agent_token else None
+
         reward_encoder_klass = dict(
             symexp_two_hot = SymExpTwoHot,
             hl_gauss = HLGaussRewardEncoder,
@@ -3909,6 +3915,16 @@ class DynamicsWorldModel(Module):
     @property
     def has_image_encoder(self):
         return exists(self.video_tokenizer) or self.has_aux_image_encoder
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        action_to_agent_scale_key = prefix + 'action_to_agent_embed_scale'
+
+        if exists(self.action_to_agent_embed_scale) and action_to_agent_scale_key not in state_dict:
+            state_dict[action_to_agent_scale_key] = self.action_to_agent_embed_scale.detach().clone()
+        elif not exists(self.action_to_agent_embed_scale) and action_to_agent_scale_key in state_dict:
+            state_dict.pop(action_to_agent_scale_key)
+
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
 
     # types of parameters
 
@@ -5709,6 +5725,12 @@ class DynamicsWorldModel(Module):
         else:
             action_tokens = empty_token
             next_action_tokens = None
+
+        if self.add_action_embed_to_agent_token and self.action_embedder.has_actions:
+            assert self.num_agents == 1, 'adding action embeddings to agent tokens only supports the single agent case for now'
+
+            action_agent_tokens = rearrange(action_tokens, 'b t d -> b t 1 d') if action_tokens.ndim == 3 else action_tokens
+            agent_tokens = agent_tokens + action_agent_tokens * self.action_to_agent_embed_scale
 
         # main function, needs to be defined as such for shortcut training - additional calls for consistency loss
 

@@ -864,6 +864,29 @@ def test_dream_trainer():
 
     dream_trainer()
 
+def test_action_embed_agent_token_checkpoint_compat():
+    from dreamer4.dreamer4 import DynamicsWorldModel
+
+    def make_model(add_action_embed_to_agent_token):
+        return DynamicsWorldModel(
+            dim = 16,
+            dim_latent = 16,
+            max_steps = 64,
+            num_latent_tokens = 1,
+            depth = 1,
+            time_block_every = 1,
+            num_spatial_tokens = 1,
+            num_discrete_actions = 4,
+            attn_dim_head = 16,
+            add_action_embed_to_agent_token = add_action_embed_to_agent_token
+        )
+
+    with_action_agent_embed = make_model(True)
+    without_action_agent_embed = make_model(False)
+
+    with_action_agent_embed.load_state_dict(without_action_agent_embed.state_dict())
+    without_action_agent_embed.load_state_dict(with_action_agent_embed.state_dict())
+
 def test_cache_generate():
     from dreamer4.dreamer4 import DynamicsWorldModel
 
