@@ -28,9 +28,10 @@ import gymnasium as gym
 import numpy as np
 import torch
 from einops import rearrange
+from adam_atan2_pytorch import MuonAdamAtan2
 from torch import Tensor, nn
 from torch.nn.utils import clip_grad_norm_
-from torch.optim import AdamW
+from torch.optim import AdamW, Optimizer
 from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -221,11 +222,63 @@ def split_world_model_and_agent_params(world_model: DynamicsWorldModel):
     return world_params, list(agent_params)
 
 
+def unique_parameters(params):
+    seen = set()
+    out = []
+
+    for param in params:
+        if param in seen:
+            continue
+
+        seen.add(param)
+        out.append(param)
+
+    return out
+
+
+MUON_BYPASS_UPDATE_SENTINEL = "__dreamer4_default_muon_bypass_update__"
+
+
+def default_muon_bypass_update_fn(ndim: int):
+    return ndim < 2 or ndim > 3
+
+
+def make_optimizer(
+    params,
+    *,
+    lr: float,
+    weight_decay: float,
+    use_muon: bool,
+    muon_params = (),
+):
+    params = unique_parameters(params)
+
+    if not use_muon:
+        return AdamW(params, lr = lr, weight_decay = weight_decay)
+
+    optimizer_param_set = set(params)
+    muon_params = [
+        param for param in unique_parameters(muon_params)
+        if param in optimizer_param_set
+    ]
+
+    if len(muon_params) == 0:
+        return AdamW(params, lr = lr, weight_decay = weight_decay)
+
+    return MuonAdamAtan2(
+        muon_params = muon_params,
+        params = params,
+        lr = lr,
+        weight_decay = weight_decay,
+        muon_bypass_update_fn = default_muon_bypass_update_fn,
+    )
+
+
 def module_parameters(module: nn.Module | None):
     return [] if not exists(module) else list(module.parameters())
 
 
-def optimizer_parameters(optimizer: AdamW):
+def optimizer_parameters(optimizer: Optimizer):
     return [param for group in optimizer.param_groups for param in group["params"]]
 
 
@@ -278,7 +331,7 @@ def clip_grad_norm_by_group(
     return sqrt(total_norm_sq), metrics
 
 
-def world_model_clip_groups(world_model: DynamicsWorldModel, optimizer: AdamW):
+def world_model_clip_groups(world_model: DynamicsWorldModel, optimizer: Optimizer):
     return disjoint_optimizer_param_groups(
         optimizer,
         [
@@ -293,7 +346,7 @@ def world_model_clip_groups(world_model: DynamicsWorldModel, optimizer: AdamW):
     )
 
 
-def agent_clip_groups(world_model: DynamicsWorldModel, optimizer: AdamW):
+def agent_clip_groups(world_model: DynamicsWorldModel, optimizer: Optimizer):
     return disjoint_optimizer_param_groups(
         optimizer,
         [
@@ -703,7 +756,7 @@ def eval_tokenizer_on_experience(
 
 def train_world_model(
     world_model: DynamicsWorldModel,
-    optimizer: AdamW,
+    optimizer: Optimizer,
     replay: deque[Experience],
     *,
     steps: int,
@@ -761,7 +814,7 @@ def train_world_model(
 
 def train_agent_in_imagination(
     world_model: DynamicsWorldModel,
-    optimizer: AdamW,
+    optimizer: Optimizer,
     policy_prior: FrozenPolicyPrior | None,
     replay: deque[Experience],
     *,
@@ -873,8 +926,8 @@ def save_checkpoint(
     loop: int,
     tokenizer: ObservationTokenizer,
     world_model: DynamicsWorldModel,
-    world_optimizer: AdamW,
-    agent_optimizer: AdamW,
+    world_optimizer: Optimizer,
+    agent_optimizer: Optimizer,
 ):
     path.parent.mkdir(parents = True, exist_ok = True)
     torch.save(
@@ -882,11 +935,37 @@ def save_checkpoint(
             loop = loop,
             tokenizer = tokenizer.state_dict(),
             world_model = world_model.state_dict(),
-            world_optimizer = world_optimizer.state_dict(),
-            agent_optimizer = agent_optimizer.state_dict(),
+            world_optimizer = checkpoint_optimizer_state_dict(world_optimizer),
+            agent_optimizer = checkpoint_optimizer_state_dict(agent_optimizer),
         ),
         str(path),
     )
+
+
+def checkpoint_optimizer_state_dict(optimizer: Optimizer):
+    state_dict = optimizer.state_dict()
+
+    for group in state_dict["param_groups"]:
+        if callable(group.get("muon_bypass_update_fn")):
+            group["muon_bypass_update_fn"] = MUON_BYPASS_UPDATE_SENTINEL
+
+    return state_dict
+
+
+def restore_optimizer_runtime_options(optimizer: Optimizer):
+    for group in optimizer.param_groups:
+        if group.get("muon_bypass_update_fn") == MUON_BYPASS_UPDATE_SENTINEL:
+            group["muon_bypass_update_fn"] = default_muon_bypass_update_fn
+
+
+def load_optimizer_state_if_compatible(optimizer: Optimizer, state_dict, name: str):
+    try:
+        optimizer.load_state_dict(state_dict)
+        restore_optimizer_runtime_options(optimizer)
+        return True
+    except (KeyError, RuntimeError, ValueError) as exc:
+        print(f"skipping {name} optimizer state: {exc}")
+        return False
 
 
 def resolve_log_dir(log_dir: str, checkpoint_path: str | None):
@@ -925,6 +1004,8 @@ def main(
     imagination_train_steps = 3,
     imagination_generate_steps = 4,
     agent_learning_rate = 3e-4,
+    use_muon_optimizer = True,
+    optimizer_weight_decay = 0.01,
     objective: Literal["ppo", "pmpo", "spo"] = "pmpo",
     pmpo_pos_to_neg_weight = 0.5,
     pmpo_kl_div_loss_weight = 0.3,
@@ -1043,16 +1124,28 @@ def main(
     ).to(device)
 
     world_params, agent_params = split_world_model_and_agent_params(world_model)
-    world_optimizer = AdamW(world_params, lr = world_model_learning_rate)
-    agent_optimizer = AdamW(agent_params, lr = agent_learning_rate)
+    world_optimizer = make_optimizer(
+        world_params,
+        lr = world_model_learning_rate,
+        weight_decay = optimizer_weight_decay,
+        use_muon = use_muon_optimizer,
+        muon_params = world_model.muon_parameters(),
+    )
+    agent_optimizer = make_optimizer(
+        agent_params,
+        lr = agent_learning_rate,
+        weight_decay = optimizer_weight_decay,
+        use_muon = use_muon_optimizer,
+        muon_params = world_model.muon_parameters(),
+    )
 
     start_loop = 0
     if exists(checkpoint_path):
         pkg = torch.load(checkpoint_path, map_location = device, weights_only = True)
         tokenizer.load_state_dict(pkg["tokenizer"])
         world_model.load_state_dict(pkg["world_model"])
-        world_optimizer.load_state_dict(pkg["world_optimizer"])
-        agent_optimizer.load_state_dict(pkg["agent_optimizer"])
+        load_optimizer_state_if_compatible(world_optimizer, pkg["world_optimizer"], "world")
+        load_optimizer_state_if_compatible(agent_optimizer, pkg["agent_optimizer"], "agent")
         start_loop = int(pkg.get("loop", 0)) + 1
 
     policy_prior = FrozenPolicyPrior(world_model).to(device) if objective == "pmpo" else None
