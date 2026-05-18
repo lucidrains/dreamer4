@@ -1938,7 +1938,9 @@ class TEM(Module):
         dim_encoded_sensory = None,
         heads = 8,
         dim_head = 64,
-        talking_heads = True
+        talking_heads = True,
+        first_state_as_init_hidden = True,
+        relative_actions = False
     ):
         super().__init__()
 
@@ -1948,7 +1950,18 @@ class TEM(Module):
         # path integration
 
         self.gru = nn.GRU(dim_action_embed, dim_structure, batch_first = True)
-        self.init_hiddens = Parameter(randn(1, 1, dim_structure) * 1e-2)
+        self.first_state_as_init_hidden = first_state_as_init_hidden
+        self.relative_actions = relative_actions
+
+        if first_state_as_init_hidden:
+            self.to_init_hiddens = MLP(
+                dim_encoded_sensory,
+                dim_structure,
+                dim_structure,
+                activation = nn.SiLU()
+            )
+        else:
+            self.init_hiddens = Parameter(randn(1, 1, dim_structure) * 1e-2)
 
         # sensory encoder
 
@@ -2018,7 +2031,7 @@ class TEM(Module):
 
     def forward(
         self,
-        action_tokens,
+        next_action_tokens,
         raw_latents,
         return_preds = False
     ):
@@ -2031,17 +2044,39 @@ class TEM(Module):
 
         # path integration
 
-        batch = action_tokens.shape[0]
-        init_hiddens = repeat(self.init_hiddens, '1 1 d -> 1 b d', b = batch)
+        batch, time, _ = encoded_sensory.shape
 
-        structural_codes, _ = self.gru(action_tokens, init_hiddens)
+        if self.first_state_as_init_hidden:
+            init_hiddens = self.to_init_hiddens(encoded_sensory[:, 0])
+            init_hiddens_gru = rearrange(init_hiddens, 'b d -> 1 b d')
+            structural_codes_init = rearrange(init_hiddens, 'b d -> b 1 d')
+        else:
+            init_hiddens_gru = repeat(self.init_hiddens, '1 1 d -> 1 b d', b = batch)
+            structural_codes_init = repeat(self.init_hiddens, '1 1 d -> b 1 d', b = batch)
+
+        # path integration over actions
+
+        actions = next_action_tokens[:, :(time - 1)] # each action predicts the next state
+
+        if actions.ndim == 4:
+            assert actions.shape[2] == 1, 'TEM is only supported for single agent'
+            actions = rearrange(actions, 'b t 1 d -> b t d')
+
+        has_actions = actions.shape[1] > 0
+
+        if self.relative_actions and has_actions:
+            actions = torch.diff(actions, dim = 1, prepend = torch.zeros_like(actions[:, :1]))
+
+        if has_actions:
+            gru_out, _ = self.gru(actions, init_hiddens_gru)
+            structural_codes = cat((structural_codes_init, gru_out), dim = 1)
+        else:
+            structural_codes = structural_codes_init
 
         # rmsnorm both
 
         structural_codes = self.structural_norm(structural_codes)
         encoded_sensory = self.sensory_norm(encoded_sensory)
-
-        structural_and_sensory = cat((structural_codes, encoded_sensory), dim = -1)
 
         # implicit mlp memory (depth 2)
 
@@ -2091,16 +2126,21 @@ class TEM(Module):
 
         # decode and loss
 
-        pred_raw_concat = self.sensory_decoder(out)
+        pred_raw = self.sensory_decoder(out)
 
-        target_raw_concat = rearrange(raw_latents, 'b t n d -> b t (n d)')
+        target_raw = rearrange(raw_latents, 'b t n d -> b t (n d)')
 
         # omit the very first token
 
-        pred_raw_concat_sliced = pred_raw_concat[:, 1:]
-        target_raw_concat_sliced = target_raw_concat[:, 1:]
+        pred_raw_sliced = pred_raw[:, 1:]
+        target_raw_sliced = target_raw[:, 1:]
 
-        loss = F.mse_loss(pred_raw_concat_sliced, target_raw_concat_sliced.detach())
+        has_predictions = pred_raw_sliced.shape[1] > 0
+
+        loss = self.zero
+
+        if has_predictions:
+            loss = F.mse_loss(pred_raw_sliced, target_raw_sliced.detach())
 
         if not return_preds:
             return loss
@@ -2108,7 +2148,7 @@ class TEM(Module):
         # restore predictions to raw latents shape for external use
 
         _, _, n, d = raw_latents.shape
-        pred_raw_latents = rearrange(pred_raw_concat, 'b t (n d) -> b t n d', n = n, d = d)
+        pred_raw_latents = rearrange(pred_raw, 'b t (n d) -> b t n d', n = n, d = d)
 
         return loss, pred_raw_latents
 
@@ -3305,6 +3345,8 @@ class DynamicsWorldModel(Module):
         lapo_pred_actions = True,
         lapo_use_fdm = True,
         ssl_tem = False,
+        tem_first_state_as_init_hidden = True,
+        tem_relative_actions = False,
         lapo_action_loss_weight = 1.,
         lapo_fdm_loss_weight = 1.,
         lapo_raw_latent_fdm_loss_weight = 1.,
@@ -3651,7 +3693,9 @@ class DynamicsWorldModel(Module):
             self.ssl_tem = TEM(
                 dim_action_embed = dim,
                 dim_raw_latent = dim_latent,
-                num_raw_latent_tokens = num_latent_tokens
+                num_raw_latent_tokens = num_latent_tokens,
+                first_state_as_init_hidden = tem_first_state_as_init_hidden,
+                relative_actions = tem_relative_actions
             )
 
         # efficient axial space / time transformer
@@ -5428,11 +5472,11 @@ class DynamicsWorldModel(Module):
 
         elif self.action_embedder.has_actions:
             action_tokens = torch.zeros_like(agent_tokens[:, :, 0:1])
-            next_action_tokens = None
+            next_action_tokens = action_tokens
 
         else:
             action_tokens = empty_token
-            next_action_tokens = None
+            next_action_tokens = empty_token
 
         # main function, needs to be defined as such for shortcut training - additional calls for consistency loss
 
@@ -5984,7 +6028,7 @@ class DynamicsWorldModel(Module):
         tem_loss = self.zero
 
         if self.has_tem:
-            action_tokens_for_tem = intermediates.pre_encoded_action
+            action_tokens_for_tem = next_action_tokens
             tem_loss, tem_pred_latents = self.ssl_tem(action_tokens_for_tem, raw_latents = latents, return_preds = True)
         else:
             tem_pred_latents = None
