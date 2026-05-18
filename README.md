@@ -286,4 +286,16 @@ Passing `--condition_on_actions True` lets you explicitly prompt with velocity a
 }
 ```
 
+```bibtex
+@misc{zhao2026subjepasubspacegaussianregularization,
+    title   = {Sub-JEPA: Subspace Gaussian Regularization for Stable End-to-End World Models},
+    author  = {Kai Zhao and Dongliang Nie and Yuchen Lin and Zhehan Luo and Yixiao Gu and Deng-Ping Fan and Dan Zeng},
+    year    = {2026},
+    eprint  = {2605.09241},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2605.09241},
+}
+```
+
 *the conquest of nature is to be achieved through number and measure - angels to Descartes in a dream*

@@ -12,7 +12,8 @@ from dataclasses import dataclass, asdict, fields
 import torch
 import torch.nn.functional as F
 from torch.distributions import Normal, Beta, kl
-from torch.nn import Module, ModuleList, Embedding, Parameter, Sequential, Linear, RMSNorm, Identity
+from torch.nn import Module, ModuleList, Embedding, Parameter, Sequential, Linear, RMSNorm
+from torch_einops_utils.nn import Identity
 from torch import nn, cat, stack, arange, tensor, Tensor, is_tensor, full, zeros, ones, randint, rand, randn, randn_like, empty, full, linspace, arange
 from torch.utils._pytree import tree_map, tree_flatten, tree_unflatten
 
@@ -390,12 +391,6 @@ def create_multi_token_prediction_targets(
 
     return out, mask
 
-# helper modules
-
-class Identity(Module):
-    def forward(self, t, *args, **kwargs):
-        return t
-
 # loss related
 
 class LossNormalizer(Module):
@@ -496,6 +491,7 @@ class LatentAutoregressiveLoss(Module):
         dim_in = None,
         use_rmsnorm = False,
         sigreg_loss_kwargs: dict | None = None,
+        sigreg_num_subspaces = None,
         net: Module | None = None
     ):
         super().__init__()
@@ -515,6 +511,17 @@ class LatentAutoregressiveLoss(Module):
 
         self.net = net
 
+        # Sub-JEPA subspace gaussian regularization
+
+        self.num_subspaces = default(sigreg_num_subspaces, 1)
+
+        if self.num_subspaces > 1:
+            dim_subspace, remainder = divmod(dim, self.num_subspaces)
+            assert remainder == 0, f'dimension {dim} must be divisible by number of subspaces {self.num_subspaces}'
+
+            projs = torch.stack([nn.init.orthogonal_(torch.empty(dim_subspace, dim)) for _ in range(self.num_subspaces)])
+            self.register_buffer('subspace_projs', projs)
+
     @staticmethod
     def sigreg_loss(
         x,
@@ -524,6 +531,7 @@ class LatentAutoregressiveLoss(Module):
         mask = None
     ):
         # Randall Balestriero - https://arxiv.org/abs/2511.08544
+        # Sub-JEPA - https://arxiv.org/abs/2605.09241v1
 
         dim, device = x.shape[-1], x.device
 
@@ -542,13 +550,13 @@ class LatentAutoregressiveLoss(Module):
 
         # empirical CF
 
-        x_t = einx.dot('... d, m d -> (...) m', x, rand_projs)
+        x_t = einx.dot('k ... d, m d -> k (...) m', x, rand_projs)
 
-        x_t = multiply('n m, t -> n m t', x_t, t)
+        x_t = multiply('k n m, t -> k n m t', x_t, t)
         ecf = (1j * x_t).exp()
 
-        mask_1d = rearrange(mask, '... -> (...)') if exists(mask) else None
-        ecf = masked_mean(ecf, mask_1d, dim = 0)
+        mask_1d = rearrange(mask, 'k ... -> k (...)') if exists(mask) else None
+        ecf = masked_mean(ecf, mask_1d, dim = 1)
 
         # weighted L2 distance
 
@@ -596,7 +604,25 @@ class LatentAutoregressiveLoss(Module):
             sigreg_input = cat((x[:, :-1], target_output), dim = 0)
             sigreg_mask = cat((mask, mask), dim = 0) if exists(mask) else None
 
-        sigreg = self.sigreg_loss(sigreg_input, mask = sigreg_mask, **self.sigreg_loss_kwargs)
+        # sub-jepa - Kai Zhao et al https://arxiv.org/abs/2605.09241v1
+
+        if self.num_subspaces > 1:
+            sigreg_input = einx.dot('... dim, k dim_subspace dim -> k ... dim_subspace', sigreg_input, self.subspace_projs)
+            if exists(sigreg_mask):
+                sigreg_mask = repeat(sigreg_mask, '... -> k ...', k = self.num_subspaces)
+        else:
+            sigreg_input = rearrange(sigreg_input, '... d -> 1 ... d')
+            if exists(sigreg_mask):
+                sigreg_mask = rearrange(sigreg_mask, '... -> 1 ...')
+
+        # sigreg for lejepa/wm
+
+        sigreg = self.sigreg_loss(
+            sigreg_input,
+            mask = sigreg_mask,
+            **self.sigreg_loss_kwargs
+        )
+
         return loss, sigreg, pred
 
 def ramp_weight(times, slope = 0.9, intercept = 0.1):
@@ -2661,6 +2687,7 @@ class VideoTokenizer(Module):
         latent_ar_sigreg_loss_weight = 0.05,
         latent_ar_placement = 'encoder',
         latent_ar_sigreg_loss_kwargs = dict(num_slices = 256),
+        latent_ar_sigreg_num_subspaces = None,
         time_attention_use_pope = False,
         decoder_flow_times_beta_alpha = 1.,
         decoder_flow_times_beta_beta = 1.
@@ -2834,7 +2861,8 @@ class VideoTokenizer(Module):
             self.latent_ar = LatentAutoregressiveLoss(
                 latent_ar_dim,
                 use_rmsnorm = latent_ar_use_rmsnorm,
-                sigreg_loss_kwargs = latent_ar_sigreg_loss_kwargs
+                sigreg_loss_kwargs = latent_ar_sigreg_loss_kwargs,
+                sigreg_num_subspaces = latent_ar_sigreg_num_subspaces
             )
 
         # loss normalizer
@@ -3349,6 +3377,7 @@ class DynamicsWorldModel(Module):
         latent_ar_loss_weight = 0.,
         latent_ar_sigreg_loss_weight = 0.05,
         latent_ar_sigreg_loss_kwargs = dict(num_slices = 256),
+        latent_ar_sigreg_num_subspaces = None,
         identity_latents_to_spatial = False,
         agent_predict_sem_kwargs: dict = dict(),
         ssl_lapo = False,
@@ -3570,7 +3599,8 @@ class DynamicsWorldModel(Module):
             self.latent_ar = LatentAutoregressiveLoss(
                 dim_in = latent_ar_dim_in,
                 dim = dim,
-                sigreg_loss_kwargs = latent_ar_sigreg_loss_kwargs
+                sigreg_loss_kwargs = latent_ar_sigreg_loss_kwargs,
+                sigreg_num_subspaces = latent_ar_sigreg_num_subspaces
             )
 
         # agent predicting state
