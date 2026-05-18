@@ -44,6 +44,7 @@ from torch_einops_utils import (
     pad_right_at_dim_to,
     pad_right_ndim_to,
     lens_to_mask,
+    shift_right,
     masked_mean,
     safe_stack,
     safe_cat,
@@ -1940,7 +1941,7 @@ class TEM(Module):
         dim_head = 64,
         talking_heads = True,
         first_state_as_init_hidden = True,
-        relative_actions = False
+        learn_relative_actions = False
     ):
         super().__init__()
 
@@ -1951,7 +1952,14 @@ class TEM(Module):
 
         self.gru = nn.GRU(dim_action_embed, dim_structure, batch_first = True)
         self.first_state_as_init_hidden = first_state_as_init_hidden
-        self.relative_actions = relative_actions
+        self.learn_relative_actions = learn_relative_actions
+
+        self.learned_relative_encode = MLP(
+            dim_action_embed * 2,
+            dim_action_embed * 2,
+            dim_action_embed,
+            activation = nn.SiLU()
+        ) if learn_relative_actions else None
 
         if first_state_as_init_hidden:
             self.to_init_hiddens = MLP(
@@ -2064,8 +2072,10 @@ class TEM(Module):
 
         has_actions = actions.shape[1] > 0
 
-        if self.relative_actions and has_actions:
-            actions = torch.diff(actions, dim = 1, prepend = torch.zeros_like(actions[:, :1]))
+        if self.learn_relative_actions and has_actions:
+            past_actions = shift_right(actions, amount = 1, dim = 1)
+            actions_with_past = torch.cat((actions, past_actions), dim = -1)
+            actions = self.learned_relative_encode(actions_with_past)
 
         if has_actions:
             gru_out, _ = self.gru(actions, init_hiddens_gru)
@@ -3346,7 +3356,7 @@ class DynamicsWorldModel(Module):
         lapo_use_fdm = True,
         ssl_tem = False,
         tem_first_state_as_init_hidden = True,
-        tem_relative_actions = False,
+        tem_learn_relative_actions = False,
         lapo_action_loss_weight = 1.,
         lapo_fdm_loss_weight = 1.,
         lapo_raw_latent_fdm_loss_weight = 1.,
@@ -3695,7 +3705,7 @@ class DynamicsWorldModel(Module):
                 dim_raw_latent = dim_latent,
                 num_raw_latent_tokens = num_latent_tokens,
                 first_state_as_init_hidden = tem_first_state_as_init_hidden,
-                relative_actions = tem_relative_actions
+                learn_relative_actions = tem_learn_relative_actions
             )
 
         # efficient axial space / time transformer
