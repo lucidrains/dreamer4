@@ -4557,8 +4557,6 @@ class DynamicsWorldModel(Module):
         log_probs = safe_cat(log_probs, dim = -1)
         entropies = safe_cat(entropies, dim = -1)
 
-        advantage = rearrange(advantage, '... -> ... 1') # broadcast across all actions
-
         # align advantage to log_probs length if bootstrap padded
 
         if advantage.shape[1] == log_probs.shape[1] + 1:
@@ -4566,6 +4564,13 @@ class DynamicsWorldModel(Module):
             mask = mask[:, :-1] if exists(mask) else None
             pos_advantage_mask = pos_advantage_mask[:, :-1] if exists(pos_advantage_mask) else None
             neg_advantage_mask = neg_advantage_mask[:, :-1] if exists(neg_advantage_mask) else None
+
+        # calculate joint log probs
+
+        log_probs = log_probs.sum(dim = -1)
+
+        if exists(old_log_probs):
+            old_log_probs = old_log_probs.sum(dim = -1)
 
         # calculate delight
         # Ian Osband - https://arxiv.org/abs/2603.14608v1
@@ -4593,10 +4598,6 @@ class DynamicsWorldModel(Module):
                 neg = neg & mask
 
             scaled_action_log_probs = maybe_gated_log_prob * advantage.tanh().abs()
-
-            num_actions = scaled_action_log_probs.shape[-1]
-            pos = repeat(pos, 'b t -> b t na', na = num_actions)
-            neg = repeat(neg, 'b t -> b t na', na = num_actions)
 
             pos_loss, neg_loss = 0., 0.
 
@@ -4653,8 +4654,6 @@ class DynamicsWorldModel(Module):
             if use_delight_gating:
                 policy_loss = policy_loss * delight_gate
 
-            policy_loss = reduce(policy_loss, 'b t na -> b t', 'sum')
-
             policy_loss = masked_mean(policy_loss, mask)
 
         elif objective == 'ppo':
@@ -4668,8 +4667,6 @@ class DynamicsWorldModel(Module):
 
             if use_delight_gating:
                 policy_loss = policy_loss * delight_gate
-
-            policy_loss = reduce(policy_loss, 'b t na -> b t', 'sum')
 
             policy_loss = masked_mean(policy_loss, mask)
 
@@ -4717,6 +4714,7 @@ class DynamicsWorldModel(Module):
         values = self.reward_encoder.bins_to_scalar_value(value_bins)
 
         # align returns and old_values to value_bins length if bootstrap padded
+
         if returns.shape[1] == value_bins.shape[1] + 1:
             returns = returns[:, :-1]
             old_values = old_values[:, :-1]
