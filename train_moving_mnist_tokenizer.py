@@ -95,7 +95,8 @@ def main(
     time_attention_use_pope = False,
     restrict_latent_grads_to_noise = True,
     decoder_flow_times_beta_alpha = 1.,
-    decoder_flow_times_beta_beta = 1.
+    decoder_flow_times_beta_beta = 1.,
+    latent_consistency_loss_weight = 0.
 ):
     import shutil
 
@@ -115,8 +116,6 @@ def main(
 
     if log_path.exists() and not latest_checkpoint:
         shutil.rmtree(log_path)
-
-    log_path.mkdir(exist_ok = True, parents = True)
 
     log_path.mkdir(exist_ok = True, parents = True)
 
@@ -161,7 +160,8 @@ def main(
         time_attention_use_pope = time_attention_use_pope,
         latent_grad_only_at_noise = restrict_latent_grads_to_noise,
         decoder_flow_times_beta_alpha = decoder_flow_times_beta_alpha,
-        decoder_flow_times_beta_beta = decoder_flow_times_beta_beta
+        decoder_flow_times_beta_beta = decoder_flow_times_beta_beta,
+        latent_consistency_loss_weight = latent_consistency_loss_weight
     )
 
     # trainer

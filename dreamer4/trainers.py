@@ -360,6 +360,10 @@ class VideoTokenizerTrainer(Module):
             if latent_ar_loss > 0.:
                 postfix_kwargs['latent_ar'] = f"{latent_ar_loss:.4f}"
 
+            latent_consistency_loss = losses.latent_consistency.item()
+            if latent_consistency_loss > 0.:
+                postfix_kwargs['latent_consistency'] = f"{latent_consistency_loss:.4f}"
+
             pbar.set_postfix(**postfix_kwargs)
 
             self.step += 1

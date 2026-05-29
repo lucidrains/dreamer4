@@ -1230,3 +1230,33 @@ def test_aux_encoder_combinations(use_tokenizer, use_aux_encoder):
 
     experience = dynamics.interact_with_env(mock_env, max_timesteps = 2, env_is_vectorized = False)
     assert experience.latents.shape[-2] == num_tokens
+
+@param('latent_consistency_loss_weight', (0., 1.))
+def test_latent_consistency_loss(latent_consistency_loss_weight):
+    import torch
+    from dreamer4.dreamer4 import VideoTokenizer
+
+    model = VideoTokenizer(
+        dim = 16,
+        dim_latent = 16,
+        patch_size = 8,
+        image_height = 64,
+        image_width = 64,
+        num_latent_tokens = 4,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        time_block_every = 1,
+        attn_heads = 1,
+        attn_dim_head = 16,
+        latent_consistency_loss_weight = latent_consistency_loss_weight
+    )
+
+    video = torch.randn(2, 3, 2, 64, 64)
+    loss, (losses, recon_video) = model(video, return_intermediates=True)
+
+    assert loss.numel() == 1
+
+    if latent_consistency_loss_weight > 0.:
+        assert losses.latent_consistency.item() > 0.
+    else:
+        assert losses.latent_consistency.item() == 0.

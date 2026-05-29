@@ -298,4 +298,16 @@ Passing `--condition_on_actions True` lets you explicitly prompt with velocity a
 }
 ```
 
+```bibtex
+@misc{wu2025h3aehighcompressionhigh,
+    title   = {H3AE: High Compression, High Speed, and High Quality AutoEncoder for Video Diffusion Models},
+    author  = {Yushu Wu and Yanyu Li and Ivan Skorokhodov and Anil Kag and Willi Menapace and Sharath Girish and Aliaksandr Siarohin and Yanzhi Wang and Sergey Tulyakov},
+    year    = {2025},
+    eprint  = {2504.10567},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.CV},
+    url     = {https://arxiv.org/abs/2504.10567},
+}
+```
+
 *the conquest of nature is to be achieved through number and measure - angels to Descartes in a dream*

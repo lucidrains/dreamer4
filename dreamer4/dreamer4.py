@@ -4,7 +4,7 @@ from typing import Callable, Iterable, NamedTuple, Tuple, Literal
 import numpy as np
 from math import ceil, log2
 from random import random
-from contextlib import nullcontext
+from contextlib import nullcontext, contextmanager
 from collections import namedtuple
 from functools import partial, wraps
 from dataclasses import dataclass, asdict, fields
@@ -102,7 +102,8 @@ LayerNormNoBias = partial(nn.LayerNorm, bias = False)
 
 VideoTokenizerIntermediates = namedtuple('VideoTokenizerIntermediates', ('losses', 'recon'))
 
-TokenizerLosses = namedtuple('TokenizerLosses', ('recon', 'lpips', 'time_decorr', 'space_decorr', 'latent_ar', 'latent_ar_sigreg'))
+TokenizerLosses = namedtuple('TokenizerLosses', ('recon', 'lpips', 'time_decorr', 'space_decorr', 'latent_ar', 'latent_ar_sigreg', 'latent_consistency'))
+
 
 WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'shortcut', 'rewards', 'terminals', 'discrete_actions', 'continuous_actions', 'state_pred', 'agent_state_pred', 'latent_ar', 'latent_ar_sigreg', 'lapo_action', 'lapo_fdm', 'lapo_raw_latent_fdm', 'tem'))
 
@@ -218,11 +219,6 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
-def cast_to_tensor(t, device, dtype = None):
-    t = t if is_tensor(t) else tensor(t)
-    t = t.to(dtype) if exists(dtype) else t
-    return t.to(device)
-
 def cosine_distance(x, y, mask = None):
     dist = 1. - F.cosine_similarity(x, y, dim = -1)
     return masked_mean(dist, mask)
@@ -250,6 +246,27 @@ def sample_prob(prob):
 
 def is_power_two(num):
     return log2(num).is_integer()
+
+def cast_to_tensor(t, device, dtype = None):
+    t = t if is_tensor(t) else tensor(t)
+    t = t.to(dtype) if exists(dtype) else t
+    return t.to(device)
+
+@contextmanager
+def temp_requires_grad(
+    parameters,
+    requires_grad = False
+):
+    parameters = list(parameters)
+    orig_requires_grad = [p.requires_grad for p in parameters]
+
+    for p in parameters:
+        p.requires_grad_(requires_grad)
+
+    yield
+
+    for p, orig in zip(parameters, orig_requires_grad):
+        p.requires_grad_(orig)
 
 # tensor helpers
 
@@ -2688,6 +2705,7 @@ class VideoTokenizer(Module):
         latent_ar_placement = 'encoder',
         latent_ar_sigreg_loss_kwargs = dict(num_slices = 256),
         latent_ar_sigreg_num_subspaces = None,
+        latent_consistency_loss_weight = 0.,
         time_attention_use_pope = False,
         decoder_flow_times_beta_alpha = 1.,
         decoder_flow_times_beta_beta = 1.
@@ -2875,10 +2893,29 @@ class VideoTokenizer(Module):
             self.time_decorr_loss_normalizer = LossNormalizer() if encoder_add_decorr_aux_loss else None
             self.space_decorr_loss_normalizer = LossNormalizer() if encoder_add_decorr_aux_loss else None
             self.latent_ar_loss_normalizer = LossNormalizer() if self.has_latent_ar else None
+            self.latent_consistency_loss_normalizer = LossNormalizer() if latent_consistency_loss_weight > 0. else None
+
+        self.latent_consistency_loss_weight = latent_consistency_loss_weight
+        self.has_latent_consistency_loss = latent_consistency_loss_weight > 0.
 
     @property
     def device(self):
         return self.zero.device
+
+    def encoder_parameters(self):
+        params = [
+            *self.patch_to_tokens.parameters(),
+            *self.encoder_transformer.parameters(),
+            *self.encoded_to_latents.parameters(),
+            self.latent_tokens,
+            self.mask_token
+        ]
+
+        if self.use_causal_conv3d:
+            params.extend(self.encoder_pre_causal_conv3d.parameters())
+            params.extend(self.encoder_post_causal_conv3d.parameters())
+
+        return params
 
     def muon_parameters(self):
         return [
@@ -3164,16 +3201,34 @@ class VideoTokenizer(Module):
             target = video
             pred = recon_video
 
-        # mse loss
+        # losses
 
         if exists(time_lens):
             if not is_tensor(time_lens):
                 time_lens = tensor(time_lens, device = device, dtype = torch.long)
 
-            recon_loss = F.mse_loss(pred, target, reduction = 'none')
+            time_mask = lens_to_mask(time_lens, time)
 
-            mask = lens_to_mask(time_lens, time)
-            mask = rearrange(mask, 'b t -> b 1 t 1 1')
+        # latent consistency loss
+
+        latent_consistency_loss = self.zero
+
+        if self.has_latent_consistency_loss:
+            with temp_requires_grad(self.encoder_parameters(), False):
+                recon_latents = self.forward(recon_video, return_latents = True)
+
+            if exists(time_lens):
+                latent_consistent_loss = F.mse_loss(recon_latents, latents.detach(), reduction = 'none')
+                latent_consistent_mask = pad_right_ndim_to(time_mask, latent_consistent_loss.ndim)
+                latent_consistency_loss = masked_mean(latent_consistent_loss, latent_consistent_mask)
+            else:
+                latent_consistency_loss = F.mse_loss(recon_latents, latents.detach())
+
+        # recon loss
+
+        if exists(time_lens):
+            recon_loss = F.mse_loss(pred, target, reduction = 'none')
+            mask = rearrange(time_mask, 'b t -> b 1 t 1 1')
             recon_loss = masked_mean(recon_loss, mask)
         else:
             recon_loss = F.mse_loss(pred, target)
@@ -3209,6 +3264,9 @@ class VideoTokenizer(Module):
                 time_decorr_loss = self.time_decorr_loss_normalizer(time_decorr_loss, update_ema = update_loss_ema)
                 space_decorr_loss = self.space_decorr_loss_normalizer(space_decorr_loss, update_ema = update_loss_ema)
 
+            if self.has_latent_consistency_loss:
+                latent_consistency_loss = self.latent_consistency_loss_normalizer(latent_consistency_loss, update_ema = update_loss_ema)
+
         # losses
 
         total_loss = (
@@ -3217,13 +3275,14 @@ class VideoTokenizer(Module):
             time_decorr_loss * self.time_decorr_loss_weight +
             space_decorr_loss * self.space_decorr_loss_weight +
             latent_ar_loss * self.latent_ar_loss_weight +
-            latent_ar_sigreg_loss * self.latent_ar_sigreg_loss_weight
+            latent_ar_sigreg_loss * self.latent_ar_sigreg_loss_weight +
+            latent_consistency_loss * self.latent_consistency_loss_weight
         )
 
         if not return_intermediates:
             return total_loss
 
-        losses = TokenizerLosses(recon_loss, lpips_loss, time_decorr_loss, space_decorr_loss, latent_ar_loss, latent_ar_sigreg_loss)
+        losses = TokenizerLosses(recon_loss, lpips_loss, time_decorr_loss, space_decorr_loss, latent_ar_loss, latent_ar_sigreg_loss, latent_consistency_loss)
 
         # handle returning of reconstructed, and image pretraining
 
