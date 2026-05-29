@@ -96,7 +96,8 @@ def main(
     restrict_latent_grads_to_noise = True,
     decoder_flow_times_beta_alpha = 1.,
     decoder_flow_times_beta_beta = 1.,
-    latent_consistency_loss_weight = 0.
+    latent_consistency_loss_weight = 0.,
+    clear_runs = False
 ):
     import shutil
 
@@ -104,6 +105,10 @@ def main(
 
     log_path = Path(log_dir)
     ckpt_folder_path = Path(checkpoint_folder)
+
+    if clear_runs and log_path.exists():
+        shutil.rmtree(log_path)
+
     latest_checkpoint = None
 
     if exists(checkpoint_path):

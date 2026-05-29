@@ -3049,6 +3049,7 @@ class VideoTokenizer(Module):
         video_or_image, # (b c t h w) | (b c h w)
         return_latents = False,
         mask_patches = None,
+        patch_mask = None,
         return_intermediates = False,
         update_loss_ema = None,
         time_cache = None,
@@ -3101,17 +3102,17 @@ class VideoTokenizer(Module):
 
         # masking
 
-        mask_patches = default(mask_patches, self.training)
+        if mask_patches or exists(patch_mask):
 
-        if mask_patches:
-            min_mask_prob, max_mask_prob = self.per_image_patch_mask_prob
+            if not exists(patch_mask):
+                min_mask_prob, max_mask_prob = self.per_image_patch_mask_prob
 
-            mask_prob = torch.empty(tokens.shape[:2], device = tokens.device).uniform_(min_mask_prob, max_mask_prob) # (b t)
+                mask_prob = torch.empty(tokens.shape[:2], device = tokens.device).uniform_(min_mask_prob, max_mask_prob) # (b t)
 
-            mask_prob = repeat(mask_prob, 'b t -> b t vh vw', vh = tokens.shape[2], vw = tokens.shape[3])
-            mask_patch = torch.bernoulli(mask_prob) == 1.
+                mask_prob = repeat(mask_prob, 'b t -> b t vh vw', vh = tokens.shape[2], vw = tokens.shape[3])
+                patch_mask = torch.bernoulli(mask_prob) == 1.
 
-            tokens = einx.where('..., d, ... d', mask_patch, self.mask_token, tokens)
+            tokens = einx.where('..., d, ... d', patch_mask, self.mask_token, tokens)
 
         # pack space
 
@@ -3215,7 +3216,12 @@ class VideoTokenizer(Module):
 
         if self.has_latent_consistency_loss:
             with temp_requires_grad(self.encoder_parameters(), False):
-                recon_latents = self.forward(recon_video, return_latents = True)
+                recon_latents = self.forward(
+                    recon_video,
+                    return_latents = True,
+                    mask_patches = False,
+                    patch_mask = patch_mask
+                )
 
             if exists(time_lens):
                 latent_consistent_loss = F.mse_loss(recon_latents, latents.detach(), reduction = 'none')
