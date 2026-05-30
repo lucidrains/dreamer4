@@ -1,6 +1,6 @@
 [project]
 name = "dreamer4"
-version = "0.9.1"
+version = "0.9.2"
 description = "Dreamer4 - PyTorch"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -41,12 +41,12 @@ dependencies = [
     "torchvision",
     "tqdm",
     "x-mlps-pytorch>=0.3.1",
-    "vit-pytorch>=1.15.3",
+    "vit-pytorch>=1.21.5",
 ]
 
 [project.urls]
 Homepage = "https://pypi.org/project/dreamer4/"
-Repository = "https://github.com/lucidrains/dreamer4"
+Repository = "https://codeberg.org/lucidrains/dreamer4"
 
 [project.optional-dependencies]
 examples = []

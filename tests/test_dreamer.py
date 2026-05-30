@@ -609,7 +609,6 @@ def test_bc_trainer(
         num_discrete_actions = 4,
         attn_dim_head = 16,
         prob_shortcut_train = 0.9,
-        num_residual_streams = 1
     )
 
     trainer = BehaviorCloneTrainer(
@@ -621,7 +620,7 @@ def test_bc_trainer(
         cpu = True,
         self_flow = self_flow,
         self_flow_student_layer = -3,
-        self_flow_teacher_layer = -1,
+        self_flow_layer = -1,
         self_flow_loss_weight = 1.0
     )
 
@@ -1260,3 +1259,53 @@ def test_latent_consistency_loss(latent_consistency_loss_weight):
         assert losses.latent_consistency.item() > 0.
     else:
         assert losses.latent_consistency.item() == 0.
+
+def test_moss_sequential_caching():
+    from dreamer4.dreamer4 import VideoTokenizer
+
+    tokenizer = VideoTokenizer(
+        dim = 128,
+        dim_latent = 32,
+        patch_size = 4,
+        num_latent_tokens = 32,
+        channels = 3,
+        image_height = 16,
+        image_width = 16,
+        encoder_depth = 4,
+        decoder_depth = 2,
+        encoder_moss_layers = (2,),
+        decoder_moss_layers = (1,),
+        moss_kwargs = dict(causal = True),
+        lpips_loss_weight = 0.,
+        use_causal_conv3d = False,
+        use_shifted_patch_tokenization = False
+    )
+
+    tokenizer.eval()
+
+    video = torch.randn(1, 3, 5, 16, 16)
+
+    with torch.no_grad():
+
+        # parallel encode
+
+        parallel_latents = tokenizer(video, return_latents = True)
+
+        # sequential encode with caching
+
+        time_cache = None
+        seq_latents = []
+
+        for t in range(5):
+            frame = video[:, :, t:t+1]
+            frame_latents, time_cache = tokenizer(frame, return_latents = True, return_time_cache = True, time_cache = time_cache)
+            seq_latents.append(frame_latents)
+
+        seq_latents = torch.cat(seq_latents, dim = 1)
+
+        assert torch.allclose(parallel_latents, seq_latents, atol = 1e-4)
+
+        # test decoder with moss
+
+        loss = tokenizer(video)
+        assert loss.numel() == 1

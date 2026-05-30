@@ -479,7 +479,7 @@ class BehaviorCloneTrainer(Module):
             self.self_flow_module = SelfFlow(
                 model = model,
                 student_layer = self_flow_student_layer,
-                teacher_layer = self_flow_teacher_layer,
+                teacher_layer = self_flow_layer,
                 **self_flow_kwargs
             )
 

@@ -60,7 +60,8 @@ def main(
     checkpoint_path = None,
     num_train_steps = 100_000,
     num_latents = 32,
-    batch_size = 64,
+    batch_size = 16,
+    encoder_moss_layers = (2,),
     grad_accum_every = 1,
     min_velocity = -2,
     max_velocity = 3,
@@ -166,6 +167,7 @@ def main(
         latent_grad_only_at_noise = restrict_latent_grads_to_noise,
         decoder_flow_times_beta_alpha = decoder_flow_times_beta_alpha,
         decoder_flow_times_beta_beta = decoder_flow_times_beta_beta,
+        encoder_moss_layers = encoder_moss_layers,
         latent_consistency_loss_weight = latent_consistency_loss_weight
     )
 

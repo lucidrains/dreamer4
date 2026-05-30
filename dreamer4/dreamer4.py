@@ -12,10 +12,11 @@ from dataclasses import dataclass, asdict, fields
 import torch
 import torch.nn.functional as F
 from torch.distributions import Normal, Beta, kl
-from torch.nn import Module, ModuleList, Embedding, Parameter, Sequential, Linear, RMSNorm
-from torch_einops_utils.nn import Identity
+from torch.nn import Module, ModuleList, ModuleDict, Embedding, Parameter, Sequential, Linear, RMSNorm
 from torch import nn, cat, stack, arange, tensor, Tensor, is_tensor, full, zeros, ones, randint, rand, randn, randn_like, empty, full, linspace, arange
 from torch.utils._pytree import tree_map, tree_flatten, tree_unflatten
+
+from torch_einops_utils.nn import Identity
 
 import torchvision
 from torchvision.models import VGG16_Weights
@@ -28,6 +29,7 @@ from x_mlps_pytorch.ensemble import Ensemble
 from x_mlps_pytorch.normed_mlp import create_mlp
 
 from vit_pytorch.vit_with_decorr import DecorrelationLoss
+from vit_pytorch.vivit_with_moss import MOSS
 
 from assoc_scan import AssocScan
 
@@ -104,12 +106,11 @@ VideoTokenizerIntermediates = namedtuple('VideoTokenizerIntermediates', ('losses
 
 TokenizerLosses = namedtuple('TokenizerLosses', ('recon', 'lpips', 'time_decorr', 'space_decorr', 'latent_ar', 'latent_ar_sigreg', 'latent_consistency'))
 
-
 WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'shortcut', 'rewards', 'terminals', 'discrete_actions', 'continuous_actions', 'state_pred', 'agent_state_pred', 'latent_ar', 'latent_ar_sigreg', 'lapo_action', 'lapo_fdm', 'lapo_raw_latent_fdm', 'tem'))
 
 AttentionIntermediates = namedtuple('AttentionIntermediates', ('next_kv_cache', 'normed_inputs'))
 
-TransformerIntermediates = namedtuple('TransformerIntermediates', ('next_kv_cache', 'normed_time_inputs', 'normed_space_inputs', 'next_rnn_hiddens', 'layer_hiddens', 'token_count'), defaults=(None, None, None, None, None, 0))
+TransformerIntermediates = namedtuple('TransformerIntermediates', ('next_kv_cache', 'normed_time_inputs', 'normed_space_inputs', 'next_rnn_hiddens', 'layer_hiddens', 'token_count', 'next_spatial_module_caches'), defaults=(None, None, None, None, None, 0, None))
 
 DynamicsIntermediates = namedtuple('DynamicsIntermediates', ('main', 'actor', 'critic', 'spatial', 'action', 'pre_encoded_spatial', 'pre_encoded_action'), defaults=(None, None, None, None, None, None, None))
 
@@ -328,7 +329,9 @@ def with_seed(seed):
     return decorator
 
 def is_empty(t):
-    return t.numel() == 0
+    if is_tensor(t):
+        return t.numel() == 0
+    return len(t) == 0
 
 def log(t, eps = 1e-20):
     return t.clamp(min = eps).log()
@@ -2222,6 +2225,9 @@ class AxialSpaceTimeTransformer(Module):
         num_special_spatial_tokens = 1,
         special_attend_only_itself = False,  # this is set to True for the video tokenizer decoder (latents can only attend to itself while spatial modalities attend to the latents and everything)
         full_spatial_attn = False,
+        spatial_modules: dict | None = None,
+        space_height: int | None = None,
+        space_width: int | None = None,
         final_norm = True,
         value_residual = True,               # https://arxiv.org/abs/2410.17897 - but with learned mixing from OSS
         rnn_time = False,
@@ -2312,6 +2318,11 @@ class AxialSpaceTimeTransformer(Module):
         self.use_attn_pool = use_attn_pool
         self.final_attn_pool = Residual(AttentionPool(dim, **attn_residual_kwargs)) if use_attn_pool else Identity()
 
+        self.spatial_modules = spatial_modules
+
+        self.space_height = space_height
+        self.space_width = space_width
+
         # final norm
 
         self.final_norm = nn.RMSNorm(dim) if final_norm else nn.Identity()
@@ -2340,7 +2351,9 @@ class AxialSpaceTimeTransformer(Module):
         self,
         tokens, # (b t s d)
         cache: TransformerIntermediates | None = None,
-        return_intermediates = False
+        return_intermediates = False,
+        space_height = None,
+        space_width = None
     ): # (b t s d) | (y 2 b h t d)
 
         tokens, inverse_pack = pack_one(tokens, 'b t * d')
@@ -2396,6 +2409,21 @@ class AxialSpaceTimeTransformer(Module):
 
         iter_rnn_prev_hiddens = iter(rnn_prev_hiddens)
 
+        has_spatial_modules = exists(self.spatial_modules)
+        space_height = default(space_height, self.space_height)
+        space_width = default(space_width, self.space_width)
+
+        spatial_module_caches = dict()
+        next_spatial_module_caches = dict()
+
+        if has_spatial_modules:
+            assert exists(space_height) and exists(space_width), 'space_height and space_width must be passed into forward if you have spatial modules (or set on init)'
+
+            spatial_packed_shape = [[space_seq_len - num_spatial_special], [num_spatial_special]]
+
+            if exists(cache) and exists(cache.next_spatial_module_caches):
+                spatial_module_caches = cache.next_spatial_module_caches
+
         # positional embs
 
         time_pos_emb = self.time_rotary(time, offset = token_count)
@@ -2417,12 +2445,12 @@ class AxialSpaceTimeTransformer(Module):
         layer_hiddens = [tokens]
         hiddens = []
 
-        for (
+        for layer_index, (
             (pre_attn_rearrange, post_attn_rearrange, attn, ff),
             maybe_rnn,
             layer_is_time,
             maybe_attn_pool
-         ) in zip(self.layers, self.rnn_layers, self.is_time, self.attn_pools):
+         ) in enumerate(zip(self.layers, self.rnn_layers, self.is_time, self.attn_pools)):
 
             # rnn block
 
@@ -2491,6 +2519,29 @@ class AxialSpaceTimeTransformer(Module):
 
             tokens = ff(tokens)
 
+            # spatial modules (eg. MOSS)
+
+            layer_key = str(layer_index)
+
+            if has_spatial_modules and layer_key in self.spatial_modules:
+                spatial_tokens, special_tokens = unpack(tokens, spatial_packed_shape, 'b t * d')
+
+                spatial_tokens = rearrange(spatial_tokens, 'b t (h w) d -> b t h w d', h = space_height, w = space_width)
+
+                layer_spatial_module = self.spatial_modules[layer_key]
+
+                spatial_tokens, layer_spatial_cache = layer_spatial_module(
+                    spatial_tokens,
+                    cache = spatial_module_caches.get(layer_key),
+                    return_cache = True
+                )
+
+                next_spatial_module_caches[layer_key] = layer_spatial_cache
+
+                spatial_tokens = rearrange(spatial_tokens, 'b t h w d -> b t (h w) d')
+
+                tokens, _ = pack((spatial_tokens, special_tokens), 'b t * d')
+
             layer_hiddens.append(tokens)
 
             hiddens.append(tokens)
@@ -2536,7 +2587,8 @@ class AxialSpaceTimeTransformer(Module):
             safe_stack(normed_space_attn_inputs),
             safe_stack(rnn_hiddens),
             hiddens,
-            token_count + time
+            token_count + time,
+            next_spatial_module_caches
         )
 
         return inverse_pack(out), intermediates
@@ -2694,6 +2746,9 @@ class VideoTokenizer(Module):
         use_causal_conv3d = False,
         use_shifted_patch_tokenization = False,
         spt_kwargs: dict = dict(),
+        encoder_moss_layers = tuple(),
+        decoder_moss_layers = tuple(),
+        moss_kwargs: dict = dict(),
         use_time_rnn = False,
         causal_conv3d_kernel_size = 3,
         decoder_flow_steps = 1,
@@ -2780,7 +2835,15 @@ class VideoTokenizer(Module):
                 LayerNormNoBias(dim)
             )
 
+        encoder_moss_modules = ModuleDict({
+            str(layer_idx): MOSS(dim, **moss_kwargs)
+            for layer_idx in encoder_moss_layers
+        }) if not is_empty(encoder_moss_layers) else None
+
         # encoder space / time transformer
+
+        num_patch_height = image_height // patch_size if exists(image_height) else None
+        num_patch_width = image_width // patch_size if exists(image_width) else None
 
         self.encoder_transformer = AxialSpaceTimeTransformer(
             dim = dim,
@@ -2793,6 +2856,9 @@ class VideoTokenizer(Module):
             full_spatial_attn = encoder_full_spatial_attn,
             attn_kwargs = attn_kwargs,
             ff_kwargs = ff_kwargs,
+            spatial_modules = encoder_moss_modules,
+            space_height = num_patch_height,
+            space_width = num_patch_width,
             final_norm = True,
             time_attention_use_pope = time_attention_use_pope,
             rnn_time = use_time_rnn
@@ -2821,6 +2887,11 @@ class VideoTokenizer(Module):
             depth = decoder_pos_mlp_depth,
         )
 
+        decoder_moss_modules = ModuleDict({
+            str(layer_idx): MOSS(dim, **moss_kwargs)
+            for layer_idx in decoder_moss_layers
+        }) if not is_empty(decoder_moss_layers) else None
+
         # decoder transformer
 
         self.decoder_transformer = AxialSpaceTimeTransformer(
@@ -2835,6 +2906,9 @@ class VideoTokenizer(Module):
             full_spatial_attn = decoder_full_spatial_attn,
             attn_kwargs = attn_kwargs,
             ff_kwargs = ff_kwargs,
+            spatial_modules = decoder_moss_modules,
+            space_height = num_patch_height,
+            space_width = num_patch_width,
             final_norm = True,
             time_attention_use_pope = time_attention_use_pope,
             rnn_time = use_time_rnn
@@ -2917,6 +2991,23 @@ class VideoTokenizer(Module):
 
         return params
 
+    def decoder_parameters(self):
+        params = [
+            *self.latents_to_decoder.parameters(),
+            *self.decoder_transformer.parameters(),
+            *self.tokens_to_patch.parameters()
+        ]
+
+        if self.use_causal_conv3d:
+            params.extend(self.decoder_pre_causal_conv3d.parameters())
+            params.extend(self.decoder_post_causal_conv3d.parameters())
+
+        if self.has_flow:
+            params.extend(self.time_embed.parameters())
+            params.extend(self.noised_patch_to_tokens.parameters())
+
+        return params
+
     def muon_parameters(self):
         return [
             *self.encoder_transformer.muon_parameters(),
@@ -2990,7 +3081,7 @@ class VideoTokenizer(Module):
 
             tokens, _ = pack((spatial_tokens, latent_tokens), 'b t * d')
 
-        tokens = self.decoder_transformer(tokens)
+        tokens = self.decoder_transformer(tokens, space_height = num_patch_height, space_width = num_patch_width)
 
         # unpack latents
 
@@ -3126,7 +3217,14 @@ class VideoTokenizer(Module):
 
         # encoder attention
 
-        tokens, intermediates = self.encoder_transformer(tokens, cache = transformer_cache, return_intermediates = True)
+        tokens, intermediates = self.encoder_transformer(
+            tokens,
+            cache = transformer_cache,
+            return_intermediates = True,
+            space_height = num_patch_height,
+            space_width = num_patch_width
+        )
+
         _, time_attn_normed_inputs, space_attn_normed_inputs, *_ = intermediates
         next_transformer_cache = intermediates
 
@@ -3343,8 +3441,8 @@ class SelfFlow(Module):
 
         *_, teacher_intermediates = ema_teacher_model(**teacher_batch_kwargs)
 
-        student_hidden = student_intermediates.layer_hiddens[self.student_layer]
-        teacher_hidden = teacher_intermediates.layer_hiddens[self.teacher_layer]
+        student_hidden = student_intermediates.main.layer_hiddens[self.student_layer]
+        teacher_hidden = teacher_intermediates.main.layer_hiddens[self.teacher_layer]
 
         if exists(lens) and not exists(mask):
             mask = lens_to_mask(lens, student_hidden.shape[-2])
@@ -4396,8 +4494,9 @@ class DynamicsWorldModel(Module):
                 break
 
         time_dim = rewards.shape[-1]
-        video = cat(video_frames, dim=2)[:, :, :time_dim] if len(video_frames) > 0 else None
-        stacked_states = stack(states, dim=1)[:, :time_dim] if len(states) > 0 else None
+
+        video = cat(video_frames, dim = 2)[:, :, :time_dim] if not is_empty(video_frames) else None
+        stacked_states = stack(states, dim = 1)[:, :time_dim] if not is_empty(states) else None
 
         # calculate episode return
 
