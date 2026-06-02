@@ -51,6 +51,7 @@ from torch_einops_utils import (
     lens_to_mask,
     shift_right,
     masked_mean,
+    repeat_interleave_to_match,
     safe_stack,
     safe_cat,
     slice_right_at_dim,
@@ -2562,9 +2563,7 @@ class AxialSpaceTimeTransformer(Module):
             if is_h_net_layer:
                 tokens, inverse_pack_hnet = pack_one(tokens, '* t d')
 
-                h_net_lens = None
-                if exists(time_lens):
-                    h_net_lens = repeat(time_lens, 'b -> (b s)', s = tokens.shape[0] // time_lens.shape[0])
+                h_net_lens = maybe(repeat_interleave_to_match)(time_lens, tokens)
 
                 tokens, h_net_layer_loss = self.h_net(tokens, lens = h_net_lens)
                 h_net_loss = h_net_loss + h_net_layer_loss
