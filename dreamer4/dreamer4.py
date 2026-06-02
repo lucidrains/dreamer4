@@ -104,7 +104,7 @@ LayerNormNoBias = partial(nn.LayerNorm, bias = False)
 
 VideoTokenizerIntermediates = namedtuple('VideoTokenizerIntermediates', ('losses', 'recon'))
 
-TokenizerLosses = namedtuple('TokenizerLosses', ('recon', 'lpips', 'time_decorr', 'space_decorr', 'latent_ar', 'latent_ar_sigreg', 'latent_consistency'))
+TokenizerLosses = namedtuple('TokenizerLosses', ('recon', 'lpips', 'time_decorr', 'space_decorr', 'latent_ar', 'latent_ar_sigreg', 'latent_consistency', 'latent_sigreg'))
 
 WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'shortcut', 'rewards', 'terminals', 'discrete_actions', 'continuous_actions', 'state_pred', 'agent_state_pred', 'latent_ar', 'latent_ar_sigreg', 'lapo_action', 'lapo_fdm', 'lapo_raw_latent_fdm', 'tem'))
 
@@ -504,7 +504,52 @@ class LPIPSLoss(Module):
 
         return F.mse_loss(embed, pred_embed)
 
+# signature regularization
+
+def sigreg(
+    x,
+    num_slices = 1024,
+    domain = (-5, 5),
+    num_knots = 17,
+    mask = None
+):
+    # Randall Balestriero - https://arxiv.org/abs/2511.08544
+    # Sub-JEPA - https://arxiv.org/abs/2605.09241v1
+
+    dim, device = x.shape[-1], x.device
+
+    # slice sampling
+
+    rand_projs = torch.randn((num_slices, dim), device = device)
+    rand_projs = l2norm(rand_projs)
+
+    # integration points
+
+    t = torch.linspace(*domain, num_knots, device = device)
+
+    # theoretical CF for N(0, 1) and Gauss. window
+
+    exp_f = (-0.5 * t.square()).exp()
+
+    # empirical CF
+
+    x_t = einx.dot('k ... d, m d -> k (...) m', x, rand_projs)
+
+    x_t = multiply('k n m, t -> k n m t', x_t, t)
+    ecf = (1j * x_t).exp()
+
+    mask_1d = rearrange(mask, 'k ... -> k (...)') if exists(mask) else None
+    ecf = masked_mean(ecf, mask_1d, dim = 1)
+
+    # weighted L2 distance
+
+    err = ecf.sub(exp_f).abs().square().mul(exp_f)
+
+    return torch.trapz(err, t, dim = -1).mean()
+
 class LatentAutoregressiveLoss(Module):
+    sigreg = staticmethod(sigreg)
+
     def __init__(
         self,
         dim,
@@ -541,48 +586,6 @@ class LatentAutoregressiveLoss(Module):
 
             projs = torch.stack([nn.init.orthogonal_(torch.empty(dim_subspace, dim)) for _ in range(self.num_subspaces)])
             self.register_buffer('subspace_projs', projs)
-
-    @staticmethod
-    def sigreg_loss(
-        x,
-        num_slices = 1024,
-        domain = (-5, 5),
-        num_knots = 17,
-        mask = None
-    ):
-        # Randall Balestriero - https://arxiv.org/abs/2511.08544
-        # Sub-JEPA - https://arxiv.org/abs/2605.09241v1
-
-        dim, device = x.shape[-1], x.device
-
-        # slice sampling
-
-        rand_projs = torch.randn((num_slices, dim), device = device)
-        rand_projs = l2norm(rand_projs)
-
-        # integration points
-
-        t = torch.linspace(*domain, num_knots, device = device)
-
-        # theoretical CF for N(0, 1) and Gauss. window
-
-        exp_f = (-0.5 * t.square()).exp()
-
-        # empirical CF
-
-        x_t = einx.dot('k ... d, m d -> k (...) m', x, rand_projs)
-
-        x_t = multiply('k n m, t -> k n m t', x_t, t)
-        ecf = (1j * x_t).exp()
-
-        mask_1d = rearrange(mask, 'k ... -> k (...)') if exists(mask) else None
-        ecf = masked_mean(ecf, mask_1d, dim = 1)
-
-        # weighted L2 distance
-
-        err = ecf.sub(exp_f).abs().square().mul(exp_f)
-
-        return torch.trapz(err, t, dim = -1).mean()
 
     def forward(
         self,
@@ -637,7 +640,7 @@ class LatentAutoregressiveLoss(Module):
 
         # sigreg for lejepa/wm
 
-        sigreg = self.sigreg_loss(
+        sigreg = self.sigreg(
             sigreg_input,
             mask = sigreg_mask,
             **self.sigreg_loss_kwargs
@@ -2760,6 +2763,8 @@ class VideoTokenizer(Module):
         latent_ar_placement = 'encoder',
         latent_ar_sigreg_loss_kwargs = dict(num_slices = 256),
         latent_ar_sigreg_num_subspaces = None,
+        latent_sigreg_loss_weight = 0.,
+        latent_sigreg_loss_kwargs = dict(num_slices = 256),
         latent_consistency_loss_weight = 0.,
         time_attention_use_pope = False,
         decoder_flow_times_beta_alpha = 1.,
@@ -2866,10 +2871,7 @@ class VideoTokenizer(Module):
 
         # latents
 
-        self.encoded_to_latents = Sequential(
-            LinearNoBias(dim, dim_latent),
-            nn.Tanh(),
-        )
+        self.encoded_to_latents = LinearNoBias(dim, dim_latent)
 
         self.latents_to_decoder = LinearNoBias(dim_latent, dim)
 
@@ -2968,9 +2970,14 @@ class VideoTokenizer(Module):
             self.space_decorr_loss_normalizer = LossNormalizer() if encoder_add_decorr_aux_loss else None
             self.latent_ar_loss_normalizer = LossNormalizer() if self.has_latent_ar else None
             self.latent_consistency_loss_normalizer = LossNormalizer() if latent_consistency_loss_weight > 0. else None
+            self.latent_sigreg_loss_normalizer = LossNormalizer() if latent_sigreg_loss_weight > 0. else None
 
         self.latent_consistency_loss_weight = latent_consistency_loss_weight
         self.has_latent_consistency_loss = latent_consistency_loss_weight > 0.
+
+        self.latent_sigreg_loss_weight = latent_sigreg_loss_weight
+        self.latent_sigreg_loss_kwargs = default(latent_sigreg_loss_kwargs, dict())
+        self.has_latent_sigreg_loss = latent_sigreg_loss_weight > 0.
 
     @property
     def device(self):
@@ -3252,6 +3259,15 @@ class VideoTokenizer(Module):
 
         latents = self.encoded_to_latents(latents)
 
+        latent_sigreg_loss = self.zero
+        if self.has_latent_sigreg_loss:
+            latent_sigreg_loss = LatentAutoregressiveLoss.sigreg(
+                latents,
+                **self.latent_sigreg_loss_kwargs
+            )
+
+        latents = latents.tanh()
+
         if return_latents:
             next_time_cache = (next_spt_cache, next_pre_causal_conv_cache, next_transformer_cache, next_post_causal_conv_cache)
 
@@ -3371,6 +3387,9 @@ class VideoTokenizer(Module):
             if self.has_latent_consistency_loss:
                 latent_consistency_loss = self.latent_consistency_loss_normalizer(latent_consistency_loss, update_ema = update_loss_ema)
 
+            if self.has_latent_sigreg_loss:
+                latent_sigreg_loss = self.latent_sigreg_loss_normalizer(latent_sigreg_loss, update_ema = update_loss_ema)
+
         # losses
 
         total_loss = (
@@ -3380,13 +3399,14 @@ class VideoTokenizer(Module):
             space_decorr_loss * self.space_decorr_loss_weight +
             latent_ar_loss * self.latent_ar_loss_weight +
             latent_ar_sigreg_loss * self.latent_ar_sigreg_loss_weight +
-            latent_consistency_loss * self.latent_consistency_loss_weight
+            latent_consistency_loss * self.latent_consistency_loss_weight +
+            latent_sigreg_loss * self.latent_sigreg_loss_weight
         )
 
         if not return_intermediates:
             return total_loss
 
-        losses = TokenizerLosses(recon_loss, lpips_loss, time_decorr_loss, space_decorr_loss, latent_ar_loss, latent_ar_sigreg_loss, latent_consistency_loss)
+        losses = TokenizerLosses(recon_loss, lpips_loss, time_decorr_loss, space_decorr_loss, latent_ar_loss, latent_ar_sigreg_loss, latent_consistency_loss, latent_sigreg_loss)
 
         # handle returning of reconstructed, and image pretraining
 
