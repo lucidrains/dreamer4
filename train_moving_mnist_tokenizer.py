@@ -98,6 +98,8 @@ def main(
     decoder_flow_times_beta_alpha = 1.,
     decoder_flow_times_beta_beta = 1.,
     latent_consistency_loss_weight = 0.,
+    use_h_net = False,
+    h_net_target_length = 2.,
     clear_runs = False
 ):
     import shutil
@@ -137,6 +139,13 @@ def main(
 
     # tokenizer
 
+    h_net_kwargs = dict(
+        depth = 2,
+        heads = attn_heads,
+        dim_head = attn_dim_head,
+        target_avg_token_length = h_net_target_length
+    ) if use_h_net else None
+
     tokenizer = VideoTokenizer(
         dim = dim,
         dim_latent = dim_latent,
@@ -168,7 +177,9 @@ def main(
         decoder_flow_times_beta_alpha = decoder_flow_times_beta_alpha,
         decoder_flow_times_beta_beta = decoder_flow_times_beta_beta,
         encoder_moss_layers = encoder_moss_layers,
-        latent_consistency_loss_weight = latent_consistency_loss_weight
+        latent_consistency_loss_weight = latent_consistency_loss_weight,
+        h_net_layer = encoder_depth // 2 if use_h_net else None,
+        h_net_kwargs = h_net_kwargs
     )
 
     # trainer

@@ -33,6 +33,8 @@ from vit_pytorch.vivit_with_moss import MOSS
 
 from assoc_scan import AssocScan
 
+from h_net_dynamic_chunking import HNet
+
 from PoPE_pytorch import PoPE, flash_attn_with_pope
 
 from discrete_continuous_embed_readout import MultiCategorical, Readout
@@ -104,13 +106,13 @@ LayerNormNoBias = partial(nn.LayerNorm, bias = False)
 
 VideoTokenizerIntermediates = namedtuple('VideoTokenizerIntermediates', ('losses', 'recon'))
 
-TokenizerLosses = namedtuple('TokenizerLosses', ('recon', 'lpips', 'time_decorr', 'space_decorr', 'latent_ar', 'latent_ar_sigreg', 'latent_consistency', 'latent_sigreg'))
+TokenizerLosses = namedtuple('TokenizerLosses', ('recon', 'lpips', 'time_decorr', 'space_decorr', 'latent_ar', 'latent_ar_sigreg', 'latent_consistency', 'latent_sigreg', 'h_net'))
 
-WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'shortcut', 'rewards', 'terminals', 'discrete_actions', 'continuous_actions', 'state_pred', 'agent_state_pred', 'latent_ar', 'latent_ar_sigreg', 'lapo_action', 'lapo_fdm', 'lapo_raw_latent_fdm', 'tem'))
+WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'shortcut', 'rewards', 'terminals', 'discrete_actions', 'continuous_actions', 'state_pred', 'agent_state_pred', 'latent_ar', 'latent_ar_sigreg', 'lapo_action', 'lapo_fdm', 'lapo_raw_latent_fdm', 'tem', 'h_net'))
 
 AttentionIntermediates = namedtuple('AttentionIntermediates', ('next_kv_cache', 'normed_inputs'))
 
-TransformerIntermediates = namedtuple('TransformerIntermediates', ('next_kv_cache', 'normed_time_inputs', 'normed_space_inputs', 'next_rnn_hiddens', 'layer_hiddens', 'token_count', 'next_spatial_module_caches'), defaults=(None, None, None, None, None, 0, None))
+TransformerIntermediates = namedtuple('TransformerIntermediates', ('next_kv_cache', 'normed_time_inputs', 'normed_space_inputs', 'next_rnn_hiddens', 'layer_hiddens', 'token_count', 'next_spatial_module_caches', 'h_net_loss'), defaults=(None, None, None, None, None, 0, None, 0.))
 
 DynamicsIntermediates = namedtuple('DynamicsIntermediates', ('main', 'actor', 'critic', 'spatial', 'action', 'pre_encoded_spatial', 'pre_encoded_action'), defaults=(None, None, None, None, None, None, None))
 
@@ -2211,6 +2213,38 @@ class TEM(Module):
 
         return loss, pred_raw_latents
 
+# hierarchical temporal transformer with dynamic chunking
+
+class HNetTemporalTransformer(Module):
+    def __init__(
+        self,
+        dim,
+        depth = 2,
+        heads = 4,
+        dim_head = 32,
+        **kwargs
+    ):
+        super().__init__()
+
+        layers = []
+        for _ in range(depth):
+            layers.extend([
+                Residual(Attention(dim = dim, heads = heads, dim_head = dim_head, pre_context_rmsnorm = True)),
+                Residual(SwiGLUFeedforward(dim = dim))
+            ])
+
+        self.h_net = HNet(
+            dim = dim,
+            encoder = Identity(),
+            decoder = Identity(),
+            network = Sequential(*layers),
+            **kwargs
+        )
+
+    def forward(self, x, lens = None):
+        x, loss, *_ = self.h_net(x, lens = lens)
+        return x, loss
+
 # axial space time transformer
 
 class AxialSpaceTimeTransformer(Module):
@@ -2235,7 +2269,9 @@ class AxialSpaceTimeTransformer(Module):
         value_residual = True,               # https://arxiv.org/abs/2410.17897 - but with learned mixing from OSS
         rnn_time = False,
         time_attention_use_pope = False,
-        use_attn_pool = True
+        use_attn_pool = True,
+        h_net_layer: int | None = None,
+        h_net_kwargs: dict | None = None
     ):
         super().__init__()
         self.full_spatial_attn = full_spatial_attn
@@ -2341,6 +2377,15 @@ class AxialSpaceTimeTransformer(Module):
             self.final_special_cross_attn = Residual(Attention(dim = dim, heads = attn_heads, dim_head = attn_dim_head, pre_context_rmsnorm = True, **attn_kwargs))
             self.final_special_ff = Residual(SwiGLUFeedforward(dim = dim, **ff_kwargs))
 
+        # hierarchical temporal transformer
+
+        self.h_net_layer = h_net_layer
+        self.h_net = HNetTemporalTransformer(dim = dim, **h_net_kwargs) if exists(h_net_kwargs) else None
+
+        # dummy loss
+
+        self.register_buffer('zero', tensor(0.), persistent = False)
+
     def muon_parameters(self):
         muon_params = []
 
@@ -2353,6 +2398,7 @@ class AxialSpaceTimeTransformer(Module):
     def forward(
         self,
         tokens, # (b t s d)
+        time_lens = None,
         cache: TransformerIntermediates | None = None,
         return_intermediates = False,
         space_height = None,
@@ -2443,6 +2489,10 @@ class AxialSpaceTimeTransformer(Module):
         normed_time_attn_inputs = []
         normed_space_attn_inputs = []
 
+        # h-net ratio loss
+
+        h_net_loss = self.zero
+
         # attention
 
         layer_hiddens = [tokens]
@@ -2504,6 +2554,22 @@ class AxialSpaceTimeTransformer(Module):
             )
 
             tokens = post_attn_rearrange(tokens_out)
+
+            # hierarchical temporal transformer
+
+            is_h_net_layer = exists(self.h_net) and layer_index == self.h_net_layer
+
+            if is_h_net_layer:
+                tokens, inverse_pack_hnet = pack_one(tokens, '* t d')
+
+                h_net_lens = None
+                if exists(time_lens):
+                    h_net_lens = repeat(time_lens, 'b -> (b s)', s = tokens.shape[0] // time_lens.shape[0])
+
+                tokens, h_net_layer_loss = self.h_net(tokens, lens = h_net_lens)
+                h_net_loss = h_net_loss + h_net_layer_loss
+
+                tokens = inverse_pack_hnet(tokens)
 
             layer_hiddens.append(tokens)
 
@@ -2591,7 +2657,8 @@ class AxialSpaceTimeTransformer(Module):
             safe_stack(rnn_hiddens),
             hiddens,
             token_count + time,
-            next_spatial_module_caches
+            next_spatial_module_caches,
+            h_net_loss
         )
 
         return inverse_pack(out), intermediates
@@ -2768,7 +2835,10 @@ class VideoTokenizer(Module):
         latent_consistency_loss_weight = 0.,
         time_attention_use_pope = False,
         decoder_flow_times_beta_alpha = 1.,
-        decoder_flow_times_beta_beta = 1.
+        decoder_flow_times_beta_beta = 1.,
+        h_net_layer: int | None = None,
+        h_net_kwargs: dict | None = None,
+        h_net_loss_weight = 1.
     ):
         super().__init__()
 
@@ -2866,7 +2936,9 @@ class VideoTokenizer(Module):
             space_width = num_patch_width,
             final_norm = True,
             time_attention_use_pope = time_attention_use_pope,
-            rnn_time = use_time_rnn
+            rnn_time = use_time_rnn,
+            h_net_layer = h_net_layer,
+            h_net_kwargs = h_net_kwargs
         )
 
         # latents
@@ -2978,6 +3050,8 @@ class VideoTokenizer(Module):
         self.latent_sigreg_loss_weight = latent_sigreg_loss_weight
         self.latent_sigreg_loss_kwargs = default(latent_sigreg_loss_kwargs, dict())
         self.has_latent_sigreg_loss = latent_sigreg_loss_weight > 0.
+
+        self.h_net_loss_weight = h_net_loss_weight
 
     @property
     def device(self):
@@ -3226,6 +3300,7 @@ class VideoTokenizer(Module):
 
         tokens, intermediates = self.encoder_transformer(
             tokens,
+            time_lens = time_lens,
             cache = transformer_cache,
             return_intermediates = True,
             space_height = num_patch_height,
@@ -3233,6 +3308,7 @@ class VideoTokenizer(Module):
         )
 
         _, time_attn_normed_inputs, space_attn_normed_inputs, *_ = intermediates
+        h_net_loss = intermediates.h_net_loss
         next_transformer_cache = intermediates
 
         next_post_causal_conv_cache = None
@@ -3400,13 +3476,14 @@ class VideoTokenizer(Module):
             latent_ar_loss * self.latent_ar_loss_weight +
             latent_ar_sigreg_loss * self.latent_ar_sigreg_loss_weight +
             latent_consistency_loss * self.latent_consistency_loss_weight +
-            latent_sigreg_loss * self.latent_sigreg_loss_weight
+            latent_sigreg_loss * self.latent_sigreg_loss_weight +
+            h_net_loss * self.h_net_loss_weight
         )
 
         if not return_intermediates:
             return total_loss
 
-        losses = TokenizerLosses(recon_loss, lpips_loss, time_decorr_loss, space_decorr_loss, latent_ar_loss, latent_ar_sigreg_loss, latent_consistency_loss, latent_sigreg_loss)
+        losses = TokenizerLosses(recon_loss, lpips_loss, time_decorr_loss, space_decorr_loss, latent_ar_loss, latent_ar_sigreg_loss, latent_consistency_loss, latent_sigreg_loss, h_net_loss)
 
         # handle returning of reconstructed, and image pretraining
 
