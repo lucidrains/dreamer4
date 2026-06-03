@@ -28,6 +28,8 @@ from x_mlps_pytorch import MLP
 from x_mlps_pytorch.ensemble import Ensemble
 from x_mlps_pytorch.normed_mlp import create_mlp
 
+from x_transformers import Decoder
+
 from vit_pytorch.vit_with_decorr import DecorrelationLoss
 from vit_pytorch.vivit_with_moss import MOSS
 
@@ -113,7 +115,7 @@ WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'shortcut', 'rewards'
 
 AttentionIntermediates = namedtuple('AttentionIntermediates', ('next_kv_cache', 'normed_inputs'))
 
-TransformerIntermediates = namedtuple('TransformerIntermediates', ('next_kv_cache', 'normed_time_inputs', 'normed_space_inputs', 'next_rnn_hiddens', 'layer_hiddens', 'token_count', 'next_spatial_module_caches', 'h_net_loss'), defaults=(None, None, None, None, None, 0, None, 0.))
+TransformerIntermediates = namedtuple('TransformerIntermediates', ('next_kv_cache', 'normed_time_inputs', 'normed_space_inputs', 'next_rnn_hiddens', 'layer_hiddens', 'token_count', 'next_spatial_module_caches', 'h_net_loss', 'next_h_net_cache'), defaults=(None, None, None, None, None, 0, None, 0., None))
 
 DynamicsIntermediates = namedtuple('DynamicsIntermediates', ('main', 'actor', 'critic', 'spatial', 'action', 'pre_encoded_spatial', 'pre_encoded_action'), defaults=(None, None, None, None, None, None, None))
 
@@ -2216,7 +2218,7 @@ class TEM(Module):
 
 # hierarchical temporal transformer with dynamic chunking
 
-class HNetTemporalTransformer(Module):
+class HierarchicalTemporalTransformer(Module):
     def __init__(
         self,
         dim,
@@ -2227,24 +2229,17 @@ class HNetTemporalTransformer(Module):
     ):
         super().__init__()
 
-        layers = []
-        for _ in range(depth):
-            layers.extend([
-                Residual(Attention(dim = dim, heads = heads, dim_head = dim_head, pre_context_rmsnorm = True)),
-                Residual(SwiGLUFeedforward(dim = dim))
-            ])
-
         self.h_net = HNet(
             dim = dim,
             encoder = Identity(),
             decoder = Identity(),
-            network = Sequential(*layers),
+            network = Decoder(dim = dim, depth = depth, heads = heads, attn_dim_head = dim_head, rotary_pos_emb = True),
             **kwargs
         )
 
-    def forward(self, x, lens = None):
-        x, loss, *_ = self.h_net(x, lens = lens)
-        return x, loss
+    def forward(self, x, lens = None, cache = None, return_hiddens = False):
+        x, loss, _, next_cache = self.h_net(x, lens = lens, cache = cache, return_hiddens = return_hiddens)
+        return x, loss, next_cache
 
 # axial space time transformer
 
@@ -2381,7 +2376,7 @@ class AxialSpaceTimeTransformer(Module):
         # hierarchical temporal transformer
 
         self.h_net_layer = h_net_layer
-        self.h_net = HNetTemporalTransformer(dim = dim, **h_net_kwargs) if exists(h_net_kwargs) else None
+        self.h_net = HierarchicalTemporalTransformer(dim = dim, **h_net_kwargs) if exists(h_net_kwargs) else None
 
         # dummy loss
 
@@ -2474,6 +2469,9 @@ class AxialSpaceTimeTransformer(Module):
             if exists(cache) and exists(cache.next_spatial_module_caches):
                 spatial_module_caches = cache.next_spatial_module_caches
 
+        h_net_cache = cache.next_h_net_cache if exists(cache) else None
+        next_h_net_cache = None
+
         # positional embs
 
         time_pos_emb = self.time_rotary(time, offset = token_count)
@@ -2561,14 +2559,21 @@ class AxialSpaceTimeTransformer(Module):
             is_h_net_layer = exists(self.h_net) and layer_index == self.h_net_layer
 
             if is_h_net_layer:
+                tokens = rearrange(tokens, 'b t s d -> b s t d')
                 tokens, inverse_pack_hnet = pack_one(tokens, '* t d')
 
                 h_net_lens = maybe(repeat_interleave_to_match)(time_lens, tokens)
 
-                tokens, h_net_layer_loss = self.h_net(tokens, lens = h_net_lens)
+                tokens, h_net_layer_loss, next_h_net_cache = self.h_net(
+                    tokens,
+                    lens = h_net_lens,
+                    cache = h_net_cache,
+                    return_hiddens = return_intermediates
+                )
                 h_net_loss = h_net_loss + h_net_layer_loss
 
                 tokens = inverse_pack_hnet(tokens)
+                tokens = rearrange(tokens, 'b s t d -> b t s d')
 
             layer_hiddens.append(tokens)
 
@@ -2657,7 +2662,8 @@ class AxialSpaceTimeTransformer(Module):
             hiddens,
             token_count + time,
             next_spatial_module_caches,
-            h_net_loss
+            h_net_loss,
+            next_h_net_cache
         )
 
         return inverse_pack(out), intermediates
