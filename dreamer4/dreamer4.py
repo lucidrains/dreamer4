@@ -88,6 +88,15 @@ from einx import add, multiply, equal, logical_and
 from einops import einsum, rearrange, repeat, reduce, pack, unpack
 from einops.layers.torch import Rearrange, Reduce
 
+# activations
+
+def relu_squared(t):
+    return F.relu(t).square()
+
+class ReLUSquared(Module):
+    def forward(self, x):
+        return relu_squared(x)
+
 # flex attention - but will make sure it works if it is not available
 # may also end up crafting own custom flash attention kernel for this work
 
@@ -576,7 +585,7 @@ class LatentAutoregressiveLoss(Module):
             net = nn.Sequential(
                 project_in,
                 norm,
-                MLP(dim, dim * 4, dim, activation = nn.SiLU())
+                MLP(dim, dim * 4, dim, activation = ReLUSquared())
             )
 
         self.net = net
@@ -1740,7 +1749,7 @@ class Attention(Module):
 
 # feedforward
 
-class SwiGLUFeedforward(Module):
+class ReLUSquaredFeedforward(Module):
     def __init__(
         self,
         dim,
@@ -1750,9 +1759,9 @@ class SwiGLUFeedforward(Module):
         super().__init__()
         self.norm = RMSNorm(dim) if pre_rmsnorm else Identity()
 
-        dim_inner = int(dim * expansion_factor * 2 / 3)
+        dim_inner = int(dim * expansion_factor)
 
-        self.proj_in = Linear(dim, dim_inner * 2)
+        self.proj_in = Linear(dim, dim_inner)
         self.proj_out = Linear(dim_inner, dim)
 
     def muon_parameters(self):
@@ -1764,8 +1773,8 @@ class SwiGLUFeedforward(Module):
     def forward(self, x):
         x = self.norm(x)
 
-        x, gates = self.proj_in(x).chunk(2, dim = -1)
-        x = x * F.gelu(gates)
+        x = self.proj_in(x)
+        x = relu_squared(x)
 
         return self.proj_out(x)
 
@@ -1893,7 +1902,7 @@ class LAPO(Module):
         # state + next state projected embeddings -> latent action - IDM
 
         self.state_norm = RMSNorm(dim_embed)
-        self.to_latent_action_embed = MLP(dim_embed * 2, dim_mlp_hidden, dim_latent_action, activation = nn.SiLU())
+        self.to_latent_action_embed = MLP(dim_embed * 2, dim_mlp_hidden, dim_latent_action, activation = ReLUSquared())
 
         # simplicial embed for action bottleneck
 
@@ -1908,7 +1917,7 @@ class LAPO(Module):
         # forward dynamics model - projected space
 
         self.use_fdm = use_fdm
-        self.to_pred_next_state_embed = MLP(dim_embed + dim_latent_action, dim_mlp_hidden, dim_project, activation = nn.SiLU()) if use_fdm else None
+        self.to_pred_next_state_embed = MLP(dim_embed + dim_latent_action, dim_mlp_hidden, dim_project, activation = ReLUSquared()) if use_fdm else None
 
         # forward dynamics model - raw latent space
 
@@ -1917,7 +1926,7 @@ class LAPO(Module):
 
         if self.has_raw_latent_fdm:
             dim_raw_latent_concat = dim_raw_latent * num_raw_latent_tokens
-            self.to_pred_raw_latent = MLP(dim_embed + dim_latent_action, dim_mlp_hidden, dim_mlp_hidden, dim_raw_latent_concat, activation = nn.SiLU())
+            self.to_pred_raw_latent = MLP(dim_embed + dim_latent_action, dim_mlp_hidden, dim_mlp_hidden, dim_raw_latent_concat, activation = ReLUSquared())
             self.num_raw_latent_tokens = num_raw_latent_tokens
             self.dim_raw_latent = dim_raw_latent
 
@@ -2031,7 +2040,7 @@ class TEM(Module):
             dim_raw_latent,
             dim_structure,
             dim_encoded_sensory,
-            activation = nn.SiLU()
+            activation = ReLUSquared()
         )
 
         self.structural_norm = RMSNorm(dim_structure)
@@ -2062,7 +2071,7 @@ class TEM(Module):
         if talking_heads:
             nn.init.dirac_(self.talking_heads.weight)
 
-        self.activation = nn.SiLU()
+        self.activation = ReLUSquared()
 
         # dummy tokens for shifted attention to mask diagonal
 
@@ -2086,7 +2095,7 @@ class TEM(Module):
             dim_structure,
             dim_structure,
             dim_raw_latent * num_raw_latent_tokens,
-            activation = nn.SiLU()
+            activation = ReLUSquared()
         )
 
         self.register_buffer('zero', tensor(0.), persistent = False)
@@ -2329,7 +2338,7 @@ class AxialSpaceTimeTransformer(Module):
                 rearrange_to_attend,
                 rearrange_from_attend,
                 Residual(Attention(dim = dim, heads = attn_heads, dim_head = attn_dim_head, value_residual = value_residual, **attn_kwargs)),
-                Residual(SwiGLUFeedforward(dim = dim, **ff_kwargs))
+                Residual(ReLUSquaredFeedforward(dim = dim, **ff_kwargs))
             ]))
 
             rnn_layers.append(Residual(GRULayer(dim, dim)) if is_time_block and rnn_time else None)
@@ -2371,7 +2380,7 @@ class AxialSpaceTimeTransformer(Module):
 
         if self.should_special_cross_attend:
             self.final_special_cross_attn = Residual(Attention(dim = dim, heads = attn_heads, dim_head = attn_dim_head, pre_context_rmsnorm = True, **attn_kwargs))
-            self.final_special_ff = Residual(SwiGLUFeedforward(dim = dim, **ff_kwargs))
+            self.final_special_ff = Residual(ReLUSquaredFeedforward(dim = dim, **ff_kwargs))
 
         # hierarchical temporal transformer
 
@@ -2386,7 +2395,7 @@ class AxialSpaceTimeTransformer(Module):
         muon_params = []
 
         for m in self.modules():
-            if isinstance(m, (Attention, SwiGLUFeedforward)):
+            if isinstance(m, (Attention, ReLUSquaredFeedforward)):
                 muon_params.extend(m.muon_parameters())
 
         return muon_params
@@ -2689,7 +2698,7 @@ class CausalDepthwiseConv3d(Module):
             groups = dim
         )
 
-        self.act = nn.SiLU()
+        self.act = ReLUSquared()
         self.proj = Linear(dim, dim)
 
     def forward(
@@ -2964,6 +2973,7 @@ class VideoTokenizer(Module):
             dim = dim * 2,
             dim_out = dim,
             depth = decoder_pos_mlp_depth,
+            activation = ReLUSquared()
         )
 
         decoder_moss_modules = ModuleDict({
@@ -3526,7 +3536,7 @@ class SelfFlow(Module):
 
         self.teacher_time_modifier_fn = teacher_time_modifier_fn
 
-        self.student_predict_head = SwiGLUFeedforward(dim = model.dim)
+        self.student_predict_head = ReLUSquaredFeedforward(dim = model.dim)
 
     def forward(
         self,
@@ -3823,7 +3833,8 @@ class DynamicsWorldModel(Module):
             dim_in = dim,
             dim = dim * 4,
             dim_out = dim * 4,
-            depth = policy_head_mlp_depth
+            depth = policy_head_mlp_depth,
+            activation = ReLUSquared()
         )
 
         # action embedder
@@ -3884,7 +3895,8 @@ class DynamicsWorldModel(Module):
                     dim_in = dim_agent_state_in,
                     dim = dim_agent_state_in * 2,
                     dim_out = num_latent_tokens * dim_latent * 2,
-                    depth = 2
+                    depth = 2,
+                    activation = ReLUSquared()
                 ),
                 Rearrange('... (n d two) -> ... n d two', n = num_latent_tokens, two = 2)
             )
@@ -3921,6 +3933,9 @@ class DynamicsWorldModel(Module):
         self.predict_terminals = predict_terminals
 
         if predict_terminals:
+            predict_terminal_mlp_kwargs = dict(predict_terminal_mlp_kwargs)
+            predict_terminal_mlp_kwargs['activation'] = ReLUSquared()
+
             self.to_state_terminal_pred = Sequential(
                 create_mlp(
                     dim_in = dim_latent,
@@ -3938,6 +3953,7 @@ class DynamicsWorldModel(Module):
             dim = dim * 4,
             dim_out = self.reward_encoder.num_bins,
             depth = value_head_mlp_depth,
+            activation = ReLUSquared()
         )
 
         # pre encoder and ssl modules

@@ -54,7 +54,8 @@ from dreamer4.dreamer4 import (
     exists,
     default,
     cast_to_tensor,
-    VideoTokenizer
+    VideoTokenizer,
+    ReLUSquared
 )
 
 # env
@@ -108,11 +109,11 @@ class SmallConvEncoder(nn.Module):
 
         self.net = nn.Sequential(
             nn.Conv2d(3, 16, 4, stride = 2, padding = 1),
-            nn.ReLU(),
+            ReLUSquared(),
             nn.Conv2d(16, 32, 4, stride = 2, padding = 1),
-            nn.ReLU(),
+            ReLUSquared(),
             nn.Conv2d(32, 64, 4, stride = 2, padding = 1),
-            nn.ReLU(),
+            ReLUSquared(),
             nn.Conv2d(64, num_latent_tokens * dim_latent, 8, stride = 1, padding = 0),
             nn.Tanh()
         )
