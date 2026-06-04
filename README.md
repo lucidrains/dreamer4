@@ -14,6 +14,8 @@ Implementation of Danijar's [latest iteration](https://arxiv.org/abs/2509.24527v
 
 - [@CarsonBurke](https://github.com/CarsonBurke) for identifying and contributing bug fixes!
 
+- `@njha` in discord channel for finding an issue with the flow loss weight for the dynamics model!
+
 ## Install
 
 ```bash

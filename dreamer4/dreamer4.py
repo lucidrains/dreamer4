@@ -5969,17 +5969,7 @@ class DynamicsWorldModel(Module):
 
         # flow loss
 
-        flow_loss_weight = 1.
-
-        if is_x_space:
-            flow_loss_weight = (1. - times) ** 2
-
         flow_losses = F.mse_loss(pred_flow, pred_target, reduction = 'none')
-
-        if is_tensor(flow_loss_weight):
-            flow_loss_weight, _ = align_dims_left((flow_loss_weight, flow_losses))
-
-        flow_losses = flow_losses * flow_loss_weight
 
         # shortcut loss
 
