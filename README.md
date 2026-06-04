@@ -312,4 +312,28 @@ Passing `--condition_on_actions True` lets you explicitly prompt with velocity a
 }
 ```
 
+```bibtex
+@misc{han2026firefrobeniusisometryreinitializationbalancing,
+    title   = {FIRE: Frobenius-Isometry Reinitialization for Balancing the Stability-Plasticity Tradeoff},
+    author  = {Isaac Han and Sangyeon Park and Seungwon Oh and Donghu Kim and Hojoon Lee and Kyung-Joong Kim},
+    year    = {2026},
+    eprint  = {2602.08040},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2602.08040},
+}
+```
+
+```bibtex
+@misc{ash2020warmstartingneuralnetworktraining,
+    title   = {On Warm-Starting Neural Network Training},
+    author  = {Jordan T. Ash and Ryan P. Adams},
+    year    = {2020},
+    eprint  = {1910.08475},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/1910.08475},
+}
+```
+
 *the conquest of nature is to be achieved through number and measure - angels to Descartes in a dream*

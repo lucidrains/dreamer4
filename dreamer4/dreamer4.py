@@ -416,6 +416,55 @@ def create_multi_token_prediction_targets(
 
     return out, mask
 
+# FIRE - Frobenius-Isometry Reinitialization
+# Han et al. https://arxiv.org/abs/2602.08040
+# Shrink and perturb - Ash et al. https://arxiv.org/abs/1910.08475
+
+@torch.no_grad()
+def apply_fire(
+    module,
+    num_iters = 20,
+    coefs = (1.5, -0.5),
+    shrink_perturb = False,
+    shrink_perturb_factors = (0.5, 0.01)
+):
+    a, b = coefs
+
+    for p in module.parameters():
+        if p.ndim != 2:
+            continue
+
+        t = p.data
+        t_norm = t.norm()
+
+        if t_norm == 0.:
+            continue
+
+        t = t / t_norm
+
+        dim_out, dim_in = t.shape
+        is_wide = dim_out < dim_in
+
+        if is_wide:
+            t = t.T
+
+        for _ in range(num_iters):
+            A = t.T @ t
+            t = a * t + b * (t @ A)
+
+        if is_wide:
+            t = t.T
+
+        t = t * (t_norm / t.norm())
+
+        if shrink_perturb:
+            scale, noise_scale = shrink_perturb_factors
+            noise = torch.randn_like(t)
+
+            t = t.mul_(1. - scale).add_(noise * noise_scale)
+
+        p.data.copy_(t)
+
 # loss related
 
 class LossNormalizer(Module):
@@ -5478,6 +5527,22 @@ class DynamicsWorldModel(Module):
             return gen
 
         return gen, time_cache
+
+    @torch.no_grad()
+    def apply_fire_(
+        self,
+        num_iters = 20,
+        coefs = (1.5, -0.5),
+        shrink_perturb = False,
+        shrink_perturb_factors = (0.5, 0.01)
+    ):
+        apply_fire(
+            self,
+            num_iters = num_iters,
+            coefs = coefs,
+            shrink_perturb = shrink_perturb,
+            shrink_perturb_factors = shrink_perturb_factors
+        )
 
     def forward(
         self,
