@@ -60,7 +60,8 @@ def main(
     checkpoint_path = None,
     num_train_steps = 100_000,
     num_latents = 32,
-    batch_size = 64,
+    batch_size = 16,
+    encoder_moss_layers = (2,),
     grad_accum_every = 1,
     min_velocity = -2,
     max_velocity = 3,
@@ -95,7 +96,11 @@ def main(
     time_attention_use_pope = False,
     restrict_latent_grads_to_noise = True,
     decoder_flow_times_beta_alpha = 1.,
-    decoder_flow_times_beta_beta = 1.
+    decoder_flow_times_beta_beta = 1.,
+    latent_consistency_loss_weight = 0.,
+    use_h_net = False,
+    h_net_target_length = 2.,
+    clear_runs = False
 ):
     import shutil
 
@@ -103,6 +108,10 @@ def main(
 
     log_path = Path(log_dir)
     ckpt_folder_path = Path(checkpoint_folder)
+
+    if clear_runs and log_path.exists():
+        shutil.rmtree(log_path)
+
     latest_checkpoint = None
 
     if exists(checkpoint_path):
@@ -118,8 +127,6 @@ def main(
 
     log_path.mkdir(exist_ok = True, parents = True)
 
-    log_path.mkdir(exist_ok = True, parents = True)
-
     # dataset
 
     dataset = MovingMNISTDataset(
@@ -131,6 +138,13 @@ def main(
     )
 
     # tokenizer
+
+    h_net_kwargs = dict(
+        depth = 2,
+        heads = attn_heads,
+        dim_head = attn_dim_head,
+        target_avg_token_length = h_net_target_length
+    ) if use_h_net else None
 
     tokenizer = VideoTokenizer(
         dim = dim,
@@ -161,7 +175,11 @@ def main(
         time_attention_use_pope = time_attention_use_pope,
         latent_grad_only_at_noise = restrict_latent_grads_to_noise,
         decoder_flow_times_beta_alpha = decoder_flow_times_beta_alpha,
-        decoder_flow_times_beta_beta = decoder_flow_times_beta_beta
+        decoder_flow_times_beta_beta = decoder_flow_times_beta_beta,
+        encoder_moss_layers = encoder_moss_layers,
+        latent_consistency_loss_weight = latent_consistency_loss_weight,
+        h_net_layer = encoder_depth // 2 if use_h_net else None,
+        h_net_kwargs = h_net_kwargs
     )
 
     # trainer

@@ -14,6 +14,8 @@ Implementation of Danijar's [latest iteration](https://arxiv.org/abs/2509.24527v
 
 - [@CarsonBurke](https://github.com/CarsonBurke) for identifying and contributing bug fixes!
 
+- `@njha` in discord channel for finding an issue with the flow loss weight for the dynamics model!
+
 ## Install
 
 ```bash
@@ -293,6 +295,30 @@ Training scalars are written to a fresh timestamped TensorBoard directory under 
     archivePrefix = {arXiv},
     primaryClass = {cs.LG},
     url     = {https://arxiv.org/abs/2401.16025},
+}
+```
+
+```bibtex
+@misc{zhao2026subjepasubspacegaussianregularization,
+    title   = {Sub-JEPA: Subspace Gaussian Regularization for Stable End-to-End World Models},
+    author  = {Kai Zhao and Dongliang Nie and Yuchen Lin and Zhehan Luo and Yixiao Gu and Deng-Ping Fan and Dan Zeng},
+    year    = {2026},
+    eprint  = {2605.09241},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2605.09241},
+}
+```
+
+```bibtex
+@misc{wu2025h3aehighcompressionhigh,
+    title   = {H3AE: High Compression, High Speed, and High Quality AutoEncoder for Video Diffusion Models},
+    author  = {Yushu Wu and Yanyu Li and Ivan Skorokhodov and Anil Kag and Willi Menapace and Sharath Girish and Aliaksandr Siarohin and Yanzhi Wang and Sergey Tulyakov},
+    year    = {2025},
+    eprint  = {2504.10567},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.CV},
+    url     = {https://arxiv.org/abs/2504.10567},
 }
 ```
 

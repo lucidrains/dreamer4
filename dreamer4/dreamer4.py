@@ -4,7 +4,7 @@ from typing import Callable, Iterable, NamedTuple, Tuple, Literal
 import numpy as np
 from math import ceil, log2
 from random import random
-from contextlib import nullcontext
+from contextlib import nullcontext, contextmanager
 from collections import namedtuple
 from functools import partial, wraps
 from dataclasses import dataclass, asdict, fields
@@ -12,9 +12,11 @@ from dataclasses import dataclass, asdict, fields
 import torch
 import torch.nn.functional as F
 from torch.distributions import Normal, Beta, kl
-from torch.nn import Module, ModuleList, Embedding, Parameter, Sequential, Linear, RMSNorm, Identity
+from torch.nn import Module, ModuleList, ModuleDict, Embedding, Parameter, Sequential, Linear, RMSNorm
 from torch import nn, cat, stack, arange, tensor, Tensor, is_tensor, full, zeros, ones, randint, rand, randn, randn_like, empty, full, linspace, arange
 from torch.utils._pytree import tree_map, tree_flatten, tree_unflatten
+
+from torch_einops_utils.nn import Identity
 
 import torchvision
 from torchvision.models import VGG16_Weights
@@ -26,9 +28,14 @@ from x_mlps_pytorch import MLP
 from x_mlps_pytorch.ensemble import Ensemble
 from x_mlps_pytorch.normed_mlp import create_mlp
 
+from x_transformers import Decoder
+
 from vit_pytorch.vit_with_decorr import DecorrelationLoss
+from vit_pytorch.vivit_with_moss import MOSS
 
 from assoc_scan import AssocScan
+
+from h_net_dynamic_chunking import HNet
 
 from PoPE_pytorch import PoPE, flash_attn_with_pope
 
@@ -45,7 +52,9 @@ from torch_einops_utils import (
     pad_right_at_dim_to,
     pad_right_ndim_to,
     lens_to_mask,
+    shift_right,
     masked_mean,
+    repeat_interleave_to_match,
     safe_stack,
     safe_cat,
     slice_right_at_dim,
@@ -110,13 +119,13 @@ LayerNormNoBias = partial(nn.LayerNorm, bias = False)
 
 VideoTokenizerIntermediates = namedtuple('VideoTokenizerIntermediates', ('losses', 'recon'))
 
-TokenizerLosses = namedtuple('TokenizerLosses', ('recon', 'lpips', 'time_decorr', 'space_decorr', 'latent_ar', 'latent_ar_sigreg'))
+TokenizerLosses = namedtuple('TokenizerLosses', ('recon', 'lpips', 'time_decorr', 'space_decorr', 'latent_ar', 'latent_ar_sigreg', 'latent_consistency', 'latent_sigreg', 'h_net'))
 
-WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'shortcut', 'rewards', 'terminals', 'discrete_actions', 'continuous_actions', 'state_pred', 'agent_state_pred', 'latent_ar', 'latent_ar_sigreg', 'lapo_action', 'lapo_fdm', 'lapo_raw_latent_fdm', 'tem'))
+WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'shortcut', 'rewards', 'terminals', 'discrete_actions', 'continuous_actions', 'state_pred', 'agent_state_pred', 'latent_ar', 'latent_ar_sigreg', 'lapo_action', 'lapo_fdm', 'lapo_raw_latent_fdm', 'tem', 'h_net'))
 
 AttentionIntermediates = namedtuple('AttentionIntermediates', ('next_kv_cache', 'normed_inputs'))
 
-TransformerIntermediates = namedtuple('TransformerIntermediates', ('next_kv_cache', 'normed_time_inputs', 'normed_space_inputs', 'next_rnn_hiddens', 'layer_hiddens', 'token_count'), defaults=(None, None, None, None, None, 0))
+TransformerIntermediates = namedtuple('TransformerIntermediates', ('next_kv_cache', 'normed_time_inputs', 'normed_space_inputs', 'next_rnn_hiddens', 'layer_hiddens', 'token_count', 'next_spatial_module_caches', 'h_net_loss', 'next_h_net_cache'), defaults=(None, None, None, None, None, 0, None, 0., None))
 
 DynamicsIntermediates = namedtuple('DynamicsIntermediates', ('main', 'actor', 'critic', 'spatial', 'action', 'pre_encoded_spatial', 'pre_encoded_action'), defaults=(None, None, None, None, None, None, None))
 
@@ -226,11 +235,6 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
-def cast_to_tensor(t, device, dtype = None):
-    t = t if is_tensor(t) else tensor(t)
-    t = t.to(dtype) if exists(dtype) else t
-    return t.to(device)
-
 def cosine_distance(x, y, mask = None):
     dist = 1. - F.cosine_similarity(x, y, dim = -1)
     return masked_mean(dist, mask)
@@ -258,6 +262,27 @@ def sample_prob(prob):
 
 def is_power_two(num):
     return log2(num).is_integer()
+
+def cast_to_tensor(t, device, dtype = None):
+    t = t if is_tensor(t) else tensor(t)
+    t = t.to(dtype) if exists(dtype) else t
+    return t.to(device)
+
+@contextmanager
+def temp_requires_grad(
+    parameters,
+    requires_grad = False
+):
+    parameters = list(parameters)
+    orig_requires_grad = [p.requires_grad for p in parameters]
+
+    for p in parameters:
+        p.requires_grad_(requires_grad)
+
+    yield
+
+    for p, orig in zip(parameters, orig_requires_grad):
+        p.requires_grad_(orig)
 
 # tensor helpers
 
@@ -319,7 +344,9 @@ def with_seed(seed):
     return decorator
 
 def is_empty(t):
-    return t.numel() == 0
+    if is_tensor(t):
+        return t.numel() == 0
+    return len(t) == 0
 
 def log(t, eps = 1e-20):
     return t.clamp(min = eps).log()
@@ -398,12 +425,6 @@ def create_multi_token_prediction_targets(
     out = t[batch_arange, indices]
 
     return out, mask
-
-# helper modules
-
-class Identity(Module):
-    def forward(self, t, *args, **kwargs):
-        return t
 
 # loss related
 
@@ -498,13 +519,59 @@ class LPIPSLoss(Module):
 
         return F.mse_loss(embed, pred_embed)
 
+# signature regularization
+
+def sigreg(
+    x,
+    num_slices = 1024,
+    domain = (-5, 5),
+    num_knots = 17,
+    mask = None
+):
+    # Randall Balestriero - https://arxiv.org/abs/2511.08544
+    # Sub-JEPA - https://arxiv.org/abs/2605.09241v1
+
+    dim, device = x.shape[-1], x.device
+
+    # slice sampling
+
+    rand_projs = torch.randn((num_slices, dim), device = device)
+    rand_projs = l2norm(rand_projs)
+
+    # integration points
+
+    t = torch.linspace(*domain, num_knots, device = device)
+
+    # theoretical CF for N(0, 1) and Gauss. window
+
+    exp_f = (-0.5 * t.square()).exp()
+
+    # empirical CF
+
+    x_t = einx.dot('k ... d, m d -> k (...) m', x, rand_projs)
+
+    x_t = multiply('k n m, t -> k n m t', x_t, t)
+    ecf = (1j * x_t).exp()
+
+    mask_1d = rearrange(mask, 'k ... -> k (...)') if exists(mask) else None
+    ecf = masked_mean(ecf, mask_1d, dim = 1)
+
+    # weighted L2 distance
+
+    err = ecf.sub(exp_f).abs().square().mul(exp_f)
+
+    return torch.trapz(err, t, dim = -1).mean()
+
 class LatentAutoregressiveLoss(Module):
+    sigreg = staticmethod(sigreg)
+
     def __init__(
         self,
         dim,
         dim_in = None,
         use_rmsnorm = False,
         sigreg_loss_kwargs: dict | None = None,
+        sigreg_num_subspaces = None,
         net: Module | None = None
     ):
         super().__init__()
@@ -524,46 +591,16 @@ class LatentAutoregressiveLoss(Module):
 
         self.net = net
 
-    @staticmethod
-    def sigreg_loss(
-        x,
-        num_slices = 1024,
-        domain = (-5, 5),
-        num_knots = 17,
-        mask = None
-    ):
-        # Randall Balestriero - https://arxiv.org/abs/2511.08544
+        # Sub-JEPA subspace gaussian regularization
 
-        dim, device = x.shape[-1], x.device
+        self.num_subspaces = default(sigreg_num_subspaces, 1)
 
-        # slice sampling
+        if self.num_subspaces > 1:
+            dim_subspace, remainder = divmod(dim, self.num_subspaces)
+            assert remainder == 0, f'dimension {dim} must be divisible by number of subspaces {self.num_subspaces}'
 
-        rand_projs = torch.randn((num_slices, dim), device = device)
-        rand_projs = l2norm(rand_projs)
-
-        # integration points
-
-        t = torch.linspace(*domain, num_knots, device = device)
-
-        # theoretical CF for N(0, 1) and Gauss. window
-
-        exp_f = (-0.5 * t.square()).exp()
-
-        # empirical CF
-
-        x_t = einx.dot('... d, m d -> (...) m', x, rand_projs)
-
-        x_t = multiply('n m, t -> n m t', x_t, t)
-        ecf = (1j * x_t).exp()
-
-        mask_1d = rearrange(mask, '... -> (...)') if exists(mask) else None
-        ecf = masked_mean(ecf, mask_1d, dim = 0)
-
-        # weighted L2 distance
-
-        err = ecf.sub(exp_f).abs().square().mul(exp_f)
-
-        return torch.trapz(err, t, dim = -1).mean()
+            projs = torch.stack([nn.init.orthogonal_(torch.empty(dim_subspace, dim)) for _ in range(self.num_subspaces)])
+            self.register_buffer('subspace_projs', projs)
 
     def forward(
         self,
@@ -605,7 +642,25 @@ class LatentAutoregressiveLoss(Module):
             sigreg_input = cat((x[:, :-1], target_output), dim = 0)
             sigreg_mask = cat((mask, mask), dim = 0) if exists(mask) else None
 
-        sigreg = self.sigreg_loss(sigreg_input, mask = sigreg_mask, **self.sigreg_loss_kwargs)
+        # sub-jepa - Kai Zhao et al https://arxiv.org/abs/2605.09241v1
+
+        if self.num_subspaces > 1:
+            sigreg_input = einx.dot('... dim, k dim_subspace dim -> k ... dim_subspace', sigreg_input, self.subspace_projs)
+            if exists(sigreg_mask):
+                sigreg_mask = repeat(sigreg_mask, '... -> k ...', k = self.num_subspaces)
+        else:
+            sigreg_input = rearrange(sigreg_input, '... d -> 1 ... d')
+            if exists(sigreg_mask):
+                sigreg_mask = rearrange(sigreg_mask, '... -> 1 ...')
+
+        # sigreg for lejepa/wm
+
+        sigreg = self.sigreg(
+            sigreg_input,
+            mask = sigreg_mask,
+            **self.sigreg_loss_kwargs
+        )
+
         return loss, sigreg, pred
 
 def ramp_weight(times, slope = 0.9, intercept = 0.1):
@@ -2058,7 +2113,9 @@ class TEM(Module):
         dim_encoded_sensory = None,
         heads = 8,
         dim_head = 64,
-        talking_heads = True
+        talking_heads = True,
+        first_state_as_init_hidden = True,
+        learn_relative_actions = False
     ):
         super().__init__()
 
@@ -2068,7 +2125,25 @@ class TEM(Module):
         # path integration
 
         self.gru = nn.GRU(dim_action_embed, dim_structure, batch_first = True)
-        self.init_hiddens = Parameter(randn(1, 1, dim_structure) * 1e-2)
+        self.first_state_as_init_hidden = first_state_as_init_hidden
+        self.learn_relative_actions = learn_relative_actions
+
+        self.learned_relative_encode = MLP(
+            dim_action_embed * 2,
+            dim_action_embed * 2,
+            dim_action_embed,
+            activation = nn.SiLU()
+        ) if learn_relative_actions else None
+
+        if first_state_as_init_hidden:
+            self.to_init_hiddens = MLP(
+                dim_encoded_sensory,
+                dim_structure,
+                dim_structure,
+                activation = nn.SiLU()
+            )
+        else:
+            self.init_hiddens = Parameter(randn(1, 1, dim_structure) * 1e-2)
 
         # sensory encoder
 
@@ -2138,7 +2213,7 @@ class TEM(Module):
 
     def forward(
         self,
-        action_tokens,
+        next_action_tokens,
         raw_latents,
         return_preds = False
     ):
@@ -2151,17 +2226,41 @@ class TEM(Module):
 
         # path integration
 
-        batch = action_tokens.shape[0]
-        init_hiddens = repeat(self.init_hiddens, '1 1 d -> 1 b d', b = batch)
+        batch, time, _ = encoded_sensory.shape
 
-        structural_codes, _ = self.gru(action_tokens, init_hiddens)
+        if self.first_state_as_init_hidden:
+            init_hiddens = self.to_init_hiddens(encoded_sensory[:, 0])
+            init_hiddens_gru = rearrange(init_hiddens, 'b d -> 1 b d')
+            structural_codes_init = rearrange(init_hiddens, 'b d -> b 1 d')
+        else:
+            init_hiddens_gru = repeat(self.init_hiddens, '1 1 d -> 1 b d', b = batch)
+            structural_codes_init = repeat(self.init_hiddens, '1 1 d -> b 1 d', b = batch)
+
+        # path integration over actions
+
+        actions = next_action_tokens[:, :(time - 1)] # each action predicts the next state
+
+        if actions.ndim == 4:
+            assert actions.shape[2] == 1, 'TEM is only supported for single agent'
+            actions = rearrange(actions, 'b t 1 d -> b t d')
+
+        has_actions = actions.shape[1] > 0
+
+        if self.learn_relative_actions and has_actions:
+            past_actions = shift_right(actions, amount = 1, dim = 1)
+            actions_with_past = torch.cat((actions, past_actions), dim = -1)
+            actions = self.learned_relative_encode(actions_with_past)
+
+        if has_actions:
+            gru_out, _ = self.gru(actions, init_hiddens_gru)
+            structural_codes = cat((structural_codes_init, gru_out), dim = 1)
+        else:
+            structural_codes = structural_codes_init
 
         # rmsnorm both
 
         structural_codes = self.structural_norm(structural_codes)
         encoded_sensory = self.sensory_norm(encoded_sensory)
-
-        structural_and_sensory = cat((structural_codes, encoded_sensory), dim = -1)
 
         # implicit mlp memory (depth 2)
 
@@ -2211,16 +2310,21 @@ class TEM(Module):
 
         # decode and loss
 
-        pred_raw_concat = self.sensory_decoder(out)
+        pred_raw = self.sensory_decoder(out)
 
-        target_raw_concat = rearrange(raw_latents, 'b t n d -> b t (n d)')
+        target_raw = rearrange(raw_latents, 'b t n d -> b t (n d)')
 
         # omit the very first token
 
-        pred_raw_concat_sliced = pred_raw_concat[:, 1:]
-        target_raw_concat_sliced = target_raw_concat[:, 1:]
+        pred_raw_sliced = pred_raw[:, 1:]
+        target_raw_sliced = target_raw[:, 1:]
 
-        loss = F.mse_loss(pred_raw_concat_sliced, target_raw_concat_sliced.detach())
+        has_predictions = pred_raw_sliced.shape[1] > 0
+
+        loss = self.zero
+
+        if has_predictions:
+            loss = F.mse_loss(pred_raw_sliced, target_raw_sliced.detach())
 
         if not return_preds:
             return loss
@@ -2228,9 +2332,34 @@ class TEM(Module):
         # restore predictions to raw latents shape for external use
 
         _, _, n, d = raw_latents.shape
-        pred_raw_latents = rearrange(pred_raw_concat, 'b t (n d) -> b t n d', n = n, d = d)
+        pred_raw_latents = rearrange(pred_raw, 'b t (n d) -> b t n d', n = n, d = d)
 
         return loss, pred_raw_latents
+
+# hierarchical temporal transformer with dynamic chunking
+
+class HierarchicalTemporalTransformer(Module):
+    def __init__(
+        self,
+        dim,
+        depth = 2,
+        heads = 4,
+        dim_head = 32,
+        **kwargs
+    ):
+        super().__init__()
+
+        self.h_net = HNet(
+            dim = dim,
+            encoder = Identity(),
+            decoder = Identity(),
+            network = Decoder(dim = dim, depth = depth, heads = heads, attn_dim_head = dim_head, rotary_pos_emb = True),
+            **kwargs
+        )
+
+    def forward(self, x, lens = None, cache = None, return_hiddens = False):
+        x, loss, _, next_cache = self.h_net(x, lens = lens, cache = cache, return_hiddens = return_hiddens)
+        return x, loss, next_cache
 
 # axial space time transformer
 
@@ -2250,11 +2379,16 @@ class AxialSpaceTimeTransformer(Module):
         special_attend_only_itself = False,  # this is set to True for the video tokenizer decoder (latents can only attend to itself while spatial modalities attend to the latents and everything)
         full_spatial_attn = False,
         final_special_cross_attn = True,
+        spatial_modules: dict | None = None,
+        space_height: int | None = None,
+        space_width: int | None = None,
         final_norm = True,
         value_residual = True,               # https://arxiv.org/abs/2410.17897 - but with learned mixing from OSS
         rnn_time = False,
         time_attention_use_pope = False,
-        use_attn_pool = True
+        use_attn_pool = True,
+        h_net_layer: int | None = None,
+        h_net_kwargs: dict | None = None
     ):
         super().__init__()
         self.full_spatial_attn = full_spatial_attn
@@ -2340,6 +2474,11 @@ class AxialSpaceTimeTransformer(Module):
         self.use_attn_pool = use_attn_pool
         self.final_attn_pool = Residual(AttentionPool(dim, **attn_residual_kwargs)) if use_attn_pool else Identity()
 
+        self.spatial_modules = spatial_modules
+
+        self.space_height = space_height
+        self.space_width = space_width
+
         # final norm
 
         self.final_norm = nn.RMSNorm(dim) if final_norm else nn.Identity()
@@ -2355,6 +2494,15 @@ class AxialSpaceTimeTransformer(Module):
             self.final_special_cross_attn = Residual(Attention(dim = dim, heads = attn_heads, dim_head = attn_dim_head, pre_context_rmsnorm = True, **attn_kwargs))
             self.final_special_ff = Residual(ReLUSquaredFeedforward(dim = dim, **ff_kwargs))
 
+        # hierarchical temporal transformer
+
+        self.h_net_layer = h_net_layer
+        self.h_net = HierarchicalTemporalTransformer(dim = dim, **h_net_kwargs) if exists(h_net_kwargs) else None
+
+        # dummy loss
+
+        self.register_buffer('zero', tensor(0.), persistent = False)
+
     def muon_parameters(self):
         muon_params = []
 
@@ -2367,8 +2515,11 @@ class AxialSpaceTimeTransformer(Module):
     def forward(
         self,
         tokens, # (b t s d)
+        time_lens = None,
         cache: TransformerIntermediates | None = None,
-        return_intermediates = False
+        return_intermediates = False,
+        space_height = None,
+        space_width = None
     ): # (b t s d) | (y 2 b h t d)
 
         tokens, inverse_pack = pack_one(tokens, 'b t * d')
@@ -2424,6 +2575,24 @@ class AxialSpaceTimeTransformer(Module):
 
         iter_rnn_prev_hiddens = iter(rnn_prev_hiddens)
 
+        has_spatial_modules = exists(self.spatial_modules)
+        space_height = default(space_height, self.space_height)
+        space_width = default(space_width, self.space_width)
+
+        spatial_module_caches = dict()
+        next_spatial_module_caches = dict()
+
+        if has_spatial_modules:
+            assert exists(space_height) and exists(space_width), 'space_height and space_width must be passed into forward if you have spatial modules (or set on init)'
+
+            spatial_packed_shape = [[space_seq_len - num_spatial_special], [num_spatial_special]]
+
+            if exists(cache) and exists(cache.next_spatial_module_caches):
+                spatial_module_caches = cache.next_spatial_module_caches
+
+        h_net_cache = cache.next_h_net_cache if exists(cache) else None
+        next_h_net_cache = None
+
         # positional embs
 
         time_pos_emb = self.time_rotary(time, offset = token_count)
@@ -2440,17 +2609,21 @@ class AxialSpaceTimeTransformer(Module):
         normed_time_attn_inputs = []
         normed_space_attn_inputs = []
 
+        # h-net ratio loss
+
+        h_net_loss = self.zero
+
         # attention
 
         layer_hiddens = [tokens]
         hiddens = []
 
-        for (
+        for layer_index, (
             (pre_attn_rearrange, post_attn_rearrange, attn, ff),
             maybe_rnn,
             layer_is_time,
             maybe_attn_pool
-         ) in zip(self.layers, self.rnn_layers, self.is_time, self.attn_pools):
+         ) in enumerate(zip(self.layers, self.rnn_layers, self.is_time, self.attn_pools), start = 1):
 
             # rnn block
 
@@ -2502,6 +2675,27 @@ class AxialSpaceTimeTransformer(Module):
 
             tokens = post_attn_rearrange(tokens_out)
 
+            # hierarchical temporal transformer
+
+            is_h_net_layer = exists(self.h_net) and layer_index == self.h_net_layer
+
+            if is_h_net_layer:
+                tokens = rearrange(tokens, 'b t s d -> b s t d')
+                tokens, inverse_pack_hnet = pack_one(tokens, '* t d')
+
+                h_net_lens = maybe(repeat_interleave_to_match)(time_lens, tokens)
+
+                tokens, h_net_layer_loss, next_h_net_cache = self.h_net(
+                    tokens,
+                    lens = h_net_lens,
+                    cache = h_net_cache,
+                    return_hiddens = return_intermediates
+                )
+                h_net_loss = h_net_loss + h_net_layer_loss
+
+                tokens = inverse_pack_hnet(tokens)
+                tokens = rearrange(tokens, 'b s t d -> b t s d')
+
             layer_hiddens.append(tokens)
 
             # save kv cache if is time layer
@@ -2518,6 +2712,29 @@ class AxialSpaceTimeTransformer(Module):
             # feedforward block
 
             tokens = ff(tokens)
+
+            # spatial modules (eg. MOSS)
+
+            layer_key = str(layer_index)
+
+            if has_spatial_modules and layer_key in self.spatial_modules:
+                spatial_tokens, special_tokens = unpack(tokens, spatial_packed_shape, 'b t * d')
+
+                spatial_tokens = rearrange(spatial_tokens, 'b t (h w) d -> b t h w d', h = space_height, w = space_width)
+
+                layer_spatial_module = self.spatial_modules[layer_key]
+
+                spatial_tokens, layer_spatial_cache = layer_spatial_module(
+                    spatial_tokens,
+                    cache = spatial_module_caches.get(layer_key),
+                    return_cache = True
+                )
+
+                next_spatial_module_caches[layer_key] = layer_spatial_cache
+
+                spatial_tokens = rearrange(spatial_tokens, 'b t h w d -> b t (h w) d')
+
+                tokens, _ = pack((spatial_tokens, special_tokens), 'b t * d')
 
             layer_hiddens.append(tokens)
 
@@ -2564,7 +2781,10 @@ class AxialSpaceTimeTransformer(Module):
             safe_stack(normed_space_attn_inputs),
             safe_stack(rnn_hiddens),
             hiddens,
-            token_count + time
+            token_count + time,
+            next_spatial_module_caches,
+            h_net_loss,
+            next_h_net_cache
         )
 
         return inverse_pack(out), intermediates
@@ -2722,6 +2942,9 @@ class VideoTokenizer(Module):
         use_causal_conv3d = False,
         use_shifted_patch_tokenization = False,
         spt_kwargs: dict = dict(),
+        encoder_moss_layers = tuple(),
+        decoder_moss_layers = tuple(),
+        moss_kwargs: dict = dict(),
         use_time_rnn = False,
         causal_conv3d_kernel_size = 3,
         decoder_flow_steps = 1,
@@ -2732,9 +2955,16 @@ class VideoTokenizer(Module):
         latent_ar_sigreg_loss_weight = 0.05,
         latent_ar_placement = 'encoder',
         latent_ar_sigreg_loss_kwargs = dict(num_slices = 256),
+        latent_ar_sigreg_num_subspaces = None,
+        latent_sigreg_loss_weight = 0.,
+        latent_sigreg_loss_kwargs = dict(num_slices = 256),
+        latent_consistency_loss_weight = 0.,
         time_attention_use_pope = False,
         decoder_flow_times_beta_alpha = 1.,
-        decoder_flow_times_beta_beta = 1.
+        decoder_flow_times_beta_beta = 1.,
+        h_net_layer: int | None = None,
+        h_net_kwargs: dict | None = None,
+        h_net_loss_weight = 1.
     ):
         super().__init__()
 
@@ -2806,7 +3036,15 @@ class VideoTokenizer(Module):
                 LayerNormNoBias(dim)
             )
 
+        encoder_moss_modules = ModuleDict({
+            str(layer_idx): MOSS(dim, **moss_kwargs)
+            for layer_idx in encoder_moss_layers
+        }) if not is_empty(encoder_moss_layers) else None
+
         # encoder space / time transformer
+
+        num_patch_height = image_height // patch_size if exists(image_height) else None
+        num_patch_width = image_width // patch_size if exists(image_width) else None
 
         self.encoder_transformer = AxialSpaceTimeTransformer(
             dim = dim,
@@ -2819,17 +3057,19 @@ class VideoTokenizer(Module):
             full_spatial_attn = encoder_full_spatial_attn,
             attn_kwargs = attn_kwargs,
             ff_kwargs = ff_kwargs,
+            spatial_modules = encoder_moss_modules,
+            space_height = num_patch_height,
+            space_width = num_patch_width,
             final_norm = True,
             time_attention_use_pope = time_attention_use_pope,
-            rnn_time = use_time_rnn
+            rnn_time = use_time_rnn,
+            h_net_layer = h_net_layer,
+            h_net_kwargs = h_net_kwargs
         )
 
         # latents
 
-        self.encoded_to_latents = Sequential(
-            LinearNoBias(dim, dim_latent),
-            nn.Tanh(),
-        )
+        self.encoded_to_latents = LinearNoBias(dim, dim_latent)
 
         self.latents_to_decoder = LinearNoBias(dim_latent, dim)
 
@@ -2848,6 +3088,11 @@ class VideoTokenizer(Module):
             activation = ReLUSquared()
         )
 
+        decoder_moss_modules = ModuleDict({
+            str(layer_idx): MOSS(dim, **moss_kwargs)
+            for layer_idx in decoder_moss_layers
+        }) if not is_empty(decoder_moss_layers) else None
+
         # decoder transformer
 
         self.decoder_transformer = AxialSpaceTimeTransformer(
@@ -2862,6 +3107,9 @@ class VideoTokenizer(Module):
             full_spatial_attn = decoder_full_spatial_attn,
             attn_kwargs = attn_kwargs,
             ff_kwargs = ff_kwargs,
+            spatial_modules = decoder_moss_modules,
+            space_height = num_patch_height,
+            space_width = num_patch_width,
             final_norm = True,
             time_attention_use_pope = time_attention_use_pope,
             rnn_time = use_time_rnn
@@ -2906,7 +3154,8 @@ class VideoTokenizer(Module):
             self.latent_ar = LatentAutoregressiveLoss(
                 latent_ar_dim,
                 use_rmsnorm = latent_ar_use_rmsnorm,
-                sigreg_loss_kwargs = latent_ar_sigreg_loss_kwargs
+                sigreg_loss_kwargs = latent_ar_sigreg_loss_kwargs,
+                sigreg_num_subspaces = latent_ar_sigreg_num_subspaces
             )
 
         # loss normalizer
@@ -2919,10 +3168,53 @@ class VideoTokenizer(Module):
             self.time_decorr_loss_normalizer = LossNormalizer() if encoder_add_decorr_aux_loss else None
             self.space_decorr_loss_normalizer = LossNormalizer() if encoder_add_decorr_aux_loss else None
             self.latent_ar_loss_normalizer = LossNormalizer() if self.has_latent_ar else None
+            self.latent_consistency_loss_normalizer = LossNormalizer() if latent_consistency_loss_weight > 0. else None
+            self.latent_sigreg_loss_normalizer = LossNormalizer() if latent_sigreg_loss_weight > 0. else None
+
+        self.latent_consistency_loss_weight = latent_consistency_loss_weight
+        self.has_latent_consistency_loss = latent_consistency_loss_weight > 0.
+
+        self.latent_sigreg_loss_weight = latent_sigreg_loss_weight
+        self.latent_sigreg_loss_kwargs = default(latent_sigreg_loss_kwargs, dict())
+        self.has_latent_sigreg_loss = latent_sigreg_loss_weight > 0.
+
+        self.h_net_loss_weight = h_net_loss_weight
 
     @property
     def device(self):
         return self.zero.device
+
+    def encoder_parameters(self):
+        params = [
+            *self.patch_to_tokens.parameters(),
+            *self.encoder_transformer.parameters(),
+            *self.encoded_to_latents.parameters(),
+            self.latent_tokens,
+            self.mask_token
+        ]
+
+        if self.use_causal_conv3d:
+            params.extend(self.encoder_pre_causal_conv3d.parameters())
+            params.extend(self.encoder_post_causal_conv3d.parameters())
+
+        return params
+
+    def decoder_parameters(self):
+        params = [
+            *self.latents_to_decoder.parameters(),
+            *self.decoder_transformer.parameters(),
+            *self.tokens_to_patch.parameters()
+        ]
+
+        if self.use_causal_conv3d:
+            params.extend(self.decoder_pre_causal_conv3d.parameters())
+            params.extend(self.decoder_post_causal_conv3d.parameters())
+
+        if self.has_flow:
+            params.extend(self.time_embed.parameters())
+            params.extend(self.noised_patch_to_tokens.parameters())
+
+        return params
 
     def muon_parameters(self):
         return [
@@ -2997,7 +3289,7 @@ class VideoTokenizer(Module):
 
             tokens, _ = pack((spatial_tokens, latent_tokens), 'b t * d')
 
-        tokens = self.decoder_transformer(tokens)
+        tokens = self.decoder_transformer(tokens, space_height = num_patch_height, space_width = num_patch_width)
 
         # unpack latents
 
@@ -3056,6 +3348,7 @@ class VideoTokenizer(Module):
         video_or_image, # (b c t h w) | (b c h w)
         return_latents = False,
         mask_patches = None,
+        patch_mask = None,
         return_intermediates = False,
         update_loss_ema = None,
         time_cache = None,
@@ -3108,17 +3401,17 @@ class VideoTokenizer(Module):
 
         # masking
 
-        mask_patches = default(mask_patches, self.training)
+        if mask_patches or exists(patch_mask):
 
-        if mask_patches:
-            min_mask_prob, max_mask_prob = self.per_image_patch_mask_prob
+            if not exists(patch_mask):
+                min_mask_prob, max_mask_prob = self.per_image_patch_mask_prob
 
-            mask_prob = torch.empty(tokens.shape[:2], device = tokens.device).uniform_(min_mask_prob, max_mask_prob) # (b t)
+                mask_prob = torch.empty(tokens.shape[:2], device = tokens.device).uniform_(min_mask_prob, max_mask_prob) # (b t)
 
-            mask_prob = repeat(mask_prob, 'b t -> b t vh vw', vh = tokens.shape[2], vw = tokens.shape[3])
-            mask_patch = torch.bernoulli(mask_prob) == 1.
+                mask_prob = repeat(mask_prob, 'b t -> b t vh vw', vh = tokens.shape[2], vw = tokens.shape[3])
+                patch_mask = torch.bernoulli(mask_prob) == 1.
 
-            tokens = einx.where('..., d, ... d', mask_patch, self.mask_token, tokens)
+            tokens = einx.where('..., d, ... d', patch_mask, self.mask_token, tokens)
 
         # pack space
 
@@ -3132,8 +3425,17 @@ class VideoTokenizer(Module):
 
         # encoder attention
 
-        tokens, intermediates = self.encoder_transformer(tokens, cache = transformer_cache, return_intermediates = True)
+        tokens, intermediates = self.encoder_transformer(
+            tokens,
+            time_lens = time_lens,
+            cache = transformer_cache,
+            return_intermediates = True,
+            space_height = num_patch_height,
+            space_width = num_patch_width
+        )
+
         _, time_attn_normed_inputs, space_attn_normed_inputs, *_ = intermediates
+        h_net_loss = intermediates.h_net_loss
         next_transformer_cache = intermediates
 
         next_post_causal_conv_cache = None
@@ -3159,6 +3461,15 @@ class VideoTokenizer(Module):
             latent_ar_loss, latent_ar_sigreg_loss, _ = self.latent_ar(latents)
 
         latents = self.encoded_to_latents(latents)
+
+        latent_sigreg_loss = self.zero
+        if self.has_latent_sigreg_loss:
+            latent_sigreg_loss = LatentAutoregressiveLoss.sigreg(
+                latents,
+                **self.latent_sigreg_loss_kwargs
+            )
+
+        latents = latents.tanh()
 
         if return_latents:
             next_time_cache = (next_spt_cache, next_pre_causal_conv_cache, next_transformer_cache, next_post_causal_conv_cache)
@@ -3208,16 +3519,39 @@ class VideoTokenizer(Module):
             target = video
             pred = recon_video
 
-        # mse loss
+        # losses
 
         if exists(time_lens):
             if not is_tensor(time_lens):
                 time_lens = tensor(time_lens, device = device, dtype = torch.long)
 
-            recon_loss = F.mse_loss(pred, target, reduction = 'none')
+            time_mask = lens_to_mask(time_lens, time)
 
-            mask = lens_to_mask(time_lens, time)
-            mask = rearrange(mask, 'b t -> b 1 t 1 1')
+        # latent consistency loss
+
+        latent_consistency_loss = self.zero
+
+        if self.has_latent_consistency_loss:
+            with temp_requires_grad(self.encoder_parameters(), False):
+                recon_latents = self.forward(
+                    recon_video,
+                    return_latents = True,
+                    mask_patches = False,
+                    patch_mask = patch_mask
+                )
+
+            if exists(time_lens):
+                latent_consistent_loss = F.mse_loss(recon_latents, latents.detach(), reduction = 'none')
+                latent_consistent_mask = pad_right_ndim_to(time_mask, latent_consistent_loss.ndim)
+                latent_consistency_loss = masked_mean(latent_consistent_loss, latent_consistent_mask)
+            else:
+                latent_consistency_loss = F.mse_loss(recon_latents, latents.detach())
+
+        # recon loss
+
+        if exists(time_lens):
+            recon_loss = F.mse_loss(pred, target, reduction = 'none')
+            mask = rearrange(time_mask, 'b t -> b 1 t 1 1')
             recon_loss = masked_mean(recon_loss, mask)
         else:
             recon_loss = F.mse_loss(pred, target)
@@ -3253,6 +3587,12 @@ class VideoTokenizer(Module):
                 time_decorr_loss = self.time_decorr_loss_normalizer(time_decorr_loss, update_ema = update_loss_ema)
                 space_decorr_loss = self.space_decorr_loss_normalizer(space_decorr_loss, update_ema = update_loss_ema)
 
+            if self.has_latent_consistency_loss:
+                latent_consistency_loss = self.latent_consistency_loss_normalizer(latent_consistency_loss, update_ema = update_loss_ema)
+
+            if self.has_latent_sigreg_loss:
+                latent_sigreg_loss = self.latent_sigreg_loss_normalizer(latent_sigreg_loss, update_ema = update_loss_ema)
+
         # losses
 
         total_loss = (
@@ -3261,13 +3601,16 @@ class VideoTokenizer(Module):
             time_decorr_loss * self.time_decorr_loss_weight +
             space_decorr_loss * self.space_decorr_loss_weight +
             latent_ar_loss * self.latent_ar_loss_weight +
-            latent_ar_sigreg_loss * self.latent_ar_sigreg_loss_weight
+            latent_ar_sigreg_loss * self.latent_ar_sigreg_loss_weight +
+            latent_consistency_loss * self.latent_consistency_loss_weight +
+            latent_sigreg_loss * self.latent_sigreg_loss_weight +
+            h_net_loss * self.h_net_loss_weight
         )
 
         if not return_intermediates:
             return total_loss
 
-        losses = TokenizerLosses(recon_loss, lpips_loss, time_decorr_loss, space_decorr_loss, latent_ar_loss, latent_ar_sigreg_loss)
+        losses = TokenizerLosses(recon_loss, lpips_loss, time_decorr_loss, space_decorr_loss, latent_ar_loss, latent_ar_sigreg_loss, latent_consistency_loss, latent_sigreg_loss, h_net_loss)
 
         # handle returning of reconstructed, and image pretraining
 
@@ -3322,8 +3665,8 @@ class SelfFlow(Module):
 
         *_, teacher_intermediates = ema_teacher_model(**teacher_batch_kwargs)
 
-        student_hidden = student_intermediates.layer_hiddens[self.student_layer]
-        teacher_hidden = teacher_intermediates.layer_hiddens[self.teacher_layer]
+        student_hidden = student_intermediates.main.layer_hiddens[self.student_layer]
+        teacher_hidden = teacher_intermediates.main.layer_hiddens[self.teacher_layer]
 
         if exists(lens) and not exists(mask):
             mask = lens_to_mask(lens, student_hidden.shape[-2])
@@ -3427,12 +3770,15 @@ class DynamicsWorldModel(Module):
         latent_ar_loss_weight = 0.,
         latent_ar_sigreg_loss_weight = 0.05,
         latent_ar_sigreg_loss_kwargs = dict(num_slices = 256),
+        latent_ar_sigreg_num_subspaces = None,
         identity_latents_to_spatial = False,
         agent_predict_sem_kwargs: dict = dict(),
         ssl_lapo = False,
         lapo_pred_actions = True,
         lapo_use_fdm = True,
         ssl_tem = False,
+        tem_first_state_as_init_hidden = True,
+        tem_learn_relative_actions = False,
         lapo_action_loss_weight = 1.,
         lapo_fdm_loss_weight = 1.,
         lapo_raw_latent_fdm_loss_weight = 1.,
@@ -3647,7 +3993,8 @@ class DynamicsWorldModel(Module):
             self.latent_ar = LatentAutoregressiveLoss(
                 dim_in = latent_ar_dim_in,
                 dim = dim,
-                sigreg_loss_kwargs = latent_ar_sigreg_loss_kwargs
+                sigreg_loss_kwargs = latent_ar_sigreg_loss_kwargs,
+                sigreg_num_subspaces = latent_ar_sigreg_num_subspaces
             )
 
         # agent predicting state
@@ -3804,7 +4151,9 @@ class DynamicsWorldModel(Module):
             self.ssl_tem = TEM(
                 dim_action_embed = dim,
                 dim_raw_latent = dim_latent,
-                num_raw_latent_tokens = num_latent_tokens
+                num_raw_latent_tokens = num_latent_tokens,
+                first_state_as_init_hidden = tem_first_state_as_init_hidden,
+                learn_relative_actions = tem_learn_relative_actions
             )
 
         # efficient axial space / time transformer
@@ -4416,8 +4765,9 @@ class DynamicsWorldModel(Module):
                 break
 
         time_dim = rewards.shape[-1]
-        video = cat(video_frames, dim=2)[:, :, :time_dim] if len(video_frames) > 0 else None
-        stacked_states = stack(states, dim=1)[:, :time_dim] if len(states) > 0 else None
+
+        video = cat(video_frames, dim = 2)[:, :, :time_dim] if not is_empty(video_frames) else None
+        stacked_states = stack(states, dim = 1)[:, :time_dim] if not is_empty(states) else None
 
         # calculate episode return
 
@@ -4809,6 +5159,7 @@ class DynamicsWorldModel(Module):
         values = self.value_encoder.bins_to_scalar_value(value_bins)
 
         # align returns and old_values to value_bins length if bootstrap padded
+
         if returns.shape[1] == value_bins.shape[1] + 1:
             returns = returns[:, :-1]
             old_values = old_values[:, :-1]
@@ -5720,11 +6071,11 @@ class DynamicsWorldModel(Module):
 
         elif self.action_embedder.has_actions:
             action_tokens = torch.zeros_like(agent_tokens[:, :, 0:1])
-            next_action_tokens = None
+            next_action_tokens = action_tokens
 
         else:
             action_tokens = empty_token
-            next_action_tokens = None
+            next_action_tokens = empty_token
 
         if self.add_action_embed_to_agent_token and self.action_embedder.has_actions:
             assert self.num_agents == 1, 'adding action embeddings to agent tokens only supports the single agent case for now'
@@ -5919,17 +6270,7 @@ class DynamicsWorldModel(Module):
 
         # flow loss
 
-        flow_loss_weight = 1.
-
-        if is_x_space:
-            flow_loss_weight = (1. - times) ** 2
-
         flow_losses = F.mse_loss(pred_flow, pred_target, reduction = 'none')
-
-        if is_tensor(flow_loss_weight):
-            flow_loss_weight, _ = align_dims_left((flow_loss_weight, flow_losses))
-
-        flow_losses = flow_losses * flow_loss_weight
 
         # shortcut loss
 
@@ -6292,10 +6633,12 @@ class DynamicsWorldModel(Module):
         tem_loss = self.zero
 
         if self.has_tem:
-            action_tokens_for_tem = intermediates.pre_encoded_action
+            action_tokens_for_tem = next_action_tokens
             tem_loss, tem_pred_latents = self.ssl_tem(action_tokens_for_tem, raw_latents = latents, return_preds = True)
         else:
             tem_pred_latents = None
+
+        h_net_loss = intermediates.main.h_net_loss
 
         # gather losses - they sum across the multi token prediction steps for rewards and actions - eq (9)
 
@@ -6313,10 +6656,11 @@ class DynamicsWorldModel(Module):
             (lapo_action_loss * self.lapo_action_loss_weight) +
             (lapo_fdm_loss * self.lapo_fdm_loss_weight) +
             (lapo_raw_latent_fdm_loss * self.lapo_raw_latent_fdm_loss_weight) +
-            (tem_loss * self.tem_loss_weight)
+            (tem_loss * self.tem_loss_weight) +
+            h_net_loss
         )
 
-        losses = WorldModelLosses(flow_loss, shortcut_flow_loss, reward_loss, state_terminal_loss, discrete_action_loss, continuous_action_loss, state_pred_loss, agent_state_pred_loss, latent_ar_loss, latent_ar_sigreg_loss, lapo_action_loss, lapo_fdm_loss, lapo_raw_latent_fdm_loss, tem_loss)
+        losses = WorldModelLosses(flow_loss, shortcut_flow_loss, reward_loss, state_terminal_loss, discrete_action_loss, continuous_action_loss, state_pred_loss, agent_state_pred_loss, latent_ar_loss, latent_ar_sigreg_loss, lapo_action_loss, lapo_fdm_loss, lapo_raw_latent_fdm_loss, tem_loss, h_net_loss)
 
         if not (return_all_losses or return_intermediates):
             return total_loss

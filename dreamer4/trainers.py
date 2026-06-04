@@ -360,6 +360,10 @@ class VideoTokenizerTrainer(Module):
             if latent_ar_loss > 0.:
                 postfix_kwargs['latent_ar'] = f"{latent_ar_loss:.4f}"
 
+            latent_consistency_loss = losses.latent_consistency.item()
+            if latent_consistency_loss > 0.:
+                postfix_kwargs['latent_consistency'] = f"{latent_consistency_loss:.4f}"
+
             pbar.set_postfix(**postfix_kwargs)
 
             self.step += 1
@@ -475,7 +479,7 @@ class BehaviorCloneTrainer(Module):
             self.self_flow_module = SelfFlow(
                 model = model,
                 student_layer = self_flow_student_layer,
-                teacher_layer = self_flow_teacher_layer,
+                teacher_layer = self_flow_layer,
                 **self_flow_kwargs
             )
 

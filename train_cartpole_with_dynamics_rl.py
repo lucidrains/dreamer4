@@ -163,6 +163,8 @@ class TransformerPPOAgent(nn.Module):
         ssl_lapo_use_fdm = True,
         ssl_lapo_pred_actions = True,
         ssl_tem = False,
+        latent_ar_sigreg_loss_kwargs = dict(num_slices = 256),
+        latent_ar_sigreg_num_subspaces = None,
     ):
         super().__init__()
         self.use_image_input = use_image_input
@@ -239,6 +241,8 @@ class TransformerPPOAgent(nn.Module):
             lapo_use_fdm = ssl_lapo_use_fdm,
             lapo_pred_actions = ssl_lapo_pred_actions,
             ssl_tem = ssl_tem,
+            latent_ar_sigreg_loss_kwargs = latent_ar_sigreg_loss_kwargs,
+            latent_ar_sigreg_num_subspaces = latent_ar_sigreg_num_subspaces,
         )
 
     @property
@@ -319,7 +323,8 @@ def main(
     lapo_use_fdm = True,
     lapo_pred_actions = True,
     tem = False,
-    use_delight_gating = True
+    use_delight_gating = True,
+    sigreg_num_subspaces = 1,
 ):
     torch.manual_seed(seed)
 
@@ -370,7 +375,8 @@ def main(
         ssl_lapo = lapo,
         ssl_lapo_use_fdm = lapo_use_fdm,
         ssl_lapo_pred_actions = lapo_pred_actions,
-        ssl_tem = tem
+        ssl_tem = tem,
+        latent_ar_sigreg_num_subspaces = sigreg_num_subspaces,
     ).to(device)
 
     # optimizers
