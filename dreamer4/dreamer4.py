@@ -2859,7 +2859,7 @@ class InvertedCrossAttention(Module):
         inner_dim = heads * dim_head
         self.scale = dim_head ** -0.5
 
-        self.to_q = LinearNoBias(dim, inner_dim)
+        self.to_qg = LinearNoBias(dim, inner_dim * 2)
         self.to_kv = LinearNoBias(dim, inner_dim * 2)
         self.to_out = LinearNoBias(inner_dim, dim)
 
@@ -2869,9 +2869,10 @@ class InvertedCrossAttention(Module):
     def forward(self, x, context):
         x = self.norm(x)
 
-        q, k, v = (self.to_q(x), *self.to_kv(context).chunk(2, dim = -1))
+        q, gate = self.to_qg(x).chunk(2, dim = -1)
+        k, v = self.to_kv(context).chunk(2, dim = -1)
 
-        q, k, v = [self.split_heads(t) for t in (q, k, v)]
+        q, gate, k, v = [self.split_heads(t) for t in (q, gate, k, v)]
 
         sim = einsum(q, k, 'b h i d, b h j d -> b h i j') * self.scale
 
@@ -2882,6 +2883,8 @@ class InvertedCrossAttention(Module):
             attn = sim.softmax(dim = -1)
 
         out = einsum(attn, v, 'b h i j, b h j d -> b h i d')
+
+        out = out * gate.sigmoid()
 
         return self.to_out(self.merge_heads(out))
 
