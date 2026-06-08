@@ -5441,6 +5441,10 @@ class DynamicsWorldModel(Module):
             if should_predict_terminals and decoded_terminals.all():
                 break
 
+        # clamp latents to range of tanh
+
+        latents.clamp_(-1., 1.)
+
         # restore state
 
         self.train(was_training)
