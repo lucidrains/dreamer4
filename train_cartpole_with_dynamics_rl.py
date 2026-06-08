@@ -164,6 +164,7 @@ class TransformerPPOAgent(nn.Module):
         ssl_tem = False,
         latent_ar_sigreg_loss_kwargs = dict(num_slices = 256),
         latent_ar_sigreg_num_subspaces = None,
+        mot_temporal = False,
     ):
         super().__init__()
         self.use_image_input = use_image_input
@@ -242,6 +243,7 @@ class TransformerPPOAgent(nn.Module):
             ssl_tem = ssl_tem,
             latent_ar_sigreg_loss_kwargs = latent_ar_sigreg_loss_kwargs,
             latent_ar_sigreg_num_subspaces = latent_ar_sigreg_num_subspaces,
+            mot_temporal = mot_temporal,
         )
 
     @property
@@ -324,6 +326,9 @@ def main(
     tem = False,
     use_delight_gating = True,
     sigreg_num_subspaces = 1,
+    mot_temporal = False,
+    experiment_name = 'dreamer4',
+    run_name = None,
 ):
     torch.manual_seed(seed)
 
@@ -336,7 +341,7 @@ def main(
         use_asym_critic = True
 
     if use_wandb:
-        wandb.init(project = 'dreamer4-cartpole')
+        wandb.init(project = experiment_name, name = run_name)
 
     accelerator = Accelerator(
         gradient_accumulation_steps = grad_accum_every,
@@ -348,7 +353,7 @@ def main(
     def log(msg):
         accelerator.print(msg)
 
-    results_folder = Path('./results')
+    results_folder = Path(f'./results_{run_name}' if run_name else './results')
     shutil.rmtree(results_folder, ignore_errors = True)
     results_folder.mkdir(exist_ok = True, parents = True)
 
@@ -375,6 +380,7 @@ def main(
         ssl_lapo_pred_actions = lapo_pred_actions,
         ssl_tem = tem,
         latent_ar_sigreg_num_subspaces = sigreg_num_subspaces,
+        mot_temporal = mot_temporal,
     ).to(device)
 
     # optimizers

@@ -1340,3 +1340,271 @@ def test_tokenizer_slot_attention(
 
     recon = tokenizer.decode(latents, 32, 32)
     assert recon.shape == video.shape
+import pytest
+
+def test_tokenizer_with_h_net():
+    from dreamer4.dreamer4 import VideoTokenizer
+    import torch
+
+    tokenizer = VideoTokenizer(
+        dim = 128,
+        dim_latent = 32,
+        patch_size = 4,
+        num_latent_tokens = 32,
+        channels = 3,
+        image_height = 32,
+        image_width = 32,
+        encoder_depth = 2,
+        decoder_depth = 2,
+        time_block_every = 2,
+        attn_dim_head = 32,
+        attn_heads = 4,
+        h_net_layer = 1,
+        h_net_kwargs = dict(depth = 2, heads = 4, dim_head = 32)
+    )
+
+    video = torch.randn(2, 3, 4, 32, 32)
+    loss, (losses, recon) = tokenizer(video, return_intermediates=True)
+
+    assert recon.shape == video.shape
+    assert isinstance(losses.h_net, torch.Tensor)
+    assert losses.h_net.item() > 0.
+
+def test_dynamics_apply_fire():
+    from dreamer4.dreamer4 import DynamicsWorldModel
+    import torch
+
+    model = DynamicsWorldModel(
+        dim = 32,
+        dim_latent = 16,
+        num_latent_tokens = 16,
+        depth = 2,
+        attn_heads = 2,
+        num_continuous_actions = 4,
+        num_discrete_actions = 0,
+        multi_token_pred_len = 1,
+        use_loss_normalization = False
+    )
+
+    model.apply_fire_(num_iters = 2)
+
+def test_axial_space_time_transformer_with_h_net():
+    from dreamer4.dreamer4 import AxialSpaceTimeTransformer
+    import torch
+
+    transformer = AxialSpaceTimeTransformer(
+        dim = 128,
+        depth = 4,
+        attn_heads = 4,
+        attn_dim_head = 32,
+        time_block_every = 2,
+        space_height = 8,
+        space_width = 8,
+        h_net_layer = 1,
+        h_net_kwargs = dict(depth = 2, heads = 4, dim_head = 32)
+    )
+
+    tokens = torch.randn(2, 4, 8 * 8, 128) # (b, t, s, d)
+    out, intermediates = transformer(tokens, return_intermediates = True)
+
+    assert out.shape == tokens.shape
+    assert isinstance(intermediates.h_net_loss, torch.Tensor)
+    assert intermediates.h_net_loss.item() > 0.
+
+def test_dynamics_model_with_h_net_caching():
+    from dreamer4.dreamer4 import DynamicsWorldModel
+    import torch
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    model = DynamicsWorldModel(
+        dim=32,
+        dim_latent=16,
+        num_latent_tokens=16,
+        depth=2,
+        time_block_every=1,  # use 1 to test full temporal attention
+        spatial_pre_encoder_depth=2,
+        action_pre_encoder_depth=2,
+        value_head_mlp_depth=1,
+        policy_head_mlp_depth=1,
+        attn_heads=2,
+        num_continuous_actions=4,
+        num_discrete_actions=0,
+        multi_token_pred_len=1,
+        use_loss_normalization=False,
+        transformer_kwargs=dict(
+            h_net_layer=1,
+            h_net_kwargs=dict(depth=1, heads=2, dim_head=16)
+        )
+    ).to(device)
+
+    model.eval()
+
+    seq_len = 4
+    batch_size = 2
+
+    actions_seq = torch.randn(batch_size, seq_len, 4, device='cpu')
+    latents = torch.randn(batch_size, seq_len, 16, 16, device='cpu')
+    signal_levels = torch.randint(0, 10, (batch_size, seq_len), device='cpu')
+    step_sizes_log2 = torch.zeros((batch_size,), device='cpu', dtype=torch.long)
+
+    with torch.no_grad():
+        parallel_pred, (embeds, _) = model(
+            latents=latents,
+            continuous_actions=actions_seq,
+            signal_levels=signal_levels,
+            step_sizes_log2=step_sizes_log2,
+            latent_is_noised=True,
+            return_pred_only=True,
+            return_intermediates=True
+        )
+
+        seq_embeds_list = []
+        seq_flow_list = []
+        time_cache = None
+
+        for t in range(seq_len):
+            latents_t = latents[:, t:t+1]
+            signal_levels_t = signal_levels[:, t:t+1]
+
+            if t == 0:
+                actions_t = torch.zeros_like(actions_seq[:, 0:1])
+            else:
+                actions_t = actions_seq[:, t-1:t]
+
+            pred_t, (embeds_t, intermediates) = model(
+                latents=latents_t,
+                continuous_actions=actions_t,
+                signal_levels=signal_levels_t,
+                step_sizes_log2=step_sizes_log2,
+                latent_is_noised=True,
+                time_cache=time_cache,
+                return_pred_only=True,
+                return_intermediates=True
+            )
+            time_cache = intermediates
+            seq_embeds_list.append(embeds_t.agent)
+            seq_flow_list.append(pred_t.flow)
+
+        seq_agent_tokens = torch.cat(seq_embeds_list, dim=1)
+        seq_flow = torch.cat(seq_flow_list, dim=1)
+
+    assert torch.allclose(embeds.agent, seq_agent_tokens, atol=1e-5), "Agent tokens diverge"
+    assert torch.allclose(parallel_pred.flow, seq_flow, atol=1e-5), "Flow output diverges"
+
+@pytest.mark.parametrize('mot_temporal', [True, False])
+def test_tokenizer_mot_temporal(mot_temporal):
+    from dreamer4.dreamer4 import VideoTokenizer
+    import torch
+
+    tokenizer = VideoTokenizer(
+        dim = 16,
+        dim_latent = 8,
+        patch_size = 2,
+        num_latent_tokens = 4,
+        channels = 3,
+        image_height = 8,
+        image_width = 8,
+        encoder_depth = 2,
+        decoder_depth = 2,
+        time_block_every = 2,
+        attn_dim_head = 16,
+        attn_heads = 2,
+        mot_temporal = mot_temporal
+    )
+
+    tokenizer.eval()
+
+    batch_size = 2
+    seq_len = 3
+
+    video = torch.randn(batch_size, 3, seq_len, 8, 8)
+
+    with torch.no_grad():
+        latents_parallel, _ = tokenizer(
+            video,
+            return_latents=True,
+            return_time_cache=True
+        )
+
+        seq_latents_list = []
+        time_cache = None
+
+        for t in range(seq_len):
+            video_t = video[:, :, t:t+1]
+            latents_t, time_cache = tokenizer(
+                video_t,
+                return_latents=True,
+                time_cache=time_cache,
+                return_time_cache=True
+            )
+            seq_latents_list.append(latents_t)
+
+        latents_seq = torch.cat(seq_latents_list, dim=1)
+
+    assert torch.allclose(latents_parallel, latents_seq, atol = 1e-5), "Tokenizer latents diverge"
+
+@pytest.mark.parametrize('mot_temporal', [True, False])
+def test_dynamics_mot_temporal(mot_temporal):
+    from dreamer4.dreamer4 import DynamicsWorldModel
+    import torch
+    import torch.nn.functional as F
+
+    model = DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 4,
+        num_latent_tokens = 4,
+        num_spatial_tokens = 4,
+        num_agents = 1,
+        num_discrete_actions = 2,
+        depth = 2,
+        mot_temporal = mot_temporal
+    )
+
+    model.eval()
+
+    batch_size = 2
+    seq_len = 3
+
+    latents = torch.randn(batch_size, seq_len, 4, 4)
+    actions = torch.randint(0, 2, (batch_size, seq_len, 1))
+    signal_levels = torch.randint(0, 10, (batch_size, seq_len))
+    step_sizes_log2 = torch.zeros((batch_size,), dtype=torch.long)
+
+    with torch.no_grad():
+        pred_parallel, _ = model(
+            latents = latents,
+            discrete_actions = actions,
+            signal_levels = signal_levels,
+            step_sizes_log2 = step_sizes_log2,
+            latent_is_noised = True,
+            return_pred_only = True,
+            return_intermediates = True
+        )
+
+        seq_flow_list = []
+        time_cache = None
+        
+        padded_actions = F.pad(actions[:, :-1], (0, 0, 1, 0), value = 0)
+
+        for t in range(seq_len):
+            latents_t = latents[:, t:t+1]
+            signal_levels_t = signal_levels[:, t:t+1]
+            actions_t = padded_actions[:, t:t+1]
+
+            pred_t, (_, intermediates) = model(
+                latents = latents_t,
+                discrete_actions = actions_t,
+                signal_levels = signal_levels_t,
+                step_sizes_log2 = step_sizes_log2,
+                latent_is_noised = True,
+                time_cache = time_cache,
+                return_pred_only = True,
+                return_intermediates = True
+            )
+            time_cache = intermediates
+            seq_flow_list.append(pred_t.flow)
+
+        seq_flow = torch.cat(seq_flow_list, dim=1)
+
+    assert torch.allclose(pred_parallel.flow, seq_flow, atol = 1e-5), "Dynamics flow output diverges"

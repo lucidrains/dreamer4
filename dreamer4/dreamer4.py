@@ -2295,7 +2295,7 @@ class HierarchicalTemporalTransformer(Module):
         x, loss, _, next_cache = self.h_net(x, lens = lens, cache = cache, return_hiddens = return_hiddens)
         return x, loss, next_cache
 
-# axial space time transformer
+# axial space time transformer - with optional mixture of transformer blocks for temporal (space tbd)
 
 class AxialSpaceTimeTransformer(Module):
     def __init__(
@@ -2320,6 +2320,7 @@ class AxialSpaceTimeTransformer(Module):
         rnn_time = False,
         time_attention_use_pope = False,
         use_attn_pool = True,
+        mot_temporal = False,
         h_net_layer: int | None = None,
         h_net_kwargs: dict | None = None
     ):
@@ -2364,6 +2365,8 @@ class AxialSpaceTimeTransformer(Module):
 
         # transformer
 
+        self.mot_temporal = mot_temporal
+
         is_time = []
 
         layers = []
@@ -2379,11 +2382,21 @@ class AxialSpaceTimeTransformer(Module):
             rearrange_to_attend = Rearrange('b t s ... -> b s t ...') if is_time_block else Identity()
             rearrange_from_attend = Rearrange('b s t ... -> b t s ...') if is_time_block else Identity()
 
+            attn_block = Residual(Attention(dim = dim, heads = attn_heads, dim_head = attn_dim_head, value_residual = value_residual, **attn_kwargs))
+            ff_block = Residual(SwiGLUFeedforward(dim = dim, **ff_kwargs))
+
+            mot_block = None
+            if is_time_block and self.mot_temporal:
+                special_attn_block = Residual(Attention(dim = dim, heads = attn_heads, dim_head = attn_dim_head, **attn_kwargs))
+                special_ff_block = Residual(SwiGLUFeedforward(dim = dim, **ff_kwargs))
+                mot_block = ModuleList([special_attn_block, special_ff_block])
+
             layers.append(ModuleList([
                 rearrange_to_attend,
                 rearrange_from_attend,
-                Residual(Attention(dim = dim, heads = attn_heads, dim_head = attn_dim_head, value_residual = value_residual, **attn_kwargs)),
-                Residual(SwiGLUFeedforward(dim = dim, **ff_kwargs))
+                attn_block,
+                ff_block,
+                mot_block
             ]))
 
             rnn_layers.append(Residual(GRULayer(dim, dim)) if is_time_block and rnn_time else None)
@@ -2552,11 +2565,18 @@ class AxialSpaceTimeTransformer(Module):
         hiddens = []
 
         for layer_index, (
-            (pre_attn_rearrange, post_attn_rearrange, attn, ff),
+            layer_modules,
             maybe_rnn,
             layer_is_time,
             maybe_attn_pool
          ) in enumerate(zip(self.layers, self.rnn_layers, self.is_time, self.attn_pools)):
+
+            pre_attn_rearrange, post_attn_rearrange, attn, ff, mot_block = layer_modules
+
+            is_mot_layer = exists(mot_block)
+            if is_mot_layer:
+                special_attn, special_ff = mot_block
+                mot_packed_shape = [(space_seq_len - self.num_special_spatial_tokens,), (self.num_special_spatial_tokens,)]
 
             # rnn block
 
@@ -2596,8 +2616,7 @@ class AxialSpaceTimeTransformer(Module):
 
             # attention layer
 
-            tokens_out, attn_intermediates = attn(
-                tokens,
+            attn_kwargs = dict(
                 rotary_pos_emb = layer_rotary_pos_emb,
                 pope_pos_emb = layer_pope_pos_emb,
                 attend_fn = attend_fn,
@@ -2605,6 +2624,38 @@ class AxialSpaceTimeTransformer(Module):
                 residual_values = layer_residual_values,
                 return_intermediates = True
             )
+
+            if not is_mot_layer:
+                tokens_out, attn_intermediates = attn(tokens, **attn_kwargs)
+            else:
+                main_tokens, special_tokens = unpack(tokens, mot_packed_shape, 'b * t d')
+                main_kwargs, special_kwargs = {**attn_kwargs}, {**attn_kwargs}
+
+                if exists(layer_residual_values):
+                    main_kwargs['residual_values'], special_kwargs['residual_values'] = unpack(layer_residual_values, mot_packed_shape, 'b * t h d')
+
+                def split_kv(kv):
+                    kv = rearrange(kv, 'kv (b s) ... -> kv b s ...', b = batch)
+                    return tuple(rearrange(c, 'kv b s ... -> kv (b s) ...') for c in unpack(kv, mot_packed_shape, 'kv b * h t d'))
+
+                def merge_kv(m_kv, s_kv):
+                    m_kv, s_kv = (rearrange(c, 'kv (b s) ... -> kv b s ...', b = batch) for c in (m_kv, s_kv))
+                    merged, _ = pack((m_kv, s_kv), 'kv b * h t d')
+                    return rearrange(merged, 'kv b s ... -> kv (b s) ...')
+
+                if exists(maybe_kv_cache):
+                    main_kwargs['kv_cache'], special_kwargs['kv_cache'] = split_kv(maybe_kv_cache)
+
+                main_out, main_interm = attn(main_tokens, **main_kwargs)
+                special_out, special_interm = special_attn(special_tokens, **special_kwargs)
+
+                tokens_out, _ = pack((main_out, special_out), 'b * t d')
+
+                if exists(main_interm) and exists(special_interm) and exists(main_interm.next_kv_cache):
+                    merged_cache = merge_kv(main_interm.next_kv_cache, special_interm.next_kv_cache)
+                    attn_intermediates = AttentionIntermediates(merged_cache, main_interm.normed_inputs)
+                else:
+                    attn_intermediates = main_interm
 
             tokens = post_attn_rearrange(tokens_out)
 
@@ -2644,7 +2695,11 @@ class AxialSpaceTimeTransformer(Module):
 
             # feedforward block
 
-            tokens = ff(tokens)
+            if not is_mot_layer:
+                tokens = ff(tokens)
+            else:
+                main_tokens, special_tokens = unpack(tokens, mot_packed_shape, 'b t * d')
+                tokens, _ = pack((ff(main_tokens), special_ff(special_tokens)), 'b t * d')
 
             # spatial modules (eg. MOSS)
 
@@ -2847,12 +2902,14 @@ class InvertedCrossAttention(Module):
     def __init__(
         self,
         dim,
+        dim_context = None,
         heads = 8,
         dim_head = 64,
         inverted_attention = True,
         pre_rmsnorm = True
     ):
         super().__init__()
+        dim_context = default(dim_context, dim)
         self.norm = RMSNorm(dim) if pre_rmsnorm else Identity()
         self.inverted_attention = inverted_attention
 
@@ -2860,7 +2917,7 @@ class InvertedCrossAttention(Module):
         self.scale = dim_head ** -0.5
 
         self.to_qg = LinearNoBias(dim, inner_dim * 2)
-        self.to_kv = LinearNoBias(dim, inner_dim * 2)
+        self.to_kv = LinearNoBias(dim_context, inner_dim * 2)
         self.to_out = LinearNoBias(inner_dim, dim)
 
         self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
@@ -2876,11 +2933,12 @@ class InvertedCrossAttention(Module):
 
         sim = einsum(q, k, 'b h i d, b h j d -> b h i j') * self.scale
 
+        attn_dim = -2 if self.inverted_attention else -1
+
+        attn = sim.softmax(dim = attn_dim)
+
         if self.inverted_attention:
-            attn = sim.softmax(dim = -2)
             attn = l1norm(attn)
-        else:
-            attn = sim.softmax(dim = -1)
 
         out = einsum(attn, v, 'b h i j, b h j d -> b h i d')
 
@@ -2892,6 +2950,7 @@ class SlotAttention(Module):
     def __init__(
         self,
         dim,
+        dim_context = None,
         iters = 2,
         ff_mult = 4,
         **kwargs
@@ -2899,7 +2958,7 @@ class SlotAttention(Module):
         super().__init__()
         self.iters = iters
 
-        self.attn = InvertedCrossAttention(dim = dim, pre_rmsnorm = True, **kwargs)
+        self.attn = InvertedCrossAttention(dim = dim, dim_context = dim_context, pre_rmsnorm = True, **kwargs)
 
         self.ff = SwiGLUFeedforward(
             dim = dim,
@@ -2979,7 +3038,8 @@ class VideoTokenizer(Module):
         slot_attention_iters = 2,
         decoder_slot_attention_initted_spatial_tokens = False,
         decoder_slot_attention_iters = 2,
-        slot_attention_inverted = True
+        slot_attention_inverted = True,
+        mot_temporal = False,
     ):
         super().__init__()
 
@@ -3099,6 +3159,7 @@ class VideoTokenizer(Module):
             space_width = num_patch_width,
             final_norm = True,
             time_attention_use_pope = time_attention_use_pope,
+            mot_temporal = mot_temporal,
             rnn_time = use_time_rnn,
             h_net_layer = h_net_layer,
             h_net_kwargs = h_net_kwargs
@@ -3148,6 +3209,7 @@ class VideoTokenizer(Module):
             space_width = num_patch_width,
             final_norm = True,
             time_attention_use_pope = time_attention_use_pope,
+            mot_temporal = mot_temporal,
             rnn_time = use_time_rnn
         )
 
@@ -3741,6 +3803,7 @@ class DynamicsWorldModel(Module):
         num_agents = 1,
         num_tasks = 0,
         num_video_views = 1,
+        mot_temporal = False,
         dim_proprio = None,
         dim_state = None,
         dim_critic_state = None,
@@ -4187,6 +4250,7 @@ class DynamicsWorldModel(Module):
             ff_kwargs = ff_kwargs,
             num_special_spatial_tokens = num_agents,
             time_block_every = time_block_every,
+            mot_temporal = mot_temporal,
             final_norm = False,
             rnn_time = use_time_rnn,
             time_attention_use_pope = time_attention_use_pope,
@@ -4202,6 +4266,7 @@ class DynamicsWorldModel(Module):
             ff_kwargs = ff_kwargs,
             num_special_spatial_tokens = num_agents,
             time_block_every = time_block_every,
+            mot_temporal = mot_temporal,
             final_norm = False,
             rnn_time = use_time_rnn,
             time_attention_use_pope = time_attention_use_pope,
