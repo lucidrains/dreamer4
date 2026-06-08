@@ -1309,3 +1309,34 @@ def test_moss_sequential_caching():
 
         loss = tokenizer(video)
         assert loss.numel() == 1
+
+@param('slot_attention_initted_latents', (False, True))
+@param('decoder_slot_attention_initted_spatial_tokens', (False, True))
+def test_tokenizer_slot_attention(
+    slot_attention_initted_latents,
+    decoder_slot_attention_initted_spatial_tokens
+):
+    from dreamer4.dreamer4 import VideoTokenizer
+
+    tokenizer = VideoTokenizer(
+        16,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        time_block_every = 1,
+        dim_latent = 16,
+        patch_size = 16,
+        attn_dim_head = 8,
+        num_latent_tokens = 4,
+        slot_attention_initted_latents = slot_attention_initted_latents,
+        decoder_slot_attention_initted_spatial_tokens = decoder_slot_attention_initted_spatial_tokens
+    )
+
+    video = torch.randn(2, 3, 4, 32, 32)
+    loss = tokenizer(video)
+    assert loss.numel() == 1
+
+    latents = tokenizer(video, return_latents = True)
+    assert latents.shape[-1] == 16
+
+    recon = tokenizer.decode(latents, 32, 32)
+    assert recon.shape == video.shape

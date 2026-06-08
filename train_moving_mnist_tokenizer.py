@@ -12,6 +12,7 @@
 #   "accelerate",
 #   "adam-atan2-pytorch",
 #   "tensorboard",
+#   "wandb",
 #   "dreamer4"
 # ]
 # [tool.uv.sources]
@@ -100,7 +101,12 @@ def main(
     latent_consistency_loss_weight = 0.,
     use_h_net = False,
     h_net_target_length = 2.,
-    clear_runs = False
+    clear_runs = False,
+    experiment_name = 'dreamer4',
+    run_name = None,
+    slot_attention_initted_latents = False,
+    decoder_slot_attention_initted_spatial_tokens = False,
+    slot_attention_inverted = True
 ):
     import shutil
 
@@ -179,7 +185,10 @@ def main(
         encoder_moss_layers = encoder_moss_layers,
         latent_consistency_loss_weight = latent_consistency_loss_weight,
         h_net_layer = encoder_depth // 2 if use_h_net else None,
-        h_net_kwargs = h_net_kwargs
+        h_net_kwargs = h_net_kwargs,
+        slot_attention_initted_latents = slot_attention_initted_latents,
+        decoder_slot_attention_initted_spatial_tokens = decoder_slot_attention_initted_spatial_tokens,
+        slot_attention_inverted = slot_attention_inverted
     )
 
     # trainer
@@ -193,7 +202,7 @@ def main(
         grad_accum_every = grad_accum_every,
         learning_rate = lr,
         num_train_steps = num_train_steps,
-        use_tensorboard_logger = True,
+        use_wandb = True,
         log_dir = log_dir,
         log_video = True,
         video_fps = 4,
@@ -202,6 +211,8 @@ def main(
         ema_decay = ema_decay,
         checkpoint_every = checkpoint_every,
         checkpoint_folder = checkpoint_folder,
+        project_name = experiment_name,
+        run_name = run_name
     )
 
     if exists(latest_checkpoint):

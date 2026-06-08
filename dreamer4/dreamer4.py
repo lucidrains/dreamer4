@@ -12,11 +12,11 @@ from dataclasses import dataclass, asdict, fields
 import torch
 import torch.nn.functional as F
 from torch.distributions import Normal, Beta, kl
-from torch.nn import Module, ModuleList, ModuleDict, Embedding, Parameter, Sequential, Linear, RMSNorm
+from torch.nn import Module, ModuleList, ModuleDict, Embedding, Parameter, Linear, RMSNorm
 from torch import nn, cat, stack, arange, tensor, Tensor, is_tensor, full, zeros, ones, randint, rand, randn, randn_like, empty, full, linspace, arange
 from torch.utils._pytree import tree_map, tree_flatten, tree_unflatten
 
-from torch_einops_utils.nn import Identity
+from torch_einops_utils.nn import Identity, Sequential
 
 import torchvision
 from torchvision.models import VGG16_Weights
@@ -388,6 +388,9 @@ def pad_tensors_at_dim_to_max_len(
 
 def l2norm(t):
     return F.normalize(t, dim = -1, p = 2)
+
+def l1norm(t, dim = -1, eps = 1e-8):
+    return F.normalize(t, p = 1, dim = dim, eps = eps)
 
 def softclamp(t, value = 50.):
     return (t / value).tanh() * value
@@ -2837,6 +2840,80 @@ class ShiftedPatchTokenization(Module):
 
         return out, next_time_cache
 
+# slot attention - https://arxiv.org/abs/2006.15055
+# inverted attention - https://openreview.net/forum?id=3H8j14mA3X
+
+class InvertedCrossAttention(Module):
+    def __init__(
+        self,
+        dim,
+        heads = 8,
+        dim_head = 64,
+        inverted_attention = True,
+        pre_rmsnorm = True
+    ):
+        super().__init__()
+        self.norm = RMSNorm(dim) if pre_rmsnorm else Identity()
+        self.inverted_attention = inverted_attention
+
+        inner_dim = heads * dim_head
+        self.scale = dim_head ** -0.5
+
+        self.to_q = LinearNoBias(dim, inner_dim)
+        self.to_kv = LinearNoBias(dim, inner_dim * 2)
+        self.to_out = LinearNoBias(inner_dim, dim)
+
+        self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
+        self.merge_heads = Rearrange('b h n d -> b n (h d)', h = heads)
+
+    def forward(self, x, context):
+        x = self.norm(x)
+
+        q, k, v = (self.to_q(x), *self.to_kv(context).chunk(2, dim = -1))
+
+        q, k, v = [self.split_heads(t) for t in (q, k, v)]
+
+        sim = einsum(q, k, 'b h i d, b h j d -> b h i j') * self.scale
+
+        if self.inverted_attention:
+            attn = sim.softmax(dim = -2)
+            attn = l1norm(attn)
+        else:
+            attn = sim.softmax(dim = -1)
+
+        out = einsum(attn, v, 'b h i j, b h j d -> b h i d')
+
+        return self.to_out(self.merge_heads(out))
+
+class SlotAttention(Module):
+    def __init__(
+        self,
+        dim,
+        iters = 2,
+        ff_mult = 4,
+        **kwargs
+    ):
+        super().__init__()
+        self.iters = iters
+
+        self.attn = InvertedCrossAttention(dim = dim, pre_rmsnorm = True, **kwargs)
+
+        self.ff = SwiGLUFeedforward(
+            dim = dim,
+            expansion_factor = ff_mult,
+            pre_rmsnorm = True
+        )
+
+    def forward(self, latents, context):
+        latents, inverse_pack = pack_one(latents, '* n d')
+        context, _ = pack_one(context, '* n d')
+
+        for _ in range(self.iters):
+            latents = self.attn(latents, context) + latents
+            latents = self.ff(latents) + latents
+
+        return inverse_pack(latents)
+
 # video tokenizer
 
 @save_load
@@ -2894,7 +2971,12 @@ class VideoTokenizer(Module):
         decoder_flow_times_beta_beta = 1.,
         h_net_layer: int | None = None,
         h_net_kwargs: dict | None = None,
-        h_net_loss_weight = 1.
+        h_net_loss_weight = 1.,
+        slot_attention_initted_latents = False,
+        slot_attention_iters = 2,
+        decoder_slot_attention_initted_spatial_tokens = False,
+        decoder_slot_attention_iters = 2,
+        slot_attention_inverted = True
     ):
         super().__init__()
 
@@ -2909,6 +2991,28 @@ class VideoTokenizer(Module):
 
         self.per_image_patch_mask_prob = per_image_patch_mask_prob
         self.mask_token = Parameter(randn(dim) * 1e-2)
+
+        # optional slot attention init
+
+        self.slot_attention_initted_latents = slot_attention_initted_latents
+        if slot_attention_initted_latents:
+            self.slot_attention = SlotAttention(
+                dim = dim,
+                iters = slot_attention_iters,
+                heads = attn_heads,
+                dim_head = attn_dim_head,
+                inverted_attention = slot_attention_inverted
+            )
+
+        self.decoder_slot_attention_initted_spatial_tokens = decoder_slot_attention_initted_spatial_tokens
+        if decoder_slot_attention_initted_spatial_tokens:
+            self.decoder_slot_attention = SlotAttention(
+                dim = dim,
+                iters = decoder_slot_attention_iters,
+                heads = attn_heads,
+                dim_head = attn_dim_head,
+                inverted_attention = slot_attention_inverted
+            )
 
         # patch and unpatch
 
@@ -3122,6 +3226,9 @@ class VideoTokenizer(Module):
             self.mask_token
         ]
 
+        if self.slot_attention_initted_latents:
+            params.extend(self.slot_attention.parameters())
+
         if self.use_causal_conv3d:
             params.extend(self.encoder_pre_causal_conv3d.parameters())
             params.extend(self.encoder_post_causal_conv3d.parameters())
@@ -3142,6 +3249,9 @@ class VideoTokenizer(Module):
         if self.has_flow:
             params.extend(self.time_embed.parameters())
             params.extend(self.noised_patch_to_tokens.parameters())
+
+        if self.decoder_slot_attention_initted_spatial_tokens:
+            params.extend(self.decoder_slot_attention.parameters())
 
         return params
 
@@ -3204,6 +3314,11 @@ class VideoTokenizer(Module):
         if exists(noised_video):
             image_tokens = self.noised_patch_to_tokens(noised_video)
             spatial_tokens = spatial_tokens + image_tokens
+
+        if self.decoder_slot_attention_initted_spatial_tokens:
+            spatial_tokens, inverse_pack_space = pack_one(spatial_tokens, 'b t * d')
+            spatial_tokens = self.decoder_slot_attention(spatial_tokens, latent_tokens)
+            spatial_tokens = inverse_pack_space(spatial_tokens)
 
         tokens, packed_latent_shape = pack((spatial_tokens, latent_tokens), 'b t * d')
 
@@ -3349,6 +3464,9 @@ class VideoTokenizer(Module):
         # add the latent
 
         latents = repeat(self.latent_tokens, 'n d -> b t n d', b = tokens.shape[0], t = tokens.shape[1])
+
+        if self.slot_attention_initted_latents:
+            latents = self.slot_attention(latents, tokens)
 
         tokens, packed_latent_shape = pack((tokens, latents), 'b t * d')
 

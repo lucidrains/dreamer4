@@ -67,12 +67,15 @@ def video_tensor_to_gif(
         optimize = optimize
     )
 
-def save_video_grid_as_gif(video, path):
+def video_tensor_to_grid(video):
     batch = video.shape[0]
     num_rows = int(math.sqrt(batch))
     num_keep = num_rows ** 2
     video = video[:num_keep]
-    grid = rearrange(video, '(row col) c f h w -> c f (row h) (col w)', row = num_rows)
+    return rearrange(video, '(row col) c f h w -> c f (row h) (col w)', row = num_rows)
+
+def save_video_grid_as_gif(video, path):
+    grid = video_tensor_to_grid(video)
     video_tensor_to_gif(grid.cpu(), str(path))
 
 def cycle(dl):
@@ -101,9 +104,11 @@ class VideoTokenizerTrainer(Module):
         cpu = False,
         use_ema = False,
         ema_decay = 0.999,
-        use_tensorboard_logger = False,
+        use_tensorboard = False,
+        use_wandb = False,
         log_dir: str | None = None,
         project_name = 'dreamer4',
+        run_name: str | None = None,
         log_video = False,
         video_fps = -1,
         log_video_every = 1000,
@@ -113,17 +118,29 @@ class VideoTokenizerTrainer(Module):
         super().__init__()
         batch_size = min(batch_size, len(dataset))
 
-        if use_tensorboard_logger:
+        assert not (use_tensorboard and use_wandb), 'use either tensorboard or wandb, not both'
+
+        self.use_tensorboard = use_tensorboard
+        self.use_wandb = use_wandb
+
+        if use_tensorboard:
             accelerate_kwargs.update(log_with = 'tensorboard', project_dir = log_dir)
+        elif use_wandb:
+            accelerate_kwargs.update(log_with = 'wandb', project_dir = log_dir)
 
         self.accelerator = Accelerator(
             cpu = cpu,
             **accelerate_kwargs
         )
 
-        if use_tensorboard_logger:
-            self.accelerator.init_trackers(project_name)
+        if use_tensorboard or use_wandb:
+            init_kwargs = dict()
+            if exists(run_name) and use_wandb:
+                init_kwargs = {'wandb': {'name': run_name}}
 
+            self.accelerator.init_trackers(project_name, init_kwargs = init_kwargs)
+
+        self.video_logger = None
         if log_video:
             assert video_fps > 0, "Video fps must be passed in and positive when log_video=True"
 
@@ -135,7 +152,7 @@ class VideoTokenizerTrainer(Module):
                 self.results_folder = Path(log_dir) / 'results'
                 self.results_folder.mkdir(parents = True, exist_ok = True)
 
-            if use_tensorboard_logger:
+            if use_tensorboard:
                 self.video_logger = self.accelerator.get_tracker("tensorboard").writer.add_video
 
         self.log_video_flag = log_video
@@ -220,13 +237,15 @@ class VideoTokenizerTrainer(Module):
         self.accelerator.log(data, step = self.step.item())
 
     def log_video(self, video, tag: str):
-        if exists(self.video_logger):
-            self.video_logger(
-                tag,
-                rearrange(video, 'b c t h w -> b t c h w'),
-                self.step.item(),
-                self.fps
-            )
+        grid = video_tensor_to_grid(video)
+
+        if self.use_tensorboard and exists(self.video_logger):
+            self.video_logger(tag, rearrange(grid, 'c f h w -> 1 f c h w'), self.step.item(), self.fps)
+
+        if self.use_wandb:
+            import wandb
+            video_np = (rearrange(grid, 'c f h w -> f c h w').cpu().numpy() * 255).astype('uint8')
+            wandb.log({tag: wandb.Video(video_np, fps = self.fps, format = 'mp4')}, step = self.step.item())
 
     def load(self, path):
         path = Path(path)
@@ -419,7 +438,8 @@ class BehaviorCloneTrainer(Module):
         accelerate_kwargs: dict = dict(),
         optim_kwargs: dict = dict(),
         cpu = False,
-        use_tensorboard_logger = False,
+        use_tensorboard = False,
+        use_wandb = False,
         log_dir: str | None = None,
         project_name = 'dreamer4',
         log_video = True,
@@ -447,15 +467,22 @@ class BehaviorCloneTrainer(Module):
         super().__init__()
         batch_size = min(batch_size, len(dataset))
 
-        if use_tensorboard_logger:
+        assert not (use_tensorboard and use_wandb), 'use either tensorboard or wandb, not both'
+
+        self.use_tensorboard = use_tensorboard
+        self.use_wandb = use_wandb
+
+        if use_tensorboard:
             accelerate_kwargs.update(log_with = 'tensorboard', project_dir = log_dir)
+        elif use_wandb:
+            accelerate_kwargs.update(log_with = 'wandb', project_dir = log_dir)
 
         self.accelerator = Accelerator(
             cpu = cpu,
             **accelerate_kwargs
         )
 
-        if use_tensorboard_logger:
+        if use_tensorboard or use_wandb:
             self.accelerator.init_trackers(project_name)
 
         self.model = model
@@ -534,7 +561,7 @@ class BehaviorCloneTrainer(Module):
                 self.results_folder = Path(log_dir) / 'results'
                 self.results_folder.mkdir(parents = True, exist_ok = True)
 
-            if use_tensorboard_logger:
+            if use_tensorboard:
                 self.video_logger = self.accelerator.get_tracker("tensorboard").writer.add_video
 
         self.log_video_flag = log_video
@@ -591,13 +618,15 @@ class BehaviorCloneTrainer(Module):
         self.accelerator.log(data, step = self.step.item())
 
     def log_video(self, video, tag: str):
-        if exists(self.video_logger):
-            self.video_logger(
-                tag,
-                rearrange(video, 'b c t h w -> b t c h w'),
-                self.step.item(),
-                self.fps
-            )
+        grid = video_tensor_to_grid(video)
+
+        if self.use_tensorboard and exists(self.video_logger):
+            self.video_logger(tag, rearrange(grid, 'c f h w -> 1 f c h w'), self.step.item(), self.fps)
+
+        if self.use_wandb:
+            import wandb
+            video_np = (rearrange(grid, 'c f h w -> f c h w').cpu().numpy() * 255).astype('uint8')
+            wandb.log({tag: wandb.Video(video_np, fps = self.fps, format = 'mp4')}, step = self.step.item())
 
     def load(self, path):
         path = Path(path)
@@ -878,21 +907,26 @@ class DreamTrainer(Module):
         accelerate_kwargs: dict = dict(),
         optim_kwargs: dict = dict(),
         cpu = False,
-        use_tensorboard_logger = False,
+        use_tensorboard = False,
+        use_wandb = False,
         log_dir: str | None = None,
         project_name = 'dreamer4'
     ):
         super().__init__()
 
-        if use_tensorboard_logger:
+        assert not (use_tensorboard and use_wandb), 'use either tensorboard or wandb, not both'
+
+        if use_tensorboard:
             accelerate_kwargs.update(log_with = 'tensorboard', project_dir = log_dir)
+        elif use_wandb:
+            accelerate_kwargs.update(log_with = 'wandb', project_dir = log_dir)
 
         self.accelerator = Accelerator(
             cpu = cpu,
             **accelerate_kwargs
         )
 
-        if use_tensorboard_logger:
+        if use_tensorboard or use_wandb:
             self.accelerator.init_trackers(project_name)
 
         self.model = model
@@ -1015,21 +1049,26 @@ class SimTrainer(Module):
         accelerate_kwargs: dict = dict(),
         optim_kwargs: dict = dict(),
         cpu = False,
-        use_tensorboard_logger = False,
+        use_tensorboard = False,
+        use_wandb = False,
         log_dir = None,
         project_name = 'dreamer4'
     ):
         super().__init__()
 
-        if use_tensorboard_logger:
+        assert not (use_tensorboard and use_wandb), 'use either tensorboard or wandb, not both'
+
+        if use_tensorboard:
             accelerate_kwargs.update(log_with = 'tensorboard', project_dir = log_dir)
+        elif use_wandb:
+            accelerate_kwargs.update(log_with = 'wandb', project_dir = log_dir)
 
         self.accelerator = Accelerator(
             cpu = cpu,
             **accelerate_kwargs
         )
 
-        if use_tensorboard_logger:
+        if use_tensorboard or use_wandb:
             self.accelerator.init_trackers(project_name)
 
         self.model = model
