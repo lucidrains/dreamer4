@@ -858,7 +858,7 @@ class ActionEmbedder(Module):
         num_discrete_actions: int | tuple[int, ...] = 0,
         num_continuous_actions  = 0,
         continuous_norm_stats: tuple[tuple[float, float], ...] | None = None,
-        continuous_dist_type: Literal['gaussian', 'squashed_gaussian', 'beta'] = 'gaussian',
+        continuous_dist_type: Literal['gaussian', 'squashed_gaussian', 'beta'] = 'beta',
         continuous_dist_kwargs: dict = dict(),
         continuous_target_action_range: tuple[float, float] | None = None,
         can_unembed = False,
@@ -902,6 +902,8 @@ class ActionEmbedder(Module):
         # only bounded distributions (beta, squashed_gaussian) can be rescaled to a target action range
 
         is_bounded = continuous_dist_type in ('beta', 'squashed_gaussian')
+        if is_bounded and not exists(continuous_target_action_range):
+            continuous_target_action_range = (-1., 1.)
         self.continuous_target_action_range = continuous_target_action_range if is_bounded else None
 
         readout_squashed = continuous_dist_type == 'squashed_gaussian'
@@ -3650,7 +3652,7 @@ class DynamicsWorldModel(Module):
         num_discrete_actions: int | tuple[int, ...] = 0,
         num_continuous_actions = 0,
         continuous_norm_stats = None,
-        continuous_dist_type: Literal['gaussian', 'squashed_gaussian', 'beta'] = 'gaussian',
+        continuous_dist_type: Literal['gaussian', 'squashed_gaussian', 'beta'] = 'beta',
         continuous_dist_kwargs: dict = dict(),
         continuous_target_action_range: tuple[float, float] | None = None,
         multi_token_pred_len = 8,                   # they do multi-token prediction of 8 steps forward
@@ -6411,7 +6413,7 @@ class DynamicsWorldModel(Module):
             (tem_loss * self.tem_loss_weight)
         )
 
-        losses = WorldModelLosses(flow_loss, shortcut_flow_loss, reward_loss, state_terminal_loss, discrete_action_loss, continuous_action_loss, state_pred_loss, agent_state_pred_loss, latent_ar_loss, latent_ar_sigreg_loss, lapo_action_loss, lapo_fdm_loss, lapo_raw_latent_fdm_loss, tem_loss)
+        losses = WorldModelLosses(flow_loss, shortcut_flow_loss, reward_loss, state_terminal_loss, discrete_action_loss, continuous_action_loss, state_pred_loss, agent_state_pred_loss, latent_ar_loss, latent_ar_sigreg_loss, lapo_action_loss, lapo_fdm_loss, lapo_raw_latent_fdm_loss, tem_loss, self.zero)
 
         if not (return_all_losses or return_intermediates):
             return total_loss
