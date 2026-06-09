@@ -8,10 +8,10 @@
 #   "einops",
 #   "moviepy",
 #   "imageio",
-#   "requests",
 #   "accelerate",
 #   "adam-atan2-pytorch",
 #   "tensorboard",
+#   "wandb",
 #   "torch-einops-utils",
 #   "dreamer4"
 # ]
@@ -128,7 +128,11 @@ def main(
     latent_ar_layer = 0,
     latent_ar_loss_weight = 0.,
     latent_ar_sigreg_loss_weight = 0.05,
-    latent_ar_sigreg_num_slices = 256
+    latent_ar_sigreg_num_slices = 256,
+    num_spatial_tokens = 4,
+    use_wandb = False,
+    experiment_name = 'dreamer4',
+    run_name = None
 ):
     import shutil
 
@@ -205,7 +209,8 @@ def main(
         latent_ar_layer = latent_ar_layer,
         latent_ar_loss_weight = latent_ar_loss_weight,
         latent_ar_sigreg_loss_weight = latent_ar_sigreg_loss_weight,
-        latent_ar_sigreg_loss_kwargs = dict(num_slices = latent_ar_sigreg_num_slices) if latent_ar else None
+        latent_ar_sigreg_loss_kwargs = dict(num_slices = latent_ar_sigreg_num_slices) if latent_ar else None,
+        num_spatial_tokens = num_spatial_tokens
     )
 
     # initialize trainer
@@ -216,7 +221,10 @@ def main(
         batch_size = batch_size,
         learning_rate = lr,
         num_train_steps = num_train_steps,
-        use_tensorboard = True,
+        use_tensorboard = not use_wandb,
+        use_wandb = use_wandb,
+        project_name = experiment_name,
+        run_name = run_name,
         log_dir = log_dir,
         video_fps = video_fps,
         log_video_every = log_video_every,

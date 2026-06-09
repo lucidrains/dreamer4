@@ -442,6 +442,7 @@ class BehaviorCloneTrainer(Module):
         use_wandb = False,
         log_dir: str | None = None,
         project_name = 'dreamer4',
+        run_name: str | None = None,
         log_video = True,
         log_video_every = 100,
         checkpoint_every = 5000,
@@ -483,7 +484,10 @@ class BehaviorCloneTrainer(Module):
         )
 
         if use_tensorboard or use_wandb:
-            self.accelerator.init_trackers(project_name)
+            init_kwargs = dict()
+            if exists(run_name) and use_wandb:
+                init_kwargs = {'wandb': {'name': run_name}}
+            self.accelerator.init_trackers(project_name, init_kwargs = init_kwargs)
 
         self.model = model
         self.dataset = dataset

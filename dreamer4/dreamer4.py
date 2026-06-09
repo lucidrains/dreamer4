@@ -3798,7 +3798,7 @@ class DynamicsWorldModel(Module):
         freeze_aux_image_encoder = False,
         max_steps = 64,                # K_max in paper
         num_register_tokens = 8,       # they claim register tokens led to better temporal consistency
-        num_spatial_tokens = 2,        # latents projected to greater number of spatial tokens
+        num_spatial_tokens = 4,        # latents projected to greater number of spatial tokens
         num_latent_tokens = None,
         num_agents = 1,
         num_tasks = 0,
