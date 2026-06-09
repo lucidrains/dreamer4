@@ -251,7 +251,7 @@ class VideoTokenizerTrainer(Module):
         path = Path(path)
         assert path.exists(), f"checkpoint not found at {path}"
 
-        pkg = torch.load(str(path), map_location = 'cpu', weights_only = True)
+        pkg = torch.load(str(path), map_location = 'cpu', weights_only = False)
 
         if 'step' in pkg:
             self.step.copy_(tensor(pkg['step']))
@@ -271,7 +271,7 @@ class VideoTokenizerTrainer(Module):
             ema_model.load_state_dict(pkg.get('model', pkg), strict = False)
             return
 
-        ema_pkg = torch.load(str(ema_path), map_location = 'cpu', weights_only = True)
+        ema_pkg = torch.load(str(ema_path), map_location = 'cpu', weights_only = False)
         ema_model.load_state_dict(ema_pkg.get('model', ema_pkg), strict = False)
 
     def forward(
@@ -636,7 +636,7 @@ class BehaviorCloneTrainer(Module):
         path = Path(path)
         assert path.exists(), f"checkpoint not found at {path}"
 
-        pkg = torch.load(str(path), map_location = 'cpu', weights_only = True)
+        pkg = torch.load(str(path), map_location = 'cpu', weights_only = False)
 
         if 'step' in pkg:
             self.step.copy_(tensor(pkg['step']))
@@ -655,7 +655,7 @@ class BehaviorCloneTrainer(Module):
             ema_model.load_state_dict(pkg.get('model', pkg), strict = False)
             return
 
-        ema_pkg = torch.load(str(ema_path), map_location = 'cpu', weights_only = True)
+        ema_pkg = torch.load(str(ema_path), map_location = 'cpu', weights_only = False)
         ema_model.load_state_dict(ema_pkg.get('model', ema_pkg), strict = False)
 
     def save_checkpoint(self):

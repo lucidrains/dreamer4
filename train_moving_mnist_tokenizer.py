@@ -106,7 +106,10 @@ def main(
     run_name = None,
     slot_attention_initted_latents = False,
     decoder_slot_attention_initted_spatial_tokens = False,
-    slot_attention_inverted = True
+    slot_attention_inverted = True,
+    encoder_slot_spatial_mix = True,
+    decoder_slot_spatial_mix = False,
+    latent_init_patch_size = None
 ):
     import shutil
 
@@ -188,7 +191,10 @@ def main(
         h_net_kwargs = h_net_kwargs,
         slot_attention_initted_latents = slot_attention_initted_latents,
         decoder_slot_attention_initted_spatial_tokens = decoder_slot_attention_initted_spatial_tokens,
-        slot_attention_inverted = slot_attention_inverted
+        slot_attention_inverted = slot_attention_inverted,
+        encoder_slot_spatial_mix = encoder_slot_spatial_mix,
+        decoder_slot_spatial_mix = decoder_slot_spatial_mix,
+        latent_init_patch_size = latent_init_patch_size
     )
 
     # trainer

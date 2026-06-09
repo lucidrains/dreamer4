@@ -1584,7 +1584,7 @@ def test_dynamics_mot_temporal(mot_temporal):
 
         seq_flow_list = []
         time_cache = None
-        
+
         padded_actions = F.pad(actions[:, :-1], (0, 0, 1, 0), value = 0)
 
         for t in range(seq_len):
@@ -1608,3 +1608,49 @@ def test_dynamics_mot_temporal(mot_temporal):
         seq_flow = torch.cat(seq_flow_list, dim=1)
 
     assert torch.allclose(pred_parallel.flow, seq_flow, atol = 1e-5), "Dynamics flow output diverges"
+
+def test_latent_init_patch_size():
+    from dreamer4.dreamer4 import VideoTokenizer
+
+    tokenizer = VideoTokenizer(
+        dim = 16,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        time_block_every = 1,
+        dim_latent = 16,
+        patch_size = 8,
+        latent_init_patch_size = 4,
+        attn_dim_head = 8,
+        num_latent_tokens = 4,
+        image_height = 32,
+        image_width = 32,
+        slot_attention_initted_latents = True
+    )
+
+    video = torch.randn(2, 3, 2, 32, 32)
+    latents = tokenizer(video, return_latents=True)
+    assert latents.shape[-1] == 16
+    assert latents.shape[-2] == 4
+
+    loss = tokenizer(video)
+    assert loss.numel() == 1
+
+    # Also test same patch size
+    tokenizer_same = VideoTokenizer(
+        dim = 16,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        time_block_every = 1,
+        dim_latent = 16,
+        patch_size = 8,
+        latent_init_patch_size = 8,
+        attn_dim_head = 8,
+        num_latent_tokens = 4,
+        image_height = 32,
+        image_width = 32,
+        slot_attention_initted_latents = True
+    )
+
+    latents_same = tokenizer_same(video, return_latents=True)
+    assert latents_same.shape[-1] == 16
+    assert latents_same.shape[-2] == 4

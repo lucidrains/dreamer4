@@ -2953,12 +2953,25 @@ class SlotAttention(Module):
         dim_context = None,
         iters = 2,
         ff_mult = 4,
+        num_slots = None,
+        spatial_mix = False,
         **kwargs
     ):
         super().__init__()
         self.iters = iters
+        self.spatial_mix = spatial_mix
 
         self.attn = InvertedCrossAttention(dim = dim, dim_context = dim_context, pre_rmsnorm = True, **kwargs)
+
+        if spatial_mix:
+            assert exists(num_slots), 'num_slots must be passed in if spatial_mix is True'
+            hidden_slots = max(1, int(num_slots * 0.5))
+            self.spatial_mixer = Sequential(
+                RMSNorm(dim),
+                nn.Conv1d(num_slots, hidden_slots, 1),
+                nn.SiLU(),
+                nn.Conv1d(hidden_slots, num_slots, 1)
+            )
 
         self.ff = SwiGLUFeedforward(
             dim = dim,
@@ -2972,6 +2985,10 @@ class SlotAttention(Module):
 
         for _ in range(self.iters):
             latents = self.attn(latents, context) + latents
+
+            if self.spatial_mix:
+                latents = self.spatial_mixer(latents) + latents
+
             latents = self.ff(latents) + latents
 
         return inverse_pack(latents)
@@ -2985,6 +3002,7 @@ class VideoTokenizer(Module):
         dim,
         dim_latent,
         patch_size,
+        latent_init_patch_size = None,
         image_height = None,
         image_width = None,
         num_latent_tokens = 64,
@@ -3036,8 +3054,10 @@ class VideoTokenizer(Module):
         h_net_loss_weight = 1.,
         slot_attention_initted_latents = False,
         slot_attention_iters = 2,
+        encoder_slot_spatial_mix = True,
         decoder_slot_attention_initted_spatial_tokens = False,
         decoder_slot_attention_iters = 2,
+        decoder_slot_spatial_mix = False,
         slot_attention_inverted = True,
         mot_temporal = False,
     ):
@@ -3064,7 +3084,9 @@ class VideoTokenizer(Module):
                 iters = slot_attention_iters,
                 heads = attn_heads,
                 dim_head = attn_dim_head,
-                inverted_attention = slot_attention_inverted
+                inverted_attention = slot_attention_inverted,
+                num_slots = num_latent_tokens,
+                spatial_mix = encoder_slot_spatial_mix
             )
 
         self.decoder_slot_attention_initted_spatial_tokens = decoder_slot_attention_initted_spatial_tokens
@@ -3074,7 +3096,9 @@ class VideoTokenizer(Module):
                 iters = decoder_slot_attention_iters,
                 heads = attn_heads,
                 dim_head = attn_dim_head,
-                inverted_attention = slot_attention_inverted
+                inverted_attention = slot_attention_inverted,
+                num_slots = self.num_spatial_tokens,
+                spatial_mix = decoder_slot_spatial_mix
             )
 
         # patch and unpatch
@@ -3083,14 +3107,28 @@ class VideoTokenizer(Module):
 
         self.use_shifted_patch_tokenization = use_shifted_patch_tokenization
 
+        def patch_to_tokens_fn(p):
+            return Sequential(
+                Rearrange('b c t (h p1) (w p2) -> b t h w (p1 p2 c)', p1 = p, p2 = p),
+                Linear(channels * p ** 2, dim),
+                LayerNormNoBias(dim)
+            )
+
         if use_shifted_patch_tokenization:
             self.patch_to_tokens = ShiftedPatchTokenization(dim = dim, patch_size = patch_size, channels = channels, **spt_kwargs)
         else:
-            self.patch_to_tokens = Sequential(
-                Rearrange('b c t (h p1) (w p2) -> b t h w (p1 p2 c)', p1 = patch_size, p2 = patch_size),
-                Linear(dim_patch, dim),
-                LayerNormNoBias(dim)
-            )
+            self.patch_to_tokens = patch_to_tokens_fn(patch_size)
+
+        self.has_latent_init_patch = exists(latent_init_patch_size)
+        self.latent_init_patch_size = latent_init_patch_size
+
+        if self.has_latent_init_patch:
+            assert latent_init_patch_size <= patch_size, 'latent init patch size must be less than or equal to the base patch size'
+            assert divisible_by(patch_size, latent_init_patch_size), 'base patch size must be cleanly divisible by latent init patch size'
+
+            self.latent_init_patch_scale = patch_size // latent_init_patch_size
+            self.latent_init_patch_to_tokens = patch_to_tokens_fn(latent_init_patch_size)
+            self.latent_init_mask_token = Parameter(randn(dim) * 1e-2)
 
         self.tokens_to_patch = Sequential(
             Linear(dim, dim_patch),
@@ -3499,6 +3537,11 @@ class VideoTokenizer(Module):
         else:
             tokens = self.patch_to_tokens(video)
 
+        if self.has_latent_init_patch:
+            latent_init_tokens = self.latent_init_patch_to_tokens(video)
+        else:
+            latent_init_tokens = tokens
+
         next_pre_causal_conv_cache = None
 
         if self.use_causal_conv3d:
@@ -3522,16 +3565,28 @@ class VideoTokenizer(Module):
 
             tokens = einx.where('..., d, ... d', patch_mask, self.mask_token, tokens)
 
+            if self.has_latent_init_patch:
+                latent_init_patch_mask = patch_mask
+
+                if self.latent_init_patch_scale > 1:
+                    scale = self.latent_init_patch_scale
+                    latent_init_patch_mask = repeat(latent_init_patch_mask, 'b t h w -> b t (h s1) (w s2)', s1 = scale, s2 = scale)
+
+                latent_init_tokens = einx.where('..., d, ... d', latent_init_patch_mask, self.latent_init_mask_token, latent_init_tokens)
+
         # pack space
 
         tokens, inverse_pack_space = pack_one(tokens, 'b t * d')
+
+        if self.has_latent_init_patch:
+            latent_init_tokens, _ = pack_one(latent_init_tokens, 'b t * d')
 
         # add the latent
 
         latents = repeat(self.latent_tokens, 'n d -> b t n d', b = tokens.shape[0], t = tokens.shape[1])
 
         if self.slot_attention_initted_latents:
-            latents = self.slot_attention(latents, tokens)
+            latents = self.slot_attention(latents, latent_init_tokens)
 
         tokens, packed_latent_shape = pack((tokens, latents), 'b t * d')
 
