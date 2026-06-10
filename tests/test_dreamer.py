@@ -178,12 +178,65 @@ def test_symexp_two_hot():
     values = torch.randn((10))
 
     two_hot_encoded = two_hot_encoder(values)
-    recon_values = two_hot_encoder.bins_to_scalar_value(two_hot_encoded)
+    recon_values = two_hot_encoder.bins_to_scalar_value(two_hot_encoded, normalize = False)
 
     assert torch.allclose(recon_values, values, atol = 1e-6)
 
     reward_embeds = two_hot_encoder.embed(two_hot_encoded)
     assert reward_embeds.shape == (10, 512)
+
+def test_hl_gauss_reward_encoder():
+    import torch
+    from dreamer4.dreamer4 import HLGaussRewardEncoder
+
+    encoder = HLGaussRewardEncoder(
+        (-3., 3.),
+        num_bins = 20,
+        learned_embedding = True,
+        dim_embed = 512
+    )
+
+    values = torch.randn((10)).clamp(-3., 3.)
+
+    probs = encoder(values)
+    recon_values = encoder.bins_to_scalar_value(probs, normalize = False)
+    empty_probs = encoder(values.new_empty(2, 0))
+
+    assert probs.shape == (10, 20)
+    assert empty_probs.shape == (2, 0, 20)
+    assert recon_values.shape == values.shape
+    assert recon_values.amin() >= -3.
+    assert recon_values.amax() <= 3.
+
+    reward_embeds = encoder.embed(probs)
+    assert reward_embeds.shape == (10, 512)
+
+def test_dynamics_world_model_defaults_to_hl_gauss_reward_encoder():
+    from dreamer4.dreamer4 import DynamicsWorldModel, HLGaussRewardEncoder, SymExpTwoHot
+
+    dynamics = DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 8,
+        num_latent_tokens = 4,
+        depth = 1,
+        reward_encoder_kwargs = dict(num_bins = 20),
+        value_encoder_kwargs = dict(num_bins = 32),
+    )
+
+    assert isinstance(dynamics.reward_encoder, HLGaussRewardEncoder)
+    assert isinstance(dynamics.value_encoder, HLGaussRewardEncoder)
+    assert dynamics.reward_encoder.num_bins == 20
+    assert dynamics.value_encoder.num_bins == 32
+
+    dynamics = DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 8,
+        num_latent_tokens = 4,
+        depth = 1,
+        reward_encoder_type = 'symexp_two_hot',
+    )
+
+    assert isinstance(dynamics.reward_encoder, SymExpTwoHot)
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = 'no cuda')
 @param('causal', (False, True))
@@ -252,7 +305,9 @@ def test_action_with_world_model():
         dim_latent = 8,
         depth = 1,
         time_block_every = 1,
-        num_discrete_actions = 4
+        num_discrete_actions = 4,
+        reward_encoder_kwargs = dict(num_bins = 20),
+        value_encoder_kwargs = dict(num_bins = 32)
     )
 
     rewards = torch.randn(1, 4)
