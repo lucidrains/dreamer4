@@ -1654,3 +1654,10 @@ def test_latent_init_patch_size():
     latents_same = tokenizer_same(video, return_latents=True)
     assert latents_same.shape[-1] == 16
     assert latents_same.shape[-2] == 4
+
+def test_orthogonal_loss():
+    from dreamer4.dreamer4 import orthogonal_loss
+    x = torch.randn(2, 4, 16) # batch, n, dim
+    loss = orthogonal_loss(x)
+    assert loss.ndim == 0
+    assert loss >= 0.

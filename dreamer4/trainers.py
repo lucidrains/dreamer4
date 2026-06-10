@@ -331,6 +331,7 @@ class VideoTokenizerTrainer(Module):
                 lpips_loss = losses.lpips.item(),
                 time_decorr_loss = losses.time_decorr.item(),
                 space_decorr_loss = losses.space_decorr.item(),
+                latent_ortho_loss = losses.latent_ortho.item(),
                 latent_ar_loss = losses.latent_ar.item()
             )
 
@@ -374,6 +375,10 @@ class VideoTokenizerTrainer(Module):
             space_decorr_loss = losses.space_decorr.item()
             if space_decorr_loss > 0.:
                 postfix_kwargs['space_decorr'] = f"{space_decorr_loss:.4f}"
+
+            latent_ortho_loss = losses.latent_ortho.item()
+            if latent_ortho_loss > 0.:
+                postfix_kwargs['latent_ortho'] = f"{latent_ortho_loss:.4f}"
 
             latent_ar_loss = losses.latent_ar.item()
             if latent_ar_loss > 0.:

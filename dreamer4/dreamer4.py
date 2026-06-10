@@ -109,7 +109,7 @@ LayerNormNoBias = partial(nn.LayerNorm, bias = False)
 
 VideoTokenizerIntermediates = namedtuple('VideoTokenizerIntermediates', ('losses', 'recon'))
 
-TokenizerLosses = namedtuple('TokenizerLosses', ('recon', 'lpips', 'time_decorr', 'space_decorr', 'latent_ar', 'latent_ar_sigreg', 'latent_consistency', 'latent_sigreg', 'h_net'))
+TokenizerLosses = namedtuple('TokenizerLosses', ('recon', 'lpips', 'time_decorr', 'space_decorr', 'latent_ortho', 'latent_ar', 'latent_ar_sigreg', 'latent_consistency', 'latent_sigreg', 'h_net'))
 
 WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'shortcut', 'rewards', 'terminals', 'discrete_actions', 'continuous_actions', 'state_pred', 'agent_state_pred', 'latent_ar', 'latent_ar_sigreg', 'lapo_action', 'lapo_fdm', 'lapo_raw_latent_fdm', 'tem', 'h_net'))
 
@@ -275,6 +275,21 @@ def temp_requires_grad(
         p.requires_grad_(orig)
 
 # tensor helpers
+
+def orthogonal_loss(x):
+    n, device = x.shape[-2], x.device
+    if n == 1:
+        return x.new_zeros(())
+
+    x = x - reduce(x, '... n d -> ... 1 d', 'mean')
+    x = l2norm(x)
+
+    sim = einsum(x, x, '... i d, ... j d -> ... i j')
+
+    eye = torch.eye(n, device = device).bool()
+    sim = sim.masked_fill(eye, 0.)
+
+    return reduce(sim ** 2, '... i j -> ...', 'sum').mean()
 
 def z_score(t, mask = None, eps = 1e-5):
     if not exists(mask):
@@ -3024,6 +3039,7 @@ class VideoTokenizer(Module):
         encoder_add_decorr_aux_loss = False,
         time_decorr_loss_weight = 4e-3,
         space_decorr_loss_weight = 4e-3,
+        latent_ortho_loss_weight = 0.,
         decorr_sample_frac = 0.25,
         use_loss_normalization = True,
         use_causal_conv3d = False,
@@ -3267,8 +3283,10 @@ class VideoTokenizer(Module):
         self.encoder_add_decorr_aux_loss = encoder_add_decorr_aux_loss
         self.time_decorr_loss_weight = time_decorr_loss_weight
         self.space_decorr_loss_weight = space_decorr_loss_weight
+        self.latent_ortho_loss_weight = latent_ortho_loss_weight
 
         self.decorr_loss = DecorrelationLoss(decorr_sample_frac, soft_validate_num_sampled = True) if encoder_add_decorr_aux_loss else None
+        self.has_latent_ortho_loss = latent_ortho_loss_weight > 0.
 
         # optional latent autoregression
 
@@ -3303,6 +3321,7 @@ class VideoTokenizer(Module):
             self.lpips_loss_normalizer = LossNormalizer() if self.has_lpips_loss else None
             self.time_decorr_loss_normalizer = LossNormalizer() if encoder_add_decorr_aux_loss else None
             self.space_decorr_loss_normalizer = LossNormalizer() if encoder_add_decorr_aux_loss else None
+            self.latent_ortho_loss_normalizer = LossNormalizer() if latent_ortho_loss_weight > 0. else None
             self.latent_ar_loss_normalizer = LossNormalizer() if self.has_latent_ar else None
             self.latent_consistency_loss_normalizer = LossNormalizer() if latent_consistency_loss_weight > 0. else None
             self.latent_sigreg_loss_normalizer = LossNormalizer() if latent_sigreg_loss_weight > 0. else None
@@ -3730,7 +3749,7 @@ class VideoTokenizer(Module):
         if self.has_lpips_loss:
             lpips_loss = self.lpips(video, recon_video)
 
-        time_decorr_loss = space_decorr_loss = self.zero
+        time_decorr_loss = space_decorr_loss = latent_ortho_loss = self.zero
 
         if self.encoder_add_decorr_aux_loss:
             if exists(time_attn_normed_inputs):
@@ -3738,6 +3757,9 @@ class VideoTokenizer(Module):
 
             if exists(space_attn_normed_inputs):
                 space_decorr_loss = self.decorr_loss(space_attn_normed_inputs)
+
+        if self.has_latent_ortho_loss and exists(latents):
+            latent_ortho_loss = orthogonal_loss(latents)
 
         # losses
 
@@ -3754,6 +3776,9 @@ class VideoTokenizer(Module):
                 time_decorr_loss = self.time_decorr_loss_normalizer(time_decorr_loss, update_ema = update_loss_ema)
                 space_decorr_loss = self.space_decorr_loss_normalizer(space_decorr_loss, update_ema = update_loss_ema)
 
+            if exists(self.latent_ortho_loss_normalizer):
+                latent_ortho_loss = self.latent_ortho_loss_normalizer(latent_ortho_loss, update_ema = update_loss_ema)
+
             if self.has_latent_consistency_loss:
                 latent_consistency_loss = self.latent_consistency_loss_normalizer(latent_consistency_loss, update_ema = update_loss_ema)
 
@@ -3767,6 +3792,7 @@ class VideoTokenizer(Module):
             lpips_loss * self.lpips_loss_weight +
             time_decorr_loss * self.time_decorr_loss_weight +
             space_decorr_loss * self.space_decorr_loss_weight +
+            latent_ortho_loss * self.latent_ortho_loss_weight +
             latent_ar_loss * self.latent_ar_loss_weight +
             latent_ar_sigreg_loss * self.latent_ar_sigreg_loss_weight +
             latent_consistency_loss * self.latent_consistency_loss_weight +
@@ -3777,7 +3803,7 @@ class VideoTokenizer(Module):
         if not return_intermediates:
             return total_loss
 
-        losses = TokenizerLosses(recon_loss, lpips_loss, time_decorr_loss, space_decorr_loss, latent_ar_loss, latent_ar_sigreg_loss, latent_consistency_loss, latent_sigreg_loss, h_net_loss)
+        losses = TokenizerLosses(recon_loss, lpips_loss, time_decorr_loss, space_decorr_loss, latent_ortho_loss, latent_ar_loss, latent_ar_sigreg_loss, latent_consistency_loss, latent_sigreg_loss, h_net_loss)
 
         # handle returning of reconstructed, and image pretraining
 
