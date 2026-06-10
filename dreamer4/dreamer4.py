@@ -5436,6 +5436,7 @@ class DynamicsWorldModel(Module):
         prompt_discrete_actions: Tensor | None = None,
         prompt_continuous_actions: Tensor | None = None,
         prompt_rewards: Tensor | None = None,
+        aug_id: bool | int | Tensor = False,
         discrete_temperature = 1.,
         continuous_temperature = 1.,
     ): # (b t n d) | (b c t h w)
@@ -5637,6 +5638,7 @@ class DynamicsWorldModel(Module):
                     continuous_actions = curr_continuous,
                     proprio = noised_proprio_with_context,
                     time_cache = time_cache,
+                    aug_id = aug_id,
                     latent_is_noised = True,
                     latent_has_view_dim = True,
                     return_pred_only = True,
@@ -5805,7 +5807,8 @@ class DynamicsWorldModel(Module):
             video = self.video_tokenizer.decode(
                 latents_for_video,
                 height = image_height,
-                width = image_width
+                width = image_width,
+                aug_id = aug_id
             )
 
             video = unpack_view(video, '* t c vh vw')
