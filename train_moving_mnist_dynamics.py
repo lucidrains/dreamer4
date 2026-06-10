@@ -28,7 +28,7 @@ from einops import repeat
 
 from dataset_moving_mnist import MovingMNISTDataset
 from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel, exists
-from dreamer4.trainers import BehaviorCloneTrainer, save_video_grid_as_gif
+from dreamer4.trainers import BehaviorCloneTrainer, save_video_grid_as_gif, pixel_shift_aug
 
 def exists(v):
     return v is not None
@@ -130,6 +130,8 @@ def main(
     latent_ar_sigreg_loss_weight = 0.05,
     latent_ar_sigreg_num_slices = 256,
     num_spatial_tokens = 4,
+    use_pixel_shift_aug = False,
+    aug_prob = 0.5,
     use_wandb = False,
     experiment_name = 'dreamer4',
     run_name = None
@@ -210,7 +212,8 @@ def main(
         latent_ar_loss_weight = latent_ar_loss_weight,
         latent_ar_sigreg_loss_weight = latent_ar_sigreg_loss_weight,
         latent_ar_sigreg_loss_kwargs = dict(num_slices = latent_ar_sigreg_num_slices) if latent_ar else None,
-        num_spatial_tokens = num_spatial_tokens
+        num_spatial_tokens = num_spatial_tokens,
+        has_aug_conditioning = use_pixel_shift_aug
     )
 
     # initialize trainer
@@ -237,6 +240,8 @@ def main(
         sample_autoregressive_actions = sample_autoregressive_actions,
         sample_filename_prefix = 'sample-baseline',
         grad_accum_every = grad_accum_every,
+        custom_aug_fn = pixel_shift_aug if use_pixel_shift_aug else None,
+        aug_prob = aug_prob,
         collate_fn = random_action_collate if condition_on_actions else None,
         custom_sample_fn = custom_3x3_grid_sample if condition_on_actions else None
     )

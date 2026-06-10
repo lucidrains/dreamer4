@@ -1655,9 +1655,68 @@ def test_latent_init_patch_size():
     assert latents_same.shape[-1] == 16
     assert latents_same.shape[-2] == 4
 
-def test_orthogonal_loss():
-    from dreamer4.dreamer4 import orthogonal_loss
-    x = torch.randn(2, 4, 16) # batch, n, dim
-    loss = orthogonal_loss(x)
-    assert loss.ndim == 0
+def test_aug_conditioning():
+    from dreamer4.dreamer4 import VideoTokenizer
+    tokenizer = VideoTokenizer(
+        dim = 128,
+        dim_latent = 16,
+        patch_size = 8,
+        encoder_depth = 2,
+        decoder_depth = 2,
+        attn_dim_head = 8,
+        num_latent_tokens = 4,
+        image_height = 32,
+        image_width = 32,
+        has_aug_conditioning = True
+    )
+
+    video = torch.randn(2, 3, 5, 32, 32)
+    aug_id = torch.randint(0, 3, (2,))
+
+    latents = tokenizer(video, aug_id = aug_id, return_latents = True)
+    assert latents.shape[-1] == 16
+    assert latents.shape[-2] == 4
+
+    loss = tokenizer(video, aug_id = aug_id)
+    assert loss.numel() == 1
     assert loss >= 0.
+
+def test_dynamics_aug_conditioning():
+    from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
+
+    tokenizer = VideoTokenizer(
+        dim = 16,
+        dim_latent = 16,
+        patch_size = 8,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        attn_dim_head = 8,
+        num_latent_tokens = 4,
+        image_height = 32,
+        image_width = 32,
+        has_aug_conditioning = True
+    )
+
+    dynamics = DynamicsWorldModel(
+        dim = 16,
+        video_tokenizer = tokenizer,
+        dim_latent = 16,
+        max_steps = 64,
+        num_latent_tokens = 4,
+        depth = 1,
+        num_discrete_actions = 4,
+        attn_dim_head = 8,
+        has_aug_conditioning = True
+    )
+
+    video = torch.randn(2, 3, 5, 32, 32)
+    discrete_actions = torch.randint(0, 4, (2, 4, 1))
+    aug_id = torch.randint(0, 3, (2,))
+
+    loss, *_ = dynamics(video = video, discrete_actions = discrete_actions, aug_id = aug_id, return_all_losses = True)
+
+    assert loss.numel() == 1
+    assert loss >= 0.
+
+    loss_int, *_ = dynamics(video = video, discrete_actions = discrete_actions, aug_id = 1, return_all_losses = True)
+    assert loss_int.numel() == 1

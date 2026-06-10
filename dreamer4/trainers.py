@@ -2,10 +2,12 @@ from __future__ import annotations
 from typing import Literal
 
 import math
-from collections import OrderedDict
+from collections import OrderedDict, namedtuple
 from random import randint
+from functools import wraps
 
 import torch
+import torch.nn.functional as F
 from torch import is_tensor, tensor
 from torch.nn import Module
 from torch.optim import AdamW
@@ -35,6 +37,9 @@ from dreamer4.dreamer4 import (
 
 from ema_pytorch import EMA
 
+import einx
+from torch_einops_utils import pack_with_inverse
+
 # helpers
 
 def exists(v):
@@ -45,6 +50,45 @@ def default(v, d):
 
 def divisible_by(num, den):
     return (num % den) == 0
+
+# augmentation
+
+AugmentedOutput = namedtuple('AugmentedOutput', ['video', 'aug_id'])
+
+def randomly_apply_aug(aug_fn):
+    @wraps(aug_fn)
+    def wrapper(video, prob = 0.5, **kwargs):
+        batch, device = video.shape[0], video.device
+        mask = torch.rand(batch, device = device) < prob
+        aug_id = mask
+
+        aug_video = aug_fn(video, **kwargs)
+
+        video = einx.where('b, b ..., b ... -> b ...', mask, aug_video, video)
+        return AugmentedOutput(video, aug_id)
+    return wrapper
+
+@randomly_apply_aug
+def pixel_shift_aug(video, max_pixel_shift = 3):
+    video, unpack = pack_with_inverse(video, 'b * h w')
+
+    batch, _, height, width = video.shape
+    device = video.device
+
+    shifts_x = torch.randint(-max_pixel_shift, max_pixel_shift + 1, (batch,), device = device)
+    shifts_y = torch.randint(-max_pixel_shift, max_pixel_shift + 1, (batch,), device = device)
+
+    padded_video = F.pad(video, (max_pixel_shift,) * 4, mode = 'reflect')
+    shifted_video = torch.empty_like(video)
+
+    for i in range(batch):
+        shift_y, shift_x = shifts_y[i].item(), shifts_x[i].item()
+        y_start, x_start = max_pixel_shift - shift_y, max_pixel_shift - shift_x
+        shifted_video[i] = padded_video[i, ..., y_start:y_start + height, x_start:x_start + width]
+
+    shifted_video = unpack(shifted_video)
+
+    return shifted_video
 
 def video_tensor_to_gif(
     tensor,
@@ -113,7 +157,9 @@ class VideoTokenizerTrainer(Module):
         video_fps = -1,
         log_video_every = 1000,
         checkpoint_every = 2500,
-        checkpoint_folder = './checkpoints_tokenizer'
+        checkpoint_folder = './checkpoints_tokenizer',
+        custom_aug_fn = None,
+        aug_prob = 0.5
     ):
         super().__init__()
         batch_size = min(batch_size, len(dataset))
@@ -164,6 +210,9 @@ class VideoTokenizerTrainer(Module):
         self.use_ema = use_ema
         self.ema_decay = ema_decay
         self.checkpoint_path = checkpoint_path
+
+        self.aug_prob = aug_prob
+        self.custom_aug_fn = custom_aug_fn
 
         self.dataset = dataset
         self.train_dataloader = DataLoader(dataset, batch_size = batch_size, drop_last = True, shuffle = True)
@@ -303,11 +352,16 @@ class VideoTokenizerTrainer(Module):
                 video = data['video'] if is_dict else data
                 time_lens = data.get('time_lens') if is_dict else None
 
+                aug_id = None
+                if exists(self.custom_aug_fn):
+                    video, aug_id = self.custom_aug_fn(video, prob = self.aug_prob)
+
                 loss, (losses, recon_video) = self.model(
                     video,
                     time_lens = time_lens,
                     update_loss_ema = True,
-                    return_intermediates = True
+                    return_intermediates = True,
+                    aug_id = aug_id
                 )
 
                 loss = loss / self.grad_accum_every
@@ -468,9 +522,15 @@ class BehaviorCloneTrainer(Module):
         self_flow_loss_weight = 1.0,
         self_flow_kwargs: dict = dict(),
         collate_fn = None,
-        custom_sample_fn = None
+        custom_sample_fn = None,
+        custom_aug_fn = None,
+        aug_prob = 0.5
     ):
         super().__init__()
+
+        self.aug_prob = aug_prob
+        self.custom_aug_fn = custom_aug_fn
+
         batch_size = min(batch_size, len(dataset))
 
         assert not (use_tensorboard and use_wandb), 'use either tensorboard or wandb, not both'
@@ -810,6 +870,12 @@ class BehaviorCloneTrainer(Module):
 
                 if is_tensor(batch_data):
                     batch_data = dict(video = batch_data)
+
+                if exists(self.custom_aug_fn) and 'video' in batch_data:
+                    aug_out = self.custom_aug_fn(batch_data['video'], prob = self.aug_prob)
+
+                    batch_data['video'] = aug_out.video
+                    batch_data['aug_id'] = aug_out.aug_id
 
                 batch_data['return_intermediates'] = True
 

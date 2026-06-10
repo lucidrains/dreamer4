@@ -19,8 +19,10 @@
 # dreamer4 = { path = "." }
 # ///
 
+from functools import partial
 from math import sqrt
 from pathlib import Path
+import shutil
 
 import numpy as np
 import torch
@@ -50,7 +52,7 @@ def default(v, d):
 
 from dataset_moving_mnist import MovingMNISTDataset
 
-from dreamer4.trainers import VideoTokenizerTrainer
+from dreamer4.trainers import VideoTokenizerTrainer, pixel_shift_aug
 
 # main
 
@@ -110,10 +112,11 @@ def main(
     slot_attention_inverted = True,
     encoder_slot_spatial_mix = True,
     decoder_slot_spatial_mix = False,
-    latent_init_patch_size = None
+    latent_init_patch_size = None,
+    use_pixel_shift_aug = False,
+    max_pixel_shift = 3,
+    aug_prob = 0.5
 ):
-    import shutil
-
     # clear old artifacts
 
     log_path = Path(log_dir)
@@ -146,6 +149,10 @@ def main(
         min_velocity = min_velocity,
         max_velocity = max_velocity
     )
+
+    # augmentation
+
+    custom_aug_fn = partial(pixel_shift_aug, max_pixel_shift=max_pixel_shift) if use_pixel_shift_aug else None
 
     # tokenizer
 
@@ -196,7 +203,8 @@ def main(
         slot_attention_inverted = slot_attention_inverted,
         encoder_slot_spatial_mix = encoder_slot_spatial_mix,
         decoder_slot_spatial_mix = decoder_slot_spatial_mix,
-        latent_init_patch_size = latent_init_patch_size
+        latent_init_patch_size = latent_init_patch_size,
+        has_aug_conditioning = use_pixel_shift_aug
     )
 
     # trainer
@@ -220,7 +228,9 @@ def main(
         checkpoint_every = checkpoint_every,
         checkpoint_folder = checkpoint_folder,
         project_name = experiment_name,
-        run_name = run_name
+        run_name = run_name,
+        custom_aug_fn = custom_aug_fn,
+        aug_prob = aug_prob
     )
 
     if exists(latest_checkpoint):
