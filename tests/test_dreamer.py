@@ -1119,6 +1119,27 @@ def test_cache_token_count():
     _, cache2 = model(x2, cache = cache, return_intermediates = True)
     assert cache2.token_count == 3
 
+def test_axial_mot_with_no_special_tokens():
+    from dreamer4 import AxialSpaceTimeTransformer
+
+    model = AxialSpaceTimeTransformer(
+        dim = 32,
+        depth = 2,
+        attn_heads = 2,
+        attn_dim_head = 8,
+        time_block_every = 1,
+        num_special_tokens = 0,
+        mot_temporal = True,
+        value_residual = False,
+        use_attn_pool = False
+    )
+
+    x = torch.randn(2, 3, 4, 32)
+    out, cache = model(x, return_intermediates = True)
+
+    assert out.shape == x.shape
+    assert cache.token_count == 3
+
 def test_images_to_video_tokenizer():
     import torch
     from dreamer4 import VideoTokenizer, DynamicsWorldModel, AxialSpaceTimeTransformer
@@ -1949,3 +1970,82 @@ def test_dynamics_aug_conditioning():
 
     loss_int, *_ = dynamics(video = video, discrete_actions = discrete_actions, aug_id = 1, return_all_losses = True)
     assert loss_int.numel() == 1
+
+def test_dynamics_aug_conditioning_reaches_tokenizer_paths():
+    from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
+
+    tokenizer = VideoTokenizer(
+        dim = 16,
+        dim_latent = 16,
+        patch_size = 8,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        attn_dim_head = 8,
+        num_latent_tokens = 4,
+        image_height = 32,
+        image_width = 32,
+        has_aug_conditioning = True
+    )
+
+    seen_aug_ids = []
+    orig_tokenize = tokenizer.tokenize
+
+    def tokenize_with_record(video, **kwargs):
+        seen_aug_ids.append(kwargs.get('aug_id'))
+        return orig_tokenize(video, **kwargs)
+
+    object.__setattr__(tokenizer, 'tokenize', tokenize_with_record)
+
+    dynamics = DynamicsWorldModel(
+        dim = 16,
+        video_tokenizer = tokenizer,
+        dim_latent = 16,
+        max_steps = 64,
+        num_latent_tokens = 4,
+        depth = 1,
+        num_discrete_actions = 4,
+        attn_dim_head = 8,
+        has_aug_conditioning = True
+    )
+
+    video = torch.randn(2, 3, 3, 32, 32)
+    discrete_actions = torch.randint(0, 4, (2, 2, 1))
+    aug_id = torch.randint(0, 3, (2,))
+
+    dynamics(video = video, discrete_actions = discrete_actions, aug_id = aug_id)
+
+    assert torch.equal(seen_aug_ids[-1], aug_id)
+
+    prompt = torch.randn(2, 3, 1, 32, 32)
+    dynamics.generate(1, batch_size = 2, prompt = prompt, aug_id = aug_id, return_decoded_video = False)
+
+    assert torch.equal(seen_aug_ids[-1], aug_id)
+
+def test_dynamics_var_len_action_loss_with_time_minus_one_actions():
+    from dreamer4.dreamer4 import DynamicsWorldModel
+
+    model = DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 8,
+        num_latent_tokens = 4,
+        num_spatial_tokens = 4,
+        depth = 1,
+        num_discrete_actions = 3,
+        attn_dim_head = 8,
+        multi_token_pred_len = 1,
+        use_loss_normalization = False
+    )
+
+    latents = torch.randn(2, 4, 4, 8)
+    actions = torch.randint(0, 3, (2, 3, 1))
+    lens = torch.tensor([4, 3])
+
+    loss, losses = model(
+        latents = latents,
+        discrete_actions = actions,
+        lens = lens,
+        return_all_losses = True
+    )
+
+    assert loss.numel() == 1
+    assert losses.discrete_actions.numel() == 1

@@ -2445,6 +2445,7 @@ class AxialSpaceTimeTransformer(Module):
         ff_kwargs: dict = dict(),
         attn_residual_kwargs: dict = dict(),
         num_special_tokens = 1,
+        num_special_spatial_tokens: int | None = None,
         special_attend_only_itself = False,  # this is set to True for the video tokenizer decoder (latents can only attend to itself while spatial modalities attend to the latents and everything)
         full_spatial_attn = False,
         final_special_cross_attn = True,
@@ -2461,6 +2462,7 @@ class AxialSpaceTimeTransformer(Module):
         h_net_kwargs: dict | None = None
     ):
         super().__init__()
+        num_special_tokens = default(num_special_spatial_tokens, num_special_tokens)
         self.full_spatial_attn = full_spatial_attn
 
         # attention
@@ -2501,7 +2503,7 @@ class AxialSpaceTimeTransformer(Module):
 
         # transformer
 
-        self.mot_temporal = mot_temporal
+        self.mot_temporal = mot_temporal and num_special_tokens > 0
 
         is_time = []
 
@@ -2779,6 +2781,11 @@ class AxialSpaceTimeTransformer(Module):
                     merged, _ = pack((m_kv, s_kv), 'kv b * h t d')
                     return rearrange(merged, 'kv b s ... -> kv (b s) ...')
 
+                def merge_normed_inputs(m_normed, s_normed):
+                    m_normed, s_normed = (rearrange(c, '(b s) ... -> b s ...', b = batch) for c in (m_normed, s_normed))
+                    merged, _ = pack((m_normed, s_normed), 'b * t d')
+                    return rearrange(merged, 'b s ... -> (b s) ...')
+
                 if exists(maybe_kv_cache):
                     main_kwargs['kv_cache'], special_kwargs['kv_cache'] = split_kv(maybe_kv_cache)
 
@@ -2787,9 +2794,14 @@ class AxialSpaceTimeTransformer(Module):
 
                 tokens_out, _ = pack((main_out, special_out), 'b * t d')
 
-                if exists(main_interm) and exists(special_interm) and exists(main_interm.next_kv_cache):
-                    merged_cache = merge_kv(main_interm.next_kv_cache, special_interm.next_kv_cache)
-                    attn_intermediates = AttentionIntermediates(merged_cache, main_interm.normed_inputs)
+                if exists(main_interm) and exists(special_interm):
+                    merged_cache = None
+
+                    if exists(main_interm.next_kv_cache) and exists(special_interm.next_kv_cache):
+                        merged_cache = merge_kv(main_interm.next_kv_cache, special_interm.next_kv_cache)
+
+                    merged_normed_inputs = merge_normed_inputs(main_interm.normed_inputs, special_interm.normed_inputs)
+                    attn_intermediates = AttentionIntermediates(merged_cache, merged_normed_inputs)
                 else:
                     attn_intermediates = main_interm
 
@@ -3109,7 +3121,7 @@ class SlotAttention(Module):
                 nn.Conv1d(hidden_slots, num_slots, 1)
             )
 
-        self.ff = SwiGLUFeedforward(
+        self.ff = ReLUSquaredFeedforward(
             dim = dim,
             expansion_factor = ff_mult,
             pre_rmsnorm = True
@@ -3208,6 +3220,10 @@ class VideoTokenizer(Module):
         self.dim_latent = dim_latent
         self.num_latent_tokens = num_latent_tokens
         self.latent_tokens = Parameter(randn(num_latent_tokens, dim) * 1e-2)
+
+        num_patch_height = image_height // patch_size if exists(image_height) else None
+        num_patch_width = image_width // patch_size if exists(image_width) else None
+        self.num_spatial_tokens = num_patch_height * num_patch_width if exists(num_patch_height) and exists(num_patch_width) else None
 
         # mae masking - Kaiming He paper from long ago
 
@@ -3517,10 +3533,11 @@ class VideoTokenizer(Module):
     @torch.no_grad()
     def tokenize(
         self,
-        video
+        video,
+        **kwargs
     ):
         self.eval()
-        return self.forward(video, return_latents = True)
+        return self.forward(video, return_latents = True, **kwargs)
 
     def decode_step(
         self,
@@ -3775,8 +3792,7 @@ class VideoTokenizer(Module):
 
         tokens, inverse_pack_space = pack_one(tokens, 'b t * d')
 
-        if self.has_latent_init_patch:
-            latent_init_tokens, _ = pack_one(latent_init_tokens, 'b t * d')
+        latent_init_tokens, _ = pack_one(latent_init_tokens, 'b t * d')
 
         # add the latent
 
@@ -5656,6 +5672,9 @@ class DynamicsWorldModel(Module):
 
         assert not (exists(prompt) and exists(prompt_latents)), 'cannot pass in both prompt video and prompt latents'
 
+        if not use_time_cache:
+            time_cache = None
+
         if exists(prompt):
             if prompt.ndim == 4:
                 prompt = rearrange(prompt, 'b c h w -> b c 1 h w')
@@ -5664,7 +5683,7 @@ class DynamicsWorldModel(Module):
             if prompt.shape[1] != tokenizer.channels:
                 prompt = repeat(prompt, 'b 1 t h w -> b c t h w', c = tokenizer.channels)
 
-            prompt_latents = tokenizer.tokenize(prompt)
+            prompt_latents = tokenizer.tokenize(prompt, aug_id = aug_id)
             assert self.num_video_views == 1, 'num video views > 1 not supported yet for auto-deriving prompt latents'
             prompt_latents = rearrange(prompt_latents, 'b t n d -> b t 1 n d')
 
@@ -5761,6 +5780,7 @@ class DynamicsWorldModel(Module):
                     discrete_actions = prompt_discrete,
                     continuous_actions = prompt_continuous,
                     proprio = proprio if has_proprio else None,
+                    aug_id = aug_id,
                     latent_is_noised = True,
                     latent_has_view_dim = True,
                     return_pred_only = True,
@@ -5868,7 +5888,7 @@ class DynamicsWorldModel(Module):
                     discrete_actions = curr_discrete,
                     continuous_actions = curr_continuous,
                     proprio = noised_proprio_with_context,
-                    time_cache = time_cache,
+                    time_cache = time_cache if use_time_cache else None,
                     aug_id = aug_id,
                     latent_is_noised = True,
                     latent_has_view_dim = True,
@@ -6239,7 +6259,7 @@ class DynamicsWorldModel(Module):
 
             latents = None
             if exists(self.video_tokenizer):
-                latents = self.video_tokenizer.tokenize(video_packed)
+                latents = self.video_tokenizer.tokenize(video_packed, aug_id = aug_id)
                 latents = unpack_views(latents, '* t n d')
 
             if self.has_aux_image_encoder:
@@ -6582,12 +6602,12 @@ class DynamicsWorldModel(Module):
             # spatial pre-encoding
 
             if exists(self.spatial_pre_encoder):
-                space_tokens, spatial_intermediates = self.spatial_pre_encoder(space_tokens, cache = spatial_cache, return_intermediates = True)
+                space_tokens, spatial_intermediates = self.spatial_pre_encoder(space_tokens, time_lens = lens, cache = spatial_cache, return_intermediates = True)
 
             # action pre-encoding
 
             if exists(self.action_pre_encoder):
-                action_tokens, action_intermediates = self.action_pre_encoder(action_tokens, cache = action_cache, return_intermediates = True)
+                action_tokens, action_intermediates = self.action_pre_encoder(action_tokens, time_lens = lens, cache = action_cache, return_intermediates = True)
 
             # pack to tokens for attending
 
@@ -6595,7 +6615,7 @@ class DynamicsWorldModel(Module):
 
             # main space time transformer
 
-            tokens, intermediates = self.transformer(tokens, cache = main_cache, return_intermediates = True)
+            tokens, intermediates = self.transformer(tokens, time_lens = lens, cache = main_cache, return_intermediates = True)
 
             # maybe actor / critic transformer heads
 
@@ -6603,11 +6623,11 @@ class DynamicsWorldModel(Module):
 
             actor_tokens = tokens
             if self.has_actor_transformer:
-                actor_tokens, actor_intermediates = self.actor_transformer(actor_tokens, cache = actor_cache, return_intermediates = True)
+                actor_tokens, actor_intermediates = self.actor_transformer(actor_tokens, time_lens = lens, cache = actor_cache, return_intermediates = True)
 
             critic_tokens = tokens
             if self.has_critic_transformer:
-                critic_tokens, critic_intermediates = self.critic_transformer(critic_tokens, cache = critic_cache, return_intermediates = True)
+                critic_tokens, critic_intermediates = self.critic_transformer(critic_tokens, time_lens = lens, cache = critic_cache, return_intermediates = True)
 
             # unpack
 
@@ -6898,6 +6918,8 @@ class DynamicsWorldModel(Module):
         continuous_action_loss = torch.zeros((self.multi_token_pred_len,), device = device)
 
         has_action_loss_weight = (self.discrete_action_loss_weight.sum() + self.continuous_action_loss_weight.sum()) > 0
+        raw_discrete_actions = discrete_actions
+        raw_continuous_actions = continuous_actions
 
         if (
             has_action_loss_weight and
@@ -6913,14 +6935,16 @@ class DynamicsWorldModel(Module):
 
             has_discrete = exists(discrete_actions)
             has_continuous = exists(continuous_actions)
+            action_loss_discrete_actions = discrete_actions
+            action_loss_continuous_actions = continuous_actions
 
             if has_discrete and shift_action_tokens:
-                discrete_actions = pad_at_dim(discrete_actions, (1, 0), value = -1, dim = 1)
+                action_loss_discrete_actions = pad_at_dim(action_loss_discrete_actions, (1, 0), value = -1, dim = 1)
 
             if has_continuous and shift_action_tokens:
-                continuous_actions = pad_at_dim(continuous_actions, (1, 0), value = 0., dim = 1)
+                action_loss_continuous_actions = pad_at_dim(action_loss_continuous_actions, (1, 0), value = 0., dim = 1)
 
-            first_has_action = discrete_actions if has_discrete else continuous_actions
+            first_has_action = action_loss_discrete_actions if has_discrete else action_loss_continuous_actions
             pred_len = first_has_action.shape[1]
 
             # only for 1 agent
@@ -6946,10 +6970,10 @@ class DynamicsWorldModel(Module):
             discrete_action_targets = continuous_action_targets = None
 
             if has_discrete:
-                discrete_action_targets, discrete_mask = make_mtp_targets(discrete_actions)
+                discrete_action_targets, discrete_mask = make_mtp_targets(action_loss_discrete_actions)
 
             if has_continuous:
-                continuous_action_targets, continuous_mask = make_mtp_targets(continuous_actions)
+                continuous_action_targets, continuous_mask = make_mtp_targets(action_loss_continuous_actions)
 
             discrete_log_probs, continuous_log_probs = self.action_embedder.log_probs(
                 policy_embed,
@@ -6958,7 +6982,7 @@ class DynamicsWorldModel(Module):
             )
 
             if is_var_len:
-                action_loss_mask = loss_mask_without_last if pred_len == (time - 1) else loss_mask
+                action_loss_mask = loss_mask[:, :num_targets]
 
             if exists(discrete_log_probs):
                 discrete_log_probs = discrete_log_probs.masked_fill(~discrete_mask[..., None], 0.)
@@ -7073,7 +7097,7 @@ class DynamicsWorldModel(Module):
         if self.has_lapo:
             space_tokens_for_lapo = intermediates.pre_encoded_spatial
 
-            raw_actions = Actions(discrete_actions, continuous_actions) if (exists(discrete_actions) or exists(continuous_actions)) else None
+            raw_actions = Actions(raw_discrete_actions, raw_continuous_actions) if (exists(raw_discrete_actions) or exists(raw_continuous_actions)) else None
             lapo_action_loss, lapo_fdm_loss, lapo_raw_latent_fdm_loss = self.ssl_lapo(space_tokens_for_lapo, raw_actions, raw_latents = latents)
 
         # predict states from actions - TEM (James Whittington)
@@ -7086,7 +7110,11 @@ class DynamicsWorldModel(Module):
         else:
             tem_pred_latents = None
 
-        h_net_loss = intermediates.main.h_net_loss
+        h_net_loss = self.zero
+
+        for maybe_transformer_intermediates in intermediates:
+            if exists(maybe_transformer_intermediates) and hasattr(maybe_transformer_intermediates, 'h_net_loss'):
+                h_net_loss = h_net_loss + maybe_transformer_intermediates.h_net_loss
 
         # gather losses - they sum across the multi token prediction steps for rewards and actions - eq (9)
 

@@ -115,7 +115,8 @@ def main(
     latent_init_patch_size = None,
     use_pixel_shift_aug = False,
     max_pixel_shift = 3,
-    aug_prob = 0.5
+    aug_prob = 0.5,
+    use_wandb = False
 ):
     # clear old artifacts
 
@@ -218,7 +219,8 @@ def main(
         grad_accum_every = grad_accum_every,
         learning_rate = lr,
         num_train_steps = num_train_steps,
-        use_wandb = True,
+        use_tensorboard = not use_wandb,
+        use_wandb = use_wandb,
         log_dir = log_dir,
         log_video = True,
         video_fps = 4,

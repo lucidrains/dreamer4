@@ -397,10 +397,10 @@ class VideoTokenizerTrainer(Module):
 
                 with torch.no_grad():
                     if self.model.has_flow:
-                        latents = sample_model.tokenize(video)
-                        recon_video = sample_model.decode(latents, height = video.shape[-2], width = video.shape[-1])
+                        latents = sample_model.tokenize(video, aug_id = aug_id)
+                        recon_video = sample_model.decode(latents, height = video.shape[-2], width = video.shape[-1], aug_id = aug_id)
                     else:
-                        _, (_, recon_video) = sample_model(video, return_intermediates = True)
+                        _, (_, recon_video) = sample_model(video, return_intermediates = True, aug_id = aug_id)
 
                 recon_video = recon_video.clamp(0., 1.)
                 self.log_video(video, "original_video")
@@ -772,6 +772,9 @@ class BehaviorCloneTrainer(Module):
         is_autoregressive = exists(self.sample_autoregressive_actions) and self.sample_autoregressive_actions
 
         if not is_tensor(batch_data):
+            if 'aug_id' in batch_data:
+                kwargs['aug_id'] = batch_data['aug_id'][:self.sample_batch_size]
+
             action_idx = max(0, self.sample_prompt_frames - 2)
             for action_key in ('continuous_actions', 'discrete_actions'):
                 if action_key not in batch_data:
