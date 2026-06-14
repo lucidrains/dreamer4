@@ -322,4 +322,38 @@ Training scalars are written to a fresh timestamped TensorBoard directory under 
 }
 ```
 
+```bibtex
+@misc{han2026firefrobeniusisometryreinitializationbalancing,
+    title   = {FIRE: Frobenius-Isometry Reinitialization for Balancing the Stability-Plasticity Tradeoff},
+    author  = {Isaac Han and Sangyeon Park and Seungwon Oh and Donghu Kim and Hojoon Lee and Kyung-Joong Kim},
+    year    = {2026},
+    eprint  = {2602.08040},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2602.08040},
+}
+```
+
+```bibtex
+@misc{ash2020warmstartingneuralnetworktraining,
+    title   = {On Warm-Starting Neural Network Training},
+    author  = {Jordan T. Ash and Ryan P. Adams},
+    year    = {2020},
+    eprint  = {1910.08475},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/1910.08475},
+}
+```
+
+```bibtex
+@inproceedings{wu2023invertedattention,
+    title   = {Inverted-Attention Transformers can Learn Object Representations: Insights from Slot Attention},
+    author  = {Yi-Fu Wu and Klaus Greff and Gamaleldin Fathy Elsayed and Michael Curtis Mozer and Thomas Kipf and Sjoerd van Steenkiste},
+    booktitle = {UniReps:  the First Workshop on Unifying Representations in Neural Models},
+    year    = {2023},
+    url     = {https://openreview.net/forum?id=WgQZNoQ5AB}
+}
+```
+
 *the conquest of nature is to be achieved through number and measure - angels to Descartes in a dream*

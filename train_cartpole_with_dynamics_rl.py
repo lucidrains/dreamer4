@@ -150,7 +150,7 @@ class TransformerPPOAgent(nn.Module):
         use_attn_pool = False,
         pmpo_kl_div_loss_weight = 0.05,
         use_continuous_actions = False,
-        continuous_dist_type: Literal['gaussian', 'squashed_gaussian', 'beta'] = 'gaussian',
+        continuous_dist_type: Literal['gaussian', 'squashed_gaussian', 'beta'] = 'beta',
         continuous_dist_kwargs: dict = dict(),
         continuous_target_action_range: tuple[float, float] | None = None,
         depth = 3,
@@ -165,6 +165,7 @@ class TransformerPPOAgent(nn.Module):
         ssl_tem = False,
         latent_ar_sigreg_loss_kwargs = dict(num_slices = 256),
         latent_ar_sigreg_num_subspaces = None,
+        mot_temporal = False,
     ):
         super().__init__()
         self.use_image_input = use_image_input
@@ -243,6 +244,7 @@ class TransformerPPOAgent(nn.Module):
             ssl_tem = ssl_tem,
             latent_ar_sigreg_loss_kwargs = latent_ar_sigreg_loss_kwargs,
             latent_ar_sigreg_num_subspaces = latent_ar_sigreg_num_subspaces,
+            mot_temporal = mot_temporal,
         )
 
     @property
@@ -302,7 +304,7 @@ def main(
     num_envs = 8,
     cpu = False,
     use_continuous_actions = False,
-    continuous_dist_type: Literal['gaussian', 'squashed_gaussian', 'beta'] = 'gaussian',
+    continuous_dist_type: Literal['gaussian', 'squashed_gaussian', 'beta'] = 'beta',
     use_time_rnn = True,
     ssl_every_rl_updates = 0,
     ssl_max_epochs = 25,
@@ -325,6 +327,9 @@ def main(
     tem = False,
     use_delight_gating = True,
     sigreg_num_subspaces = 1,
+    mot_temporal = False,
+    experiment_name = 'dreamer4',
+    run_name = None,
 ):
     torch.manual_seed(seed)
 
@@ -337,7 +342,7 @@ def main(
         use_asym_critic = True
 
     if use_wandb:
-        wandb.init(project = 'dreamer4-cartpole')
+        wandb.init(project = experiment_name, name = run_name)
 
     accelerator = Accelerator(
         gradient_accumulation_steps = grad_accum_every,
@@ -349,7 +354,7 @@ def main(
     def log(msg):
         accelerator.print(msg)
 
-    results_folder = Path('./results')
+    results_folder = Path(f'./results_{run_name}' if run_name else './results')
     shutil.rmtree(results_folder, ignore_errors = True)
     results_folder.mkdir(exist_ok = True, parents = True)
 
@@ -365,7 +370,6 @@ def main(
         use_attn_pool = use_attn_pool,
         use_continuous_actions = use_continuous_actions,
         continuous_dist_type = continuous_dist_type,
-        continuous_target_action_range = (-1., 1.),
         depth = depth,
         actor_depth = actor_depth,
         critic_depth = critic_depth,
@@ -377,6 +381,7 @@ def main(
         ssl_lapo_pred_actions = lapo_pred_actions,
         ssl_tem = tem,
         latent_ar_sigreg_num_subspaces = sigreg_num_subspaces,
+        mot_temporal = mot_temporal,
     ).to(device)
 
     # optimizers

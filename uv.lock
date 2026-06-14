@@ -214,7 +214,7 @@ wheels = [
 
 [[package]]
 name = "dreamer4"
-version = "0.10.4"
+version = "0.11.7"
 source = { editable = "." }
 dependencies = [
     { name = "accelerate" },

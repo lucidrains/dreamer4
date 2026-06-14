@@ -8,10 +8,10 @@
 #   "einops",
 #   "moviepy",
 #   "imageio",
-#   "requests",
 #   "accelerate",
 #   "adam-atan2-pytorch",
 #   "tensorboard",
+#   "wandb",
 #   "torch-einops-utils",
 #   "dreamer4"
 # ]
@@ -28,7 +28,7 @@ from einops import repeat
 
 from dataset_moving_mnist import MovingMNISTDataset
 from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel, exists
-from dreamer4.trainers import BehaviorCloneTrainer, save_video_grid_as_gif
+from dreamer4.trainers import BehaviorCloneTrainer, save_video_grid_as_gif, pixel_shift_aug
 
 def exists(v):
     return v is not None
@@ -128,7 +128,13 @@ def main(
     latent_ar_layer = 0,
     latent_ar_loss_weight = 0.,
     latent_ar_sigreg_loss_weight = 0.05,
-    latent_ar_sigreg_num_slices = 256
+    latent_ar_sigreg_num_slices = 256,
+    num_spatial_tokens = 4,
+    use_pixel_shift_aug = False,
+    aug_prob = 0.5,
+    use_wandb = False,
+    experiment_name = 'dreamer4',
+    run_name = None
 ):
     import shutil
 
@@ -205,7 +211,9 @@ def main(
         latent_ar_layer = latent_ar_layer,
         latent_ar_loss_weight = latent_ar_loss_weight,
         latent_ar_sigreg_loss_weight = latent_ar_sigreg_loss_weight,
-        latent_ar_sigreg_loss_kwargs = dict(num_slices = latent_ar_sigreg_num_slices) if latent_ar else None
+        latent_ar_sigreg_loss_kwargs = dict(num_slices = latent_ar_sigreg_num_slices) if latent_ar else None,
+        num_spatial_tokens = num_spatial_tokens,
+        has_aug_conditioning = use_pixel_shift_aug
     )
 
     # initialize trainer
@@ -216,19 +224,24 @@ def main(
         batch_size = batch_size,
         learning_rate = lr,
         num_train_steps = num_train_steps,
+        use_tensorboard = not use_wandb,
+        use_wandb = use_wandb,
+        project_name = experiment_name,
+        run_name = run_name,
         log_dir = log_dir,
         video_fps = video_fps,
         log_video_every = log_video_every,
         checkpoint_every = checkpoint_every,
         checkpoint_folder = checkpoint_folder,
         use_ema = use_ema,
-        use_tensorboard_logger = True,
         log_video = True,
         sample_prompt_frames = sample_prompt_frames,
         sample_sticky_action = condition_on_actions and not sample_autoregressive_actions,
         sample_autoregressive_actions = sample_autoregressive_actions,
         sample_filename_prefix = 'sample-baseline',
         grad_accum_every = grad_accum_every,
+        custom_aug_fn = pixel_shift_aug if use_pixel_shift_aug else None,
+        aug_prob = aug_prob,
         collate_fn = random_action_collate if condition_on_actions else None,
         custom_sample_fn = custom_3x3_grid_sample if condition_on_actions else None
     )
