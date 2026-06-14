@@ -136,13 +136,14 @@ def make_env(
     *,
     vectorized = True,
     num_envs = 8,
+    episode_stats_buffer_length = 100,
 ):
     if vectorized:
         env = gym.make_vec(env_name, num_envs = num_envs)
-        env = gym.wrappers.vector.RecordEpisodeStatistics(env)
+        env = gym.wrappers.vector.RecordEpisodeStatistics(env, buffer_length = episode_stats_buffer_length)
     else:
         env = gym.make(env_name)
-        env = gym.wrappers.RecordEpisodeStatistics(env)
+        env = gym.wrappers.RecordEpisodeStatistics(env, buffer_length = episode_stats_buffer_length)
 
     if exists(seed):
         env.action_space.seed(seed)
@@ -214,6 +215,34 @@ def log_scalars(writer: SummaryWriter | None, scalars: dict[str, float], step: i
         if value is None:
             continue
         writer.add_scalar(key, float(value), step)
+
+
+def get_episode_count(env) -> int:
+    return int(getattr(env, "episode_count", 0))
+
+
+def get_completed_episode_stats(env, start_episode_count: int):
+    return_queue = getattr(env, "return_queue", None)
+    length_queue = getattr(env, "length_queue", None)
+
+    if return_queue is None or length_queue is None:
+        return [], []
+
+    num_new_episodes = max(get_episode_count(env) - start_episode_count, 0)
+
+    if num_new_episodes == 0:
+        return [], []
+
+    if num_new_episodes > len(return_queue) or num_new_episodes > len(length_queue):
+        raise RuntimeError(
+            f"episode statistics buffer only retained {len(return_queue)} returns and {len(length_queue)} lengths, "
+            f"but {num_new_episodes} episodes completed since the last read"
+        )
+
+    returns = list(return_queue)[-num_new_episodes:]
+    lengths = list(length_queue)[-num_new_episodes:]
+
+    return returns, lengths
 
 
 def split_world_model_and_agent_params(world_model: DynamicsWorldModel):
@@ -400,12 +429,88 @@ def slice_experience(exp: Experience, idx: Tensor):
     )
 
 
-def sample_experience_batch(replay: deque[Experience], batch_size: int):
+def sample_experience_batch(replay: deque[Experience], batch_size: int, max_time: int | None = None):
     exp = combine_experiences(sample_experiences(replay, batch_size))
     total = exp.latents.shape[0]
     batch_size = min(batch_size, total)
     indices = torch.randperm(total)[:batch_size]
-    return slice_experience(exp, indices)
+    exp = slice_experience(exp, indices)
+    return sample_experience_time_window(exp, max_time)
+
+
+def sample_experience_time_window(exp: Experience, max_length: int | None):
+    if not exists(max_length) or max_length <= 0:
+        return exp
+
+    assert exists(exp.latents)
+
+    batch, time = exp.latents.shape[:2]
+    window_length = min(max_length, time)
+
+    if window_length == time:
+        return exp
+
+    device = exp.latents.device
+    lens = exp.lens if exists(exp.lens) else torch.full((batch,), time, device = device)
+    lens = lens.to(device = device).long().clamp(min = 1, max = time)
+
+    max_starts = (lens - window_length).clamp(min = 0)
+    starts = (torch.rand((batch,), device = device) * (max_starts + 1).float()).floor().long()
+
+    batch_indices = torch.arange(batch, device = device)[:, None]
+    time_indices = starts[:, None] + torch.arange(window_length, device = device)[None, :]
+
+    def take_window(t: Tensor | None):
+        if not exists(t) or not torch.is_tensor(t):
+            return t
+
+        if t.ndim < 2 or t.shape[:2] != (batch, time):
+            return t
+
+        return t[batch_indices, time_indices]
+
+    actions = Actions(
+        take_window(exp.actions.discrete),
+        take_window(exp.actions.continuous),
+    ) if exists(exp.actions) else None
+
+    log_probs = Actions(
+        take_window(exp.log_probs.discrete),
+        take_window(exp.log_probs.continuous),
+    ) if exists(exp.log_probs) else None
+
+    old_action_unembeds = tuple(take_window(t) for t in exp.old_action_unembeds) if exists(exp.old_action_unembeds) else None
+    window_lens = (lens - starts).clamp(min = 0, max = window_length)
+    reaches_episode_end = starts + window_lens >= lens
+
+    def take_episode_end_flag(t: Tensor | None):
+        if not exists(t) or not torch.is_tensor(t):
+            return t
+
+        if t.ndim == 1 and t.shape[0] == batch:
+            return t & reaches_episode_end.to(device = t.device)
+
+        return take_window(t)
+
+    return Experience(
+        latents = take_window(exp.latents),
+        video = take_window(exp.video),
+        proprio = take_window(exp.proprio),
+        critic_state = take_window(exp.critic_state),
+        agent_embed = take_window(exp.agent_embed),
+        rewards = take_window(exp.rewards),
+        terminals = take_episode_end_flag(exp.terminals),
+        actions = actions,
+        log_probs = log_probs,
+        old_action_unembeds = old_action_unembeds,
+        values = take_window(exp.values),
+        step_size = exp.step_size,
+        lens = window_lens,
+        is_truncated = take_episode_end_flag(exp.is_truncated),
+        agent_index = exp.agent_index,
+        is_from_world_model = exp.is_from_world_model,
+        episode_return = exp.episode_return,
+    )
 
 
 def sample_imagination_prompts(
@@ -761,6 +866,7 @@ def train_world_model(
     *,
     steps: int,
     batch_size: int,
+    sequence_length: int | None,
     max_grad_norm: float,
     global_step: int,
     writer: SummaryWriter | None,
@@ -773,7 +879,7 @@ def train_world_model(
     grad_clip_groups = world_model_clip_groups(world_model, optimizer)
 
     for _ in pbar:
-        exp = sample_experience_batch(replay, batch_size).to(world_model.device)
+        exp = sample_experience_batch(replay, batch_size, max_time = sequence_length).to(world_model.device)
 
         loss, losses = world_model(
             latents = exp.latents,
@@ -982,7 +1088,7 @@ def main(
     num_loops = 500,
     rollouts_per_loop = 1,
     num_envs = 32,
-    max_timesteps = 200,
+    max_timesteps = 1000,
     replay_size = 256,
     seed = 42,
     cpu = False,
@@ -996,6 +1102,7 @@ def main(
     reward_encoder_type: Literal["symexp_two_hot", "hl_gauss"] = "hl_gauss",
     world_model_batch_size = 32,
     world_model_train_steps = 13,
+    world_model_train_sequence_length = 200,
     world_model_learning_rate = 3e-4,
     imagination_batch_size = 128,
     imagination_horizon = 32,
@@ -1074,7 +1181,13 @@ def main(
     for param in tokenizer.parameters():
         param.requires_grad_(False)
 
-    env = make_env(env_name, seed, vectorized = True, num_envs = num_envs)
+    env = make_env(
+        env_name,
+        seed,
+        vectorized = True,
+        num_envs = num_envs,
+        episode_stats_buffer_length = max(100, num_envs * max_timesteps),
+    )
 
     single_action_space = getattr(env, "single_action_space", env.action_space)
     action_dim = int(np.prod(single_action_space.shape))
@@ -1155,6 +1268,7 @@ def main(
     replay: deque[Experience] = deque(maxlen = replay_size)
     wm_step = 0
     imagination_step = 0
+    env_step = 0
 
     print(f"training {env_name} from {obs_dim} raw observations on {device}")
     print(f"tensorboard log dir: {run_log_dir.absolute()}" if use_tensorboard else "tensorboard disabled")
@@ -1167,9 +1281,12 @@ def main(
         world_model.eval()
         tokenizer_eval_loss_sum = 0.
         tokenizer_eval_sample_count = 0
-        rollout_returns = []
+        episodic_returns = []
+        rollout_horizon_returns = []
 
         for rollout_idx in range(rollouts_per_loop):
+            start_episode_count = get_episode_count(env)
+
             exp = world_model.interact_with_env(
                 env,
                 seed = seed if loop == 0 and rollout_idx == 0 else None,
@@ -1193,9 +1310,30 @@ def main(
                     tokenizer_eval_sample_count += sample_count
 
             replay.append(exp.to("cpu"))
-            rollout_returns.extend(exp.episode_return.detach().cpu().tolist())
+            rollout_horizon_returns.extend(exp.episode_return.detach().cpu().tolist())
 
-        avg_return = float(np.mean(rollout_returns)) if len(rollout_returns) > 0 else 0.
+            rollout_steps = exp.rewards.shape[1]
+            has_bootstrap_padding = exists(exp.is_truncated) and exists(exp.terminals) and (exp.is_truncated & ~exp.terminals).any()
+            if has_bootstrap_padding:
+                rollout_steps -= 1
+
+            env_step += rollout_steps * exp.rewards.shape[0]
+
+            completed_returns, completed_lengths = get_completed_episode_stats(env, start_episode_count)
+
+            for episode_return, episode_length in zip(completed_returns, completed_lengths):
+                episodic_returns.append(float(episode_return))
+                log_scalars(
+                    writer,
+                    {
+                        "charts/episodic_return": episode_return,
+                        "charts/episodic_length": episode_length,
+                    },
+                    env_step,
+                )
+
+        avg_return = float(np.mean(episodic_returns)) if len(episodic_returns) > 0 else None
+        avg_horizon_return = float(np.mean(rollout_horizon_returns)) if len(rollout_horizon_returns) > 0 else 0.
         avg_length = float(np.mean([exp.lens.float().mean().item() for exp in replay])) if len(replay) > 0 else 0.
         tokenizer_policy_recon_loss = tokenizer_eval_loss_sum / tokenizer_eval_sample_count if tokenizer_eval_sample_count > 0 else None
 
@@ -1203,6 +1341,7 @@ def main(
             writer,
             {
                 "rollout/average_return": avg_return,
+                "rollout/average_horizon_return": avg_horizon_return,
                 "rollout/replay_size": len(replay),
                 "rollout/average_length": avg_length,
                 "tokenizer/policy_recon_loss": tokenizer_policy_recon_loss,
@@ -1217,6 +1356,7 @@ def main(
             replay,
             steps = world_model_train_steps,
             batch_size = world_model_batch_size,
+            sequence_length = world_model_train_sequence_length,
             max_grad_norm = max_grad_norm,
             global_step = wm_step,
             writer = writer,
@@ -1244,7 +1384,8 @@ def main(
             writer = writer,
         )
 
-        postfix = {"return": f"{avg_return:.1f}", "replay": len(replay)}
+        postfix_return = avg_return if exists(avg_return) else avg_horizon_return
+        postfix = {"return": f"{postfix_return:.1f}", "replay": len(replay)}
         if wm_metrics:
             postfix["wm"] = f"{wm_metrics['world_model/loss']:.2f}"
         if imagination_metrics:
