@@ -682,7 +682,7 @@ class LatentAutoregressiveLoss(Module):
         if not return_loss:
             return pred
 
-        loss = F.mse_loss(pred, target_output, reduction = 'none')
+        loss = F.smooth_l1_loss(pred, target_output.detach(), reduction = 'none')
 
         if return_unreduced_loss:
             return loss, pred
