@@ -109,7 +109,7 @@ LayerNormNoBias = partial(nn.LayerNorm, bias = False)
 
 VideoTokenizerIntermediates = namedtuple('VideoTokenizerIntermediates', ('losses', 'recon'))
 
-TokenizerLosses = namedtuple('TokenizerLosses', ('recon', 'lpips', 'time_decorr', 'space_decorr', 'latent_ortho', 'latent_ar', 'latent_ar_sigreg', 'latent_consistency', 'latent_sigreg', 'h_net'))
+TokenizerLosses = namedtuple('TokenizerLosses', ('recon', 'flow_recon', 'lpips', 'time_decorr', 'space_decorr', 'latent_ortho', 'latent_ar', 'latent_ar_sigreg', 'latent_consistency', 'latent_sigreg', 'h_net'))
 
 WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'shortcut', 'rewards', 'terminals', 'discrete_actions', 'continuous_actions', 'state_pred', 'agent_state_pred', 'latent_ar', 'latent_ar_sigreg', 'lapo_action', 'lapo_fdm', 'lapo_raw_latent_fdm', 'tem', 'h_net'))
 
@@ -3040,7 +3040,195 @@ class SlotAttention(Module):
 # video tokenizer
 
 @save_load
+class VideoDecoderNetwork(Module):
+    def __init__(
+        self,
+        dim,
+        dim_latent,
+        patch_size,
+        channels,
+        depth,
+        time_block_every,
+        attn_dim_head,
+        attn_heads,
+        num_spatial_tokens,
+        decoder_slot_attention_initted_spatial_tokens,
+        decoder_slot_attention_iters,
+        slot_attention_inverted,
+        decoder_slot_spatial_mix,
+        use_causal_conv3d,
+        causal_conv3d_kernel_size,
+        has_aug_conditioning,
+        moss_kwargs,
+        decoder_moss_layers,
+        time_attention_use_pope,
+        image_height = None,
+        image_width = None
+    ):
+        super().__init__()
+        self.image_height = image_height
+        self.image_width = image_width
+        self.patch_size = patch_size
+
+        # pos emb
+
+        self.to_decoder_pos_emb = create_mlp(
+            dim_in = 2,
+            dim = dim * 2,
+            dim_out = dim,
+            depth = 2,
+        )
+
+        # slot attention
+
+        self.decoder_slot_attention_initted_spatial_tokens = decoder_slot_attention_initted_spatial_tokens
+        self.num_spatial_tokens = num_spatial_tokens
+
+        if decoder_slot_attention_initted_spatial_tokens:
+            self.decoder_slot_attention = SlotAttention(
+                dim = dim,
+                iters = decoder_slot_attention_iters,
+                heads = attn_heads,
+                dim_head = attn_dim_head,
+                inverted_attention = slot_attention_inverted,
+                num_slots = self.num_spatial_tokens,
+                spatial_mix = decoder_slot_spatial_mix
+            )
+
+        # patch out
+
+        dim_patch = channels * patch_size ** 2
+
+        self.tokens_to_patch = Sequential(
+            Linear(dim, dim_patch),
+            Rearrange('b t h w (p1 p2 c) -> b c t (h p1) (w p2)', p1 = patch_size, p2 = patch_size),
+        )
+
+        # aug cond
+
+        self.has_aug_conditioning = has_aug_conditioning
+        if has_aug_conditioning:
+            self.aug_cond_embedding = Embedding(3, dim)
+
+        # causal convs
+
+        self.use_causal_conv3d = use_causal_conv3d
+        if use_causal_conv3d:
+            self.decoder_pre_causal_conv3d = CausalDepthwiseConv3d(dim, kernel_size = causal_conv3d_kernel_size)
+            self.decoder_post_causal_conv3d = CausalDepthwiseConv3d(dim, kernel_size = causal_conv3d_kernel_size)
+
+        # transformer
+
+        moss_modules = ModuleDict({
+            str(layer_idx): MOSS(dim, **moss_kwargs)
+            for layer_idx in decoder_moss_layers
+        }) if len(decoder_moss_layers) > 0 else None
+
+        num_patch_height = image_height // patch_size if exists(image_height) else None
+        num_patch_width = image_width // patch_size if exists(image_width) else None
+
+        self.transformer = AxialSpaceTimeTransformer(
+            dim = dim,
+            depth = depth,
+            attn_dim_head = attn_dim_head,
+            attn_heads = attn_heads,
+            time_block_every = time_block_every,
+            spatial_modules = moss_modules,
+            space_height = num_patch_height,
+            space_width = num_patch_width,
+            time_attention_use_pope = time_attention_use_pope
+        )
+
+    def muon_parameters(self):
+        return self.transformer.muon_parameters()
+
+    def forward(
+        self,
+        latent_tokens,
+        noised_image_tokens = None,
+        height = None,
+        width = None,
+        aug_id = None
+    ):
+        batch, time_len, device = *latent_tokens.shape[:2], latent_tokens.device
+
+        height = default(height, self.image_height)
+        width = default(width, self.image_width)
+
+        num_patch_height = height // self.patch_size if exists(height) else None
+        num_patch_width = width // self.patch_size if exists(width) else None
+
+        # generate decoder positional embedding and concat the latent token
+
+        spatial_pos_height = torch.linspace(-1., 1., num_patch_height, device = device)
+        spatial_pos_width = torch.linspace(-1., 1., num_patch_width, device = device)
+
+        space_height_width_coor = stack(torch.meshgrid(spatial_pos_height, spatial_pos_width, indexing = 'ij'), dim = -1)
+
+        decoder_pos_emb = self.to_decoder_pos_emb(space_height_width_coor)
+        decoder_pos_emb = repeat(decoder_pos_emb, '... -> b t ...', b = batch, t = time_len)
+
+        spatial_tokens = decoder_pos_emb
+
+        if exists(noised_image_tokens):
+            spatial_tokens = spatial_tokens + noised_image_tokens
+
+        if self.decoder_slot_attention_initted_spatial_tokens:
+            spatial_tokens, inverse_pack_space = pack_one(spatial_tokens, 'b t * d')
+            spatial_tokens = self.decoder_slot_attention(spatial_tokens, latent_tokens)
+            spatial_tokens = inverse_pack_space(spatial_tokens)
+
+        # augmentation conditioning
+
+        if self.has_aug_conditioning:
+            aug_id = default(aug_id, 0)
+
+            if isinstance(aug_id, bool):
+                aug_id = int(aug_id) + 1
+
+            if is_tensor(aug_id) and aug_id.dtype == torch.bool:
+                aug_id = aug_id.long() + 1
+
+            if isinstance(aug_id, int):
+                aug_id = torch.full((batch,), aug_id, device = device, dtype = torch.long)
+
+            maybe_aug_token = self.aug_cond_embedding(aug_id)
+            maybe_aug_token = repeat(maybe_aug_token, 'b d -> b t 1 d', t = time_len)
+        else:
+            maybe_aug_token = latent_tokens[:, :, 0:0]
+
+        tokens, packed_latent_shape = pack((spatial_tokens, maybe_aug_token, latent_tokens), 'b t * d')
+
+        # decoder attention
+
+        if self.use_causal_conv3d:
+            b, t, *_ = tokens.shape
+
+            unpacked = unpack(tokens, packed_latent_shape, 'b t * d')
+            spatial_tokens, maybe_aug_token, latent_tokens = unpacked
+
+            spatial_tokens = self.decoder_pre_causal_conv3d(spatial_tokens)
+
+            tokens, _ = pack((spatial_tokens, maybe_aug_token, latent_tokens), 'b t * d')
+
+        tokens = self.transformer(tokens, space_height = num_patch_height, space_width = num_patch_width)
+
+        # unpack latents
+
+        unpacked = unpack(tokens, packed_latent_shape, 'b t * d')
+        tokens, maybe_aug_token, latent_tokens = unpacked
+
+        # project to patches
+
+        if self.use_causal_conv3d:
+            tokens = self.decoder_post_causal_conv3d(tokens)
+
+        recon_video = self.tokens_to_patch(tokens)
+
+        return recon_video
+
 class VideoTokenizer(Module):
+
     def __init__(
         self,
         dim,
@@ -3107,7 +3295,9 @@ class VideoTokenizer(Module):
         slot_attention_inverted = True,
         mot_temporal = False,
         has_aug_conditioning = False,
-        aug_cfg_dropout_prob = 0.1
+        aug_cfg_dropout_prob = 0.1,
+        separate_flow_decoder = False,
+        flow_decoder_train_prob = 0.5
     ):
         super().__init__()
 
@@ -3144,18 +3334,6 @@ class VideoTokenizer(Module):
                 spatial_mix = encoder_slot_spatial_mix
             )
 
-        self.decoder_slot_attention_initted_spatial_tokens = decoder_slot_attention_initted_spatial_tokens
-        if decoder_slot_attention_initted_spatial_tokens:
-            self.decoder_slot_attention = SlotAttention(
-                dim = dim,
-                iters = decoder_slot_attention_iters,
-                heads = attn_heads,
-                dim_head = attn_dim_head,
-                inverted_attention = slot_attention_inverted,
-                num_slots = self.num_spatial_tokens,
-                spatial_mix = decoder_slot_spatial_mix
-            )
-
         # patch and unpatch
 
         dim_patch = channels * patch_size ** 2
@@ -3185,11 +3363,6 @@ class VideoTokenizer(Module):
             self.latent_init_patch_to_tokens = patch_to_tokens_fn(latent_init_patch_size)
             self.latent_init_mask_token = Parameter(randn(dim) * 1e-2)
 
-        self.tokens_to_patch = Sequential(
-            Linear(dim, dim_patch),
-            Rearrange('b t h w (p1 p2 c) -> b c t (h p1) (w p2)', p1 = patch_size, p2 = patch_size),
-        )
-
         # optional causal depthwise 3d convs
 
         self.use_causal_conv3d = use_causal_conv3d
@@ -3197,8 +3370,6 @@ class VideoTokenizer(Module):
         if use_causal_conv3d:
             self.encoder_pre_causal_conv3d = CausalDepthwiseConv3d(dim, kernel_size = causal_conv3d_kernel_size)
             self.encoder_post_causal_conv3d = CausalDepthwiseConv3d(dim, kernel_size = causal_conv3d_kernel_size)
-            self.decoder_pre_causal_conv3d = CausalDepthwiseConv3d(dim, kernel_size = causal_conv3d_kernel_size)
-            self.decoder_post_causal_conv3d = CausalDepthwiseConv3d(dim, kernel_size = causal_conv3d_kernel_size)
 
         # latent conditioned flow matching decoder - inspired by RAC https://arxiv.org/abs/2412.16279 - enabled by setting flow steps > 1
         # predicting clean, as in 'back to basics' https://arxiv.org/abs/2502.13745
@@ -3206,17 +3377,23 @@ class VideoTokenizer(Module):
         self.decoder_flow_steps = decoder_flow_steps
         self.decoder_v_space_loss = decoder_v_space_loss
 
+        self.has_flow = decoder_flow_steps > 0
+        self.has_separate_flow_decoder = separate_flow_decoder and self.has_flow
+        self.flow_decoder_train_prob = flow_decoder_train_prob
+
         if latent_grad_only_at_noise:
             assert not exists(latent_receive_grad_frac), 'cannot set both latent_grad_only_at_noise and latent_receive_grad_frac'
+            latent_receive_grad_frac = lambda time_frac: (time_frac == 0.).float()
+
+        if self.has_separate_flow_decoder and not exists(latent_receive_grad_frac):
             latent_receive_grad_frac = lambda time_frac: (time_frac == 0.).float()
 
         self.latent_receive_grad_frac = latent_receive_grad_frac
 
         self.decoder_times_beta_distribution = None
         if decoder_flow_times_beta_alpha != 1. or decoder_flow_times_beta_beta != 1.:
+            assert not separate_flow_decoder, 'beta distribution for flow times is incompatible with separate flow decoder'
             self.decoder_times_beta_distribution = Beta(tensor(decoder_flow_times_beta_alpha), tensor(decoder_flow_times_beta_beta))
-
-        self.has_flow = decoder_flow_steps > 1
 
         if self.has_flow:
             self.time_embed = Embedding(decoder_flow_steps, dim)
@@ -3269,42 +3446,41 @@ class VideoTokenizer(Module):
         self.image_height = image_height
         self.image_width = image_width
 
-        # parameterize the decoder positional embeddings for MAE style training so it can be resolution agnostic
+        if exists(image_height) and exists(image_width):
+            self.num_spatial_tokens = (image_height // patch_size) * (image_width // patch_size)
+        else:
+            self.num_spatial_tokens = None
 
-        self.to_decoder_pos_emb = create_mlp(
-            dim_in = 2,
-            dim = dim * 2,
-            dim_out = dim,
-            depth = decoder_pos_mlp_depth,
-        )
+        # decoder networks
 
-        decoder_moss_modules = ModuleDict({
-            str(layer_idx): MOSS(dim, **moss_kwargs)
-            for layer_idx in decoder_moss_layers
-        }) if not is_empty(decoder_moss_layers) else None
-
-        # decoder transformer
-
-        self.decoder_transformer = AxialSpaceTimeTransformer(
+        decoder_kwargs = dict(
             dim = dim,
+            dim_latent = dim_latent,
+            patch_size = patch_size,
+            channels = channels,
             depth = decoder_depth,
+            time_block_every = time_block_every,
             attn_dim_head = attn_dim_head,
             attn_heads = attn_heads,
-            attn_softclamp_value = attn_softclamp_value,
-            time_block_every = time_block_every,
-            num_special_tokens = num_latent_tokens + int(has_aug_conditioning),
-            special_attend_only_itself = True,
-            full_spatial_attn = decoder_full_spatial_attn,
-            attn_kwargs = attn_kwargs,
-            ff_kwargs = ff_kwargs,
-            spatial_modules = decoder_moss_modules,
-            space_height = num_patch_height,
-            space_width = num_patch_width,
-            final_norm = True,
+            num_spatial_tokens = self.num_spatial_tokens,
+            decoder_slot_attention_initted_spatial_tokens = decoder_slot_attention_initted_spatial_tokens,
+            decoder_slot_attention_iters = decoder_slot_attention_iters,
+            slot_attention_inverted = slot_attention_inverted,
+            decoder_slot_spatial_mix = decoder_slot_spatial_mix,
+            use_causal_conv3d = use_causal_conv3d,
+            causal_conv3d_kernel_size = causal_conv3d_kernel_size,
+            has_aug_conditioning = has_aug_conditioning,
+            moss_kwargs = moss_kwargs,
+            decoder_moss_layers = decoder_moss_layers,
             time_attention_use_pope = time_attention_use_pope,
-            mot_temporal = mot_temporal,
-            rnn_time = use_time_rnn
+            image_height = image_height,
+            image_width = image_width
         )
+
+        self.decoder = VideoDecoderNetwork(**decoder_kwargs)
+
+        if self.has_separate_flow_decoder:
+            self.flow_decoder = VideoDecoderNetwork(**decoder_kwargs)
 
         # loss related
 
@@ -3358,6 +3534,7 @@ class VideoTokenizer(Module):
 
         if use_loss_normalization:
             self.recon_loss_normalizer = LossNormalizer()
+            self.flow_recon_loss_normalizer = LossNormalizer() if self.has_separate_flow_decoder else None
             self.lpips_loss_normalizer = LossNormalizer() if self.has_lpips_loss else None
             self.time_decorr_loss_normalizer = LossNormalizer() if encoder_add_decorr_aux_loss else None
             self.space_decorr_loss_normalizer = LossNormalizer() if encoder_add_decorr_aux_loss else None
@@ -3400,28 +3577,31 @@ class VideoTokenizer(Module):
     def decoder_parameters(self):
         params = [
             *self.latents_to_decoder.parameters(),
-            *self.decoder_transformer.parameters(),
-            *self.tokens_to_patch.parameters()
+            *self.decoder.parameters()
         ]
 
-        if self.use_causal_conv3d:
-            params.extend(self.decoder_pre_causal_conv3d.parameters())
-            params.extend(self.decoder_post_causal_conv3d.parameters())
+        if self.has_separate_flow_decoder:
+            params.extend(self.flow_decoder.parameters())
 
         if self.has_flow:
             params.extend(self.time_embed.parameters())
             params.extend(self.noised_patch_to_tokens.parameters())
 
-        if self.decoder_slot_attention_initted_spatial_tokens:
-            params.extend(self.decoder_slot_attention.parameters())
+        if self.has_aug_conditioning:
+            params.extend(self.aug_cond_embedding.parameters())
 
         return params
 
     def muon_parameters(self):
-        return [
+        params = [
             *self.encoder_transformer.muon_parameters(),
-            *self.decoder_transformer.muon_parameters()
+            *self.decoder.muon_parameters()
         ]
+
+        if self.has_separate_flow_decoder:
+            params.extend(self.flow_decoder.muon_parameters())
+
+        return params
 
     @torch.no_grad()
     def tokenize(
@@ -3441,94 +3621,42 @@ class VideoTokenizer(Module):
         aug_id = None,
     ): # (b c t h w)
 
-        height = default(height, self.image_height)
-        width = default(width, self.image_width)
-
-        assert exists(height) and exists(width), f'image height and width need to be passed in when decoding latents'
-
         batch, time_len, device = *latents.shape[:2], latents.device
 
-        use_flex = latents.is_cuda and exists(flex_attention)
-
-        num_patch_height = height // self.patch_size
-        num_patch_width = width // self.patch_size
-
-        # latents to tokens
+        # to latents
 
         latent_tokens = self.latents_to_decoder(latents)
 
-        if exists(time_indices):
+        if self.has_flow:
+            time_indices = default(time_indices, torch.zeros(batch, device = device, dtype = torch.long))
             time_embedding = self.time_embed(time_indices)
             time_embedding = rearrange(time_embedding, 'b d -> b 1 1 d')
             latent_tokens = latent_tokens + time_embedding
 
-        # generate decoder positional embedding and concat the latent token
-
-        spatial_pos_height = torch.linspace(-1., 1., num_patch_height, device = device)
-        spatial_pos_width = torch.linspace(-1., 1., num_patch_width, device = device)
-
-        space_height_width_coor = stack(torch.meshgrid(spatial_pos_height, spatial_pos_width, indexing = 'ij'), dim = -1)
-
-        decoder_pos_emb = self.to_decoder_pos_emb(space_height_width_coor)
-        decoder_pos_emb = repeat(decoder_pos_emb, '... -> b t ...', b = batch, t = time_len)
-
-        spatial_tokens = decoder_pos_emb
-
+        image_tokens = None
         if exists(noised_video):
             image_tokens = self.noised_patch_to_tokens(noised_video)
-            spatial_tokens = spatial_tokens + image_tokens
 
-        if self.decoder_slot_attention_initted_spatial_tokens:
-            spatial_tokens, inverse_pack_space = pack_one(spatial_tokens, 'b t * d')
-            spatial_tokens = self.decoder_slot_attention(spatial_tokens, latent_tokens)
-            spatial_tokens = inverse_pack_space(spatial_tokens)
+        # decode
 
-        # augmentation conditioning
+        # use base decoder if no flow decoder, or if time_indices is all 0s
 
-        if self.has_aug_conditioning:
-            aug_id = default(aug_id, 0)
+        use_base_decoder = True
 
-            if isinstance(aug_id, bool):
-                aug_id = int(aug_id) + 1
+        if self.has_separate_flow_decoder and exists(time_indices):
+            is_flow_step = time_indices > 0
+            assert not is_flow_step.any() or is_flow_step.all(), 'when using separate flow decoder, time indices must be either all 0s or all > 0s'
+            use_base_decoder = not is_flow_step.any()
 
-            if is_tensor(aug_id) and aug_id.dtype == torch.bool:
-                aug_id = aug_id.long() + 1
+        decoder = self.decoder if use_base_decoder else self.flow_decoder
 
-            if isinstance(aug_id, int):
-                aug_id = torch.full((batch,), aug_id, device = device, dtype = torch.long)
-
-            maybe_aug_token = self.aug_cond_embedding(aug_id)
-            maybe_aug_token = repeat(maybe_aug_token, 'b d -> b t 1 d', t = time_len)
-        else:
-            maybe_aug_token = latent_tokens[:, :, 0:0]
-
-        tokens, packed_latent_shape = pack((spatial_tokens, maybe_aug_token, latent_tokens), 'b t * d')
-
-        # decoder attention
-
-        if self.use_causal_conv3d:
-            b, t, *_ = tokens.shape
-
-            unpacked = unpack(tokens, packed_latent_shape, 'b t * d')
-            spatial_tokens, maybe_aug_token, latent_tokens = unpacked
-
-            spatial_tokens = self.decoder_pre_causal_conv3d(spatial_tokens)
-
-            tokens, _ = pack((spatial_tokens, maybe_aug_token, latent_tokens), 'b t * d')
-
-        tokens = self.decoder_transformer(tokens, space_height = num_patch_height, space_width = num_patch_width)
-
-        # unpack latents
-
-        unpacked = unpack(tokens, packed_latent_shape, 'b t * d')
-        tokens, maybe_aug_token, latent_tokens = unpacked
-
-        # project to patches
-
-        if self.use_causal_conv3d:
-            tokens = self.decoder_post_causal_conv3d(tokens)
-
-        recon_video = self.tokens_to_patch(tokens)
+        recon_video = decoder(
+            latent_tokens = latent_tokens,
+            noised_image_tokens = image_tokens,
+            height = height,
+            width = width,
+            aug_id = aug_id
+        )
 
         return recon_video
 
@@ -3763,11 +3891,17 @@ class VideoTokenizer(Module):
         if self.has_latent_ar and self.latent_ar_in_decoder:
             latent_ar_loss, latent_ar_sigreg_loss, _ = self.latent_ar(latents)
 
+        time_indices = None
+
         if self.has_flow:
 
             if exists(self.decoder_times_beta_distribution):
                 u = self.decoder_times_beta_distribution.sample((batch,)).to(device)
                 time_indices = (u * self.decoder_flow_steps).clamp(0, self.decoder_flow_steps - 1).long()
+            elif self.has_separate_flow_decoder and self.decoder_flow_steps > 1:
+                is_flow_step = random() < self.flow_decoder_train_prob
+                low, high = (1, self.decoder_flow_steps) if is_flow_step else (0, 1)
+                time_indices = torch.randint(low, high, (batch,), device = device)
             else:
                 time_indices = torch.randint(0, self.decoder_flow_steps, (batch,), device = device)
 
@@ -3837,6 +3971,13 @@ class VideoTokenizer(Module):
         else:
             recon_loss = F.mse_loss(pred, target)
 
+        flow_recon_loss = self.zero
+        is_flow_step = self.has_separate_flow_decoder and exists(time_indices) and (time_indices > 0).any()
+
+        if is_flow_step:
+            flow_recon_loss = recon_loss
+            recon_loss = self.zero
+
         # losses
 
         lpips_loss = self.zero
@@ -3859,7 +4000,10 @@ class VideoTokenizer(Module):
         # losses
 
         if self.use_loss_normalization:
-            recon_loss = self.recon_loss_normalizer(recon_loss, update_ema = update_loss_ema)
+            if not is_flow_step:
+                recon_loss = self.recon_loss_normalizer(recon_loss, update_ema = update_loss_ema)
+            else:
+                flow_recon_loss = self.flow_recon_loss_normalizer(flow_recon_loss, update_ema = update_loss_ema)
 
             if self.has_latent_ar:
                 latent_ar_loss = self.latent_ar_loss_normalizer(latent_ar_loss, update_ema = update_loss_ema)
@@ -3884,6 +4028,7 @@ class VideoTokenizer(Module):
 
         total_loss = (
             recon_loss +
+            flow_recon_loss +
             lpips_loss * self.lpips_loss_weight +
             time_decorr_loss * self.time_decorr_loss_weight +
             space_decorr_loss * self.space_decorr_loss_weight +
@@ -3898,7 +4043,7 @@ class VideoTokenizer(Module):
         if not return_intermediates:
             return total_loss
 
-        losses = TokenizerLosses(recon_loss, lpips_loss, time_decorr_loss, space_decorr_loss, latent_ortho_loss, latent_ar_loss, latent_ar_sigreg_loss, latent_consistency_loss, latent_sigreg_loss, h_net_loss)
+        losses = TokenizerLosses(recon_loss, flow_recon_loss, lpips_loss, time_decorr_loss, space_decorr_loss, latent_ortho_loss, latent_ar_loss, latent_ar_sigreg_loss, latent_consistency_loss, latent_sigreg_loss, h_net_loss)
 
         # handle returning of reconstructed, and image pretraining
 

@@ -1742,3 +1742,52 @@ def test_latent_ar_loss(loss_type, detach_target, sigreg_num_subspaces, predict_
 
     loss, pred = latent_ar_loss(torch.randn(2, 4, 512), return_unreduced_loss = True)
     assert loss.shape == (2, 3, 512)
+
+@param('decoder_flow_steps, separate_flow_decoder, override_grad_frac', [
+    (1, False, None),
+    (4, False, None),
+    (4, True, None),
+    (4, True, lambda t: (t < 0.5).float())
+])
+def test_separate_flow_decoder(
+    decoder_flow_steps,
+    separate_flow_decoder,
+    override_grad_frac
+):
+    from dreamer4.dreamer4 import VideoTokenizer
+    import torch
+
+    tokenizer = VideoTokenizer(
+        dim = 256,
+        dim_latent = 16,
+        patch_size = 4,
+        image_height = 32,
+        image_width = 32,
+        num_latent_tokens = 4,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        decoder_flow_steps = decoder_flow_steps,
+        separate_flow_decoder = separate_flow_decoder,
+        flow_decoder_train_prob = 0.5,
+        latent_receive_grad_frac = override_grad_frac
+    )
+    video = torch.randn(1, 3, 2, 32, 32)
+
+    # test parameter separation
+    if separate_flow_decoder:
+        decoder_params = list(tokenizer.decoder.parameters())
+        flow_decoder_params = list(tokenizer.flow_decoder.parameters())
+
+        assert len(decoder_params) == len(flow_decoder_params)
+        for p1, p2 in zip(decoder_params, flow_decoder_params):
+            assert p1 is not p2, 'parameters must not be shared between base decoder and flow decoder'
+
+    # test forward
+    loss = tokenizer(video)
+    assert loss.numel() == 1
+    loss.backward()
+
+    # test inference
+    latents = tokenizer(video, return_latents = True)
+    decoded_video = tokenizer.decode(latents, height=32, width=32)
+    assert decoded_video.shape == video.shape

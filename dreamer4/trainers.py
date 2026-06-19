@@ -382,6 +382,7 @@ class VideoTokenizerTrainer(Module):
             self.log(
                 loss = total_loss,
                 recon_loss = losses.recon.item(),
+                flow_recon_loss = losses.flow_recon.item(),
                 lpips_loss = losses.lpips.item(),
                 time_decorr_loss = losses.time_decorr.item(),
                 space_decorr_loss = losses.space_decorr.item(),
@@ -412,11 +413,16 @@ class VideoTokenizerTrainer(Module):
                     save_video_grid_as_gif(combined_video, gif_path)
 
             # display active losses in pbar
+
             postfix_kwargs = dict(loss = f"{total_loss:.4f}")
 
             recon_loss = losses.recon.item()
             if recon_loss > 0.:
                 postfix_kwargs['recon'] = f"{recon_loss:.4f}"
+
+            flow_recon_loss = losses.flow_recon.item()
+            if flow_recon_loss > 0.:
+                postfix_kwargs['flow_recon'] = f"{flow_recon_loss:.4f}"
 
             lpips_loss = losses.lpips.item()
             if lpips_loss > 0.:
