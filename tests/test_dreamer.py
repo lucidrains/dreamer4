@@ -1720,3 +1720,25 @@ def test_dynamics_aug_conditioning():
 
     loss_int, *_ = dynamics(video = video, discrete_actions = discrete_actions, aug_id = 1, return_all_losses = True)
     assert loss_int.numel() == 1
+
+@param('loss_type, detach_target, sigreg_num_subspaces, predict_residual', [
+    ('smooth_l1', False, 4, True),
+    ('cosine', True, None, False)
+])
+def test_latent_ar_loss(loss_type, detach_target, sigreg_num_subspaces, predict_residual):
+    from dreamer4.dreamer4 import LatentAutoregressiveLoss
+    import torch
+
+    latent_ar_loss = LatentAutoregressiveLoss(
+        dim = 512,
+        loss_type = loss_type,
+        detach_target = detach_target,
+        sigreg_num_subspaces = sigreg_num_subspaces,
+        predict_residual = predict_residual
+    )
+
+    loss, sigreg, pred = latent_ar_loss(torch.randn(2, 4, 512))
+    assert loss.ndim == 0
+
+    loss, pred = latent_ar_loss(torch.randn(2, 4, 512), return_unreduced_loss = True)
+    assert loss.shape == (2, 3, 512)

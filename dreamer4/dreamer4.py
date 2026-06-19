@@ -225,9 +225,11 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
-def cosine_distance(x, y, mask = None):
-    dist = 1. - F.cosine_similarity(x, y, dim = -1)
-    return masked_mean(dist, mask)
+def identity(t, *args, **kwargs):
+    return t
+
+def detach(t):
+    return t.detach()
 
 def first(arr):
     return arr[0]
@@ -275,6 +277,13 @@ def temp_requires_grad(
         p.requires_grad_(orig)
 
 # tensor helpers
+
+def cosine_distance(x, y, mask = None):
+    dist = 1. - F.cosine_similarity(x, y, dim = -1)
+    return masked_mean(dist, mask)
+
+def cosine_sim_loss(x, y, reduction = 'mean'):
+    return F.mse_loss(l2norm(x), l2norm(y), reduction = reduction)
 
 def orthogonal_loss(x):
     n, device = x.shape[-2], x.device
@@ -629,11 +638,19 @@ class LatentAutoregressiveLoss(Module):
         use_rmsnorm = False,
         sigreg_loss_kwargs: dict | None = None,
         sigreg_num_subspaces = None,
+        loss_type: Literal['smooth_l1', 'cosine'] = 'smooth_l1',
+        detach_target = True,
+        predict_residual = False,
         net: Module | None = None
     ):
         super().__init__()
         dim_in = default(dim_in, dim)
+        self.predict_residual = predict_residual
         self.sigreg_loss_kwargs = default(sigreg_loss_kwargs, dict())
+
+        assert loss_type in ('smooth_l1', 'cosine')
+        self.loss_type = loss_type
+        self.maybe_detach = detach if detach_target else identity
 
         if not exists(net):
             norm = RMSNorm(dim) if use_rmsnorm else Identity()
@@ -671,18 +688,30 @@ class LatentAutoregressiveLoss(Module):
         is_same_layer = not exists(target) or x is target
         target = default(target, x)
 
-        pred_input = x[:, :-1]
+        latents_input = x[:, :-1]
         target_output = target[:, 1:]
+
+        pred_input = latents_input
 
         if exists(cond):
             pred_input = cat((pred_input, cond[:, :-1]), dim = -1)
 
         pred = self.net(pred_input)
 
+        if self.predict_residual:
+            pred = pred + latents_input
+
         if not return_loss:
             return pred
 
-        loss = F.smooth_l1_loss(pred, target_output.detach(), reduction = 'none')
+        target_output_loss = self.maybe_detach(target_output)
+
+        if self.loss_type == 'smooth_l1':
+            loss = F.smooth_l1_loss(pred, target_output_loss, reduction = 'none')
+        elif self.loss_type == 'cosine':
+            loss = cosine_sim_loss(pred, target_output_loss, reduction = 'none')
+        else:
+            raise ValueError(f'unknown loss_type {self.loss_type}')
 
         if return_unreduced_loss:
             return loss, pred
@@ -3059,6 +3088,7 @@ class VideoTokenizer(Module):
         latent_ar_placement = 'encoder',
         latent_ar_sigreg_loss_kwargs = dict(num_slices = 256),
         latent_ar_sigreg_num_subspaces = None,
+        latent_ar_kwargs = dict(),
         latent_sigreg_loss_weight = 0.,
         latent_sigreg_loss_kwargs = dict(num_slices = 256),
         latent_consistency_loss_weight = 0.,
@@ -3318,7 +3348,8 @@ class VideoTokenizer(Module):
                 latent_ar_dim,
                 use_rmsnorm = latent_ar_use_rmsnorm,
                 sigreg_loss_kwargs = latent_ar_sigreg_loss_kwargs,
-                sigreg_num_subspaces = latent_ar_sigreg_num_subspaces
+                sigreg_num_subspaces = latent_ar_sigreg_num_subspaces,
+                **latent_ar_kwargs
             )
 
         # loss normalizer
@@ -4023,6 +4054,7 @@ class DynamicsWorldModel(Module):
         latent_ar_sigreg_loss_weight = 0.05,
         latent_ar_sigreg_loss_kwargs = dict(num_slices = 256),
         latent_ar_sigreg_num_subspaces = None,
+        latent_ar_kwargs = dict(),
         identity_latents_to_spatial = False,
         has_aug_conditioning = False,
         aug_cfg_dropout_prob = 0.1,
@@ -4253,7 +4285,8 @@ class DynamicsWorldModel(Module):
                 dim_in = latent_ar_dim_in,
                 dim = dim,
                 sigreg_loss_kwargs = latent_ar_sigreg_loss_kwargs,
-                sigreg_num_subspaces = latent_ar_sigreg_num_subspaces
+                sigreg_num_subspaces = latent_ar_sigreg_num_subspaces,
+                **latent_ar_kwargs
             )
 
         # agent predicting state
