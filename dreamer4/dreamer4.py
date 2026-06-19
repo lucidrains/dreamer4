@@ -3667,13 +3667,19 @@ class VideoTokenizer(Module):
         height = None,
         width = None,
         aug_id = None,
+        return_recons_across_steps = False
     ): # (b c t h w)
 
         height = default(height, self.image_height)
         width = default(width, self.image_width)
 
         if not self.has_flow:
-            return self.decode_step(latents, height = height, width = width, aug_id = aug_id)
+            recon = self.decode_step(latents, height = height, width = width, aug_id = aug_id)
+
+            if return_recons_across_steps:
+                return recon, [recon]
+
+            return recon
 
         batch, time_len, device = *latents.shape[:2], latents.device
 
@@ -3685,6 +3691,7 @@ class VideoTokenizer(Module):
         video = noise
 
         delta = 1. / steps
+        all_pred_videos = []
 
         for i, time in enumerate(times[:-1].unbind()):
 
@@ -3698,7 +3705,13 @@ class VideoTokenizer(Module):
 
             video = video + pred_flow * delta
 
-        return video
+            if return_recons_across_steps:
+                all_pred_videos.append(pred_video)
+
+        if not return_recons_across_steps:
+            return video
+
+        return video, all_pred_videos
 
     def forward(
         self,

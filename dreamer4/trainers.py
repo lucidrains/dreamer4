@@ -397,18 +397,32 @@ class VideoTokenizerTrainer(Module):
                 sample_model.eval()
 
                 with torch.no_grad():
+                    video_height, video_width = video.shape[-2:]
+
                     if self.model.has_flow:
                         latents = sample_model.tokenize(video)
-                        recon_video = sample_model.decode(latents, height = video.shape[-2], width = video.shape[-1])
+                        recon_video, all_pred_videos = sample_model.decode(
+                            latents,
+                            height = video_height,
+                            width = video_width,
+                            return_recons_across_steps = True
+                        )
                     else:
                         _, (_, recon_video) = sample_model(video, return_intermediates = True)
+                        all_pred_videos = [recon_video]
 
                 recon_video = recon_video.clamp(0., 1.)
                 self.log_video(video, "original_video")
                 self.log_video(recon_video, "reconstructed_video")
 
+                if sample_model.has_flow:
+                    recon_timestep_zero = all_pred_videos[0].clamp(0., 1.)
+                    self.log_video(recon_timestep_zero, "recon_timestep_zero")
+
                 if exists(self.results_folder):
-                    combined_video = torch.cat((video, recon_video), dim = -1)
+                    videos_to_concat = (video, recon_timestep_zero, recon_video) if sample_model.has_flow else (video, recon_video)
+
+                    combined_video = torch.cat(videos_to_concat, dim = -1)
                     gif_path = self.results_folder / f'sample-{self.step.item()}.gif'
                     save_video_grid_as_gif(combined_video, gif_path)
 
