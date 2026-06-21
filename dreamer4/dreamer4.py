@@ -1,19 +1,20 @@
 from __future__ import annotations
 from typing import Callable, Iterable, NamedTuple, Tuple, Literal
 
-import numpy as np
 from math import ceil, log2
 from random import random
+import numpy as np
+from copy import deepcopy
+from functools import wraps, partial
 from contextlib import nullcontext, contextmanager
 from collections import namedtuple
-from functools import partial, wraps
 from dataclasses import dataclass, asdict, fields
 
 import torch
 import torch.nn.functional as F
 from torch.distributions import Normal, Beta, kl
 from torch.nn import Module, ModuleList, ModuleDict, Embedding, Parameter, Linear, RMSNorm
-from torch import nn, cat, stack, arange, tensor, Tensor, is_tensor, full, zeros, ones, randint, rand, randn, randn_like, empty, full, linspace, arange
+from torch import nn, cat, stack, arange, tensor, Tensor, is_tensor, full, zeros, ones, randint, rand, randn, randn_like, empty, full, linspace, arange, rand_like, ones_like, zeros_like
 from torch.utils._pytree import tree_map, tree_flatten, tree_unflatten
 
 from torch_einops_utils.nn import Identity, Sequential
@@ -375,7 +376,7 @@ def safe_squeeze_first(t):
     return rearrange(t, '1 ... -> ...')
 
 def gumbel_noise(t):
-    noise = torch.rand_like(t)
+    noise = rand_like(t)
     return -log(-log(noise))
 
 def gumbel_sample(
@@ -486,7 +487,7 @@ def apply_fire(
 
         if shrink_perturb:
             scale, noise_scale = shrink_perturb_factors
-            noise = torch.randn_like(t)
+            noise = randn_like(t)
 
             t = t.mul_(1. - scale).add_(noise * noise_scale)
 
@@ -505,7 +506,7 @@ class LossNormalizer(Module):
         eps = 1e-6
     ):
         super().__init__()
-        self.register_buffer('exp_avg_sq', torch.ones(num_losses))
+        self.register_buffer('exp_avg_sq', ones(num_losses))
         self.beta = beta
         self.eps = eps
 
@@ -601,12 +602,12 @@ def sigreg(
 
     # slice sampling
 
-    rand_projs = torch.randn((num_slices, dim), device = device)
+    rand_projs = randn((num_slices, dim), device = device)
     rand_projs = l2norm(rand_projs)
 
     # integration points
 
-    t = torch.linspace(*domain, num_knots, device = device)
+    t = linspace(*domain, num_knots, device = device)
 
     # theoretical CF for N(0, 1) and Gauss. window
 
@@ -673,7 +674,7 @@ class LatentAutoregressiveLoss(Module):
             dim_subspace, remainder = divmod(dim, self.num_subspaces)
             assert remainder == 0, f'dimension {dim} must be divisible by number of subspaces {self.num_subspaces}'
 
-            projs = torch.stack([nn.init.orthogonal_(torch.empty(dim_subspace, dim)) for _ in range(self.num_subspaces)])
+            projs = stack([nn.init.orthogonal_(empty(dim_subspace, dim)) for _ in range(self.num_subspaces)])
             self.register_buffer('subspace_projs', projs)
 
     def forward(
@@ -886,7 +887,7 @@ class SymExpTwoHot(Module):
 
         # set the left and right values (two-hot)
 
-        encoded = torch.zeros((num_values, self.num_bins), device = self.device)
+        encoded = zeros((num_values, self.num_bins), device = self.device)
 
         encoded.scatter_(-1, left_indices, left_logit_value)
         encoded.scatter_(-1, right_indices, right_logit_value)
@@ -995,7 +996,7 @@ class ActionEmbedder(Module):
 
         # discrete action unembed
 
-        self.discrete_action_unembed = Parameter(torch.randn(total_discrete_actions, num_unembed_preds, unembed_dim) * 1e-2)
+        self.discrete_action_unembed = Parameter(randn(total_discrete_actions, num_unembed_preds, unembed_dim) * 1e-2)
 
         if self.has_discrete_actions:
 
@@ -1013,7 +1014,7 @@ class ActionEmbedder(Module):
 
         # continuous action unembed
 
-        self.continuous_action_unembed = Parameter(torch.randn(num_continuous_actions, num_unembed_preds, unembed_dim, 2) * 1e-2)
+        self.continuous_action_unembed = Parameter(randn(num_continuous_actions, num_unembed_preds, unembed_dim, 2) * 1e-2)
 
     def embed_parameters(self):
         return set([*self.discrete_action_embed.parameters(), *self.continuous_action_embed.parameters()])
@@ -1243,9 +1244,9 @@ class ActionEmbedder(Module):
             tgt_dist = MultiCategorical(tgt_logits, use_parallel_multi_discrete = True)
 
             discrete_kl = src_dist.kl_div(tgt_dist)
-
-            # MultiCategorical.kl_div already returns a reduced tensor across actions
-            # so we should not sum it again if it is already reduced
+            
+            if reduce_across_num_actions:
+                discrete_kl = discrete_kl.sum(dim = -1)
 
         # continuous kl
 
@@ -1341,7 +1342,7 @@ def calc_gae(
     use_accelerated = default(use_accelerated, rewards.is_cuda)
 
     if not exists(masks):
-        masks = torch.ones_like(values)
+        masks = ones_like(values)
 
     masks = masks.float()
 
@@ -1382,7 +1383,7 @@ class Rotary1D(Module):
     ):
         device, dtype = self.inv_freq.device, self.inv_freq.dtype
 
-        t = torch.arange(seq_len, device = device).type(dtype) + offset
+        t = arange(seq_len, device = device).type(dtype) + offset
         freqs = einsum(t, self.inv_freq, 'i, j -> i j')
 
         return cat((freqs, freqs), dim = -1)
@@ -1432,7 +1433,7 @@ class MultiHeadRMSNorm(Module):
     ):
         super().__init__()
         self.scale = dim_head ** 0.5
-        self.gamma = Parameter(torch.zeros(heads, dim_head)) # weight decay friendly
+        self.gamma = Parameter(zeros(heads, dim_head)) # weight decay friendly
 
     def forward(
         self,
@@ -1499,7 +1500,7 @@ def naive_attend(
           i = ceil(i / causal_block_size)
           j = ceil(j / causal_block_size)
 
-        causal_mask = torch.ones((i, j), dtype = torch.bool, device = sim.device).triu(j - i + 1)
+        causal_mask = ones((i, j), dtype = torch.bool, device = sim.device).triu(j - i + 1)
 
         if causal_block_size > 1:
             causal_mask = repeat(causal_mask, 'i j -> (i b1) (j b2)', b1 = causal_block_size, b2 = causal_block_size)
@@ -1619,8 +1620,8 @@ def get_attend_fn(
 
         mask = None
         if num_special_tokens > 0:
-            q_seq = torch.arange(seq_len, device = device)[:, None]
-            k_seq = torch.arange(k_seq_len, device = device)[None, :]
+            q_seq = arange(seq_len, device = device)[:, None]
+            k_seq = arange(k_seq_len, device = device)[None, :]
 
             mask = special_token_mask(q_seq, k_seq, block_size_per_special, num_special_tokens, special_attend_only_itself)
 
@@ -1965,6 +1966,168 @@ class LearnedQueriesAttentionPool(Module):
 
 # ssl
 
+# self predictive representation (next latent prediction methods) for actor
+
+class ActorSPRWrapper(Module):
+    def __init__(
+        self,
+        action_embedder,
+        *,
+        dim,
+        num_rollouts = 1,
+        spr_loss_weight = 1.0,
+        kl_loss_weight = 1.0,
+        dynamics_hidden_dim = None,
+        dynamics_num_layers = 3,
+        sigreg_loss_weight = 0.,
+        sigreg_loss_kwargs: dict = dict()
+    ):
+        super().__init__()
+        self.action_embedder = action_embedder
+        self.num_rollouts = num_rollouts
+
+        self.norm = RMSNorm(dim)
+
+        self.spr_loss_weight = spr_loss_weight
+        self.kl_loss_weight = kl_loss_weight
+
+        self.sigreg_loss_weight = sigreg_loss_weight
+        self.sigreg_loss_kwargs = dict(num_slices = 1024, domain = (-5, 5), num_knots = 17)
+        self.sigreg_loss_kwargs.update(sigreg_loss_kwargs)
+
+        self.has_spr_loss = spr_loss_weight > 0.
+        self.has_kl_loss = kl_loss_weight > 0.
+        self.has_sigreg = sigreg_loss_weight > 0.
+
+        rollout_weights = tensor([1.] * num_rollouts)
+        self.register_buffer('rollout_loss_weights', rollout_weights / rollout_weights.sum(), persistent = False)
+
+        dynamics_hidden_dim = default(dynamics_hidden_dim, dim)
+        action_embed_dim = action_embedder.discrete_action_embed.embedding_dim if action_embedder.has_discrete_actions else action_embedder.continuous_action_embed.embedding_dim
+
+        self.dynamics_mlp = create_mlp(
+            dynamics_hidden_dim,
+            dynamics_num_layers,
+            dim_in = dim + action_embed_dim,
+            dim_out = dim
+        )
+
+        self.dynamics_norm = RMSNorm(dim + action_embed_dim)
+
+        self.register_buffer('zero', tensor(0.), persistent = False)
+
+    def forward(
+        self,
+        policy_embed,
+        discrete_actions = None,
+        continuous_actions = None,
+        discrete_action_types = None,
+        continuous_action_types = None,
+        mask = None
+    ):
+        num_rollouts = self.num_rollouts
+        seq = policy_embed.shape[1]
+
+        policy_embed = self.norm(policy_embed)
+
+        if not (self.has_spr_loss or self.has_kl_loss or self.has_sigreg):
+            return self.zero, self.zero
+
+        if not exists(mask):
+            mask = ones(policy_embed.shape[:2], device = policy_embed.device, dtype = torch.bool)
+
+        action_embeds = self.action_embedder(
+            discrete_actions = discrete_actions,
+            continuous_actions = continuous_actions,
+            discrete_action_types = discrete_action_types,
+            continuous_action_types = continuous_action_types,
+            return_sum_pooled_embeds = True
+        )
+
+        assert seq > num_rollouts
+
+        pad_amt = num_rollouts - 1
+        padded_target_embeds = pad_right_at_dim(policy_embed, pad_amt, dim = 1, value = 0.)
+        padded_mask = pad_right_at_dim(mask, pad_amt, dim = 1, value = False)
+        padded_action_embeds = pad_right_at_dim(action_embeds, pad_amt, dim = 1, value = 0.)
+
+        step_targets = rearrange(padded_target_embeds[:, 1:].unfold(1, seq - 1, 1), 'b r d n -> r b n d')
+        step_masks = rearrange(padded_mask[:, 1:].unfold(1, seq - 1, 1), 'b r n -> r b n')
+        step_actions = rearrange(padded_action_embeds[:, :-1].unfold(1, seq - 1, 1), 'b r d n -> r b n d')
+
+        if self.has_kl_loss:
+            frozen_action_embedder = deepcopy(self.action_embedder)
+            for p in frozen_action_embedder.parameters():
+                p.requires_grad_(False)
+
+        # rollout and gather next latent pred losses
+
+        pred_loss_inputs = []
+        pred = policy_embed[:, :-1]
+
+        for step in range(num_rollouts):
+            step_action_embeds = step_actions[step].detach()
+            dynamics_input = self.dynamics_norm(cat((pred, step_action_embeds), dim = -1))
+            pred = pred + self.dynamics_mlp(dynamics_input)
+            pred_loss_inputs.append(pred)
+
+        pred_loss_inputs = stack(pred_loss_inputs)
+
+        spr_loss = kl_loss = sigreg_loss = self.zero
+        weights = self.rollout_loss_weights[:num_rollouts]
+
+        if self.has_spr_loss:
+            step_smooth_l1 = F.smooth_l1_loss(pred_loss_inputs, step_targets.detach(), reduction = 'none')
+            step_smooth_l1 = einx.multiply('r b n d, r -> r b n d', step_smooth_l1, weights)
+            spr_loss = masked_mean(step_smooth_l1, rearrange(step_masks, '... -> ... 1'), dim = (1, 2, 3)).sum()
+
+        # kl loss
+
+        if self.has_kl_loss:
+            with torch.no_grad():
+                target_discrete_logits, target_cont_params = frozen_action_embedder.unembed(
+                    step_targets.detach(),
+                    pred_head_index = 0,
+                    discrete_action_types = discrete_action_types,
+                    continuous_action_types = continuous_action_types,
+                    return_split_discrete = True
+                )
+
+            pred_discrete_logits, pred_cont_params = frozen_action_embedder.unembed(
+                pred_loss_inputs,
+                pred_head_index = 0,
+                discrete_action_types = discrete_action_types,
+                continuous_action_types = continuous_action_types,
+                return_split_discrete = True
+            )
+
+            discrete_kl, cont_kl = frozen_action_embedder.kl_div(
+                (pred_discrete_logits, pred_cont_params),
+                (target_discrete_logits, target_cont_params)
+            )
+            
+            step_kl = self.zero
+
+            if exists(discrete_kl):
+                step_kl = step_kl + discrete_kl
+
+            if exists(cont_kl):
+                step_kl = step_kl + cont_kl
+
+            step_kl = einx.multiply('r b n, r -> r b n', step_kl, weights)
+            kl_loss = masked_mean(step_kl, step_masks, dim = (1, 2)).sum()
+
+        if self.has_sigreg:
+            sigreg_loss = sigreg(policy_embed[mask], **self.sigreg_loss_kwargs)
+
+        total_loss = (
+            spr_loss * self.spr_loss_weight +
+            kl_loss * self.kl_loss_weight +
+            sigreg_loss * self.sigreg_loss_weight
+        )
+
+        return total_loss, (spr_loss, kl_loss, sigreg_loss)
+
 # Dominik Schmidt https://arxiv.org/abs/2312.10812
 
 class LAPO(Module):
@@ -2228,7 +2391,7 @@ class TEM(Module):
 
         if self.learn_relative_actions and has_actions:
             past_actions = shift_right(actions, amount = 1, dim = 1)
-            actions_with_past = torch.cat((actions, past_actions), dim = -1)
+            actions_with_past = cat((actions, past_actions), dim = -1)
             actions = self.learned_relative_encode(actions_with_past)
 
         if has_actions:
@@ -2601,7 +2764,7 @@ class AxialSpaceTimeTransformer(Module):
             space_pos_emb = self.space_rotary((space_height, space_width))
 
             if num_spatial_special > 0:
-                space_pope_pos_emb_indices = torch.arange(space_height * space_width, device = device)
+                space_pope_pos_emb_indices = arange(space_height * space_width, device = device)
 
         # value residual
 
@@ -2890,7 +3053,7 @@ class CausalDepthwiseConv3d(Module):
         # handle cache or causal pad
 
         if exists(time_cache):
-            x = torch.cat((time_cache, x), dim = 2)
+            x = cat((time_cache, x), dim = 2)
         else:
             x = pad_at_dim(x, (causal_pad, 0), dim = 2)
 
@@ -2953,7 +3116,7 @@ class ShiftedPatchTokenization(Module):
 
         if self.temporal_shift:
             if exists(time_cache):
-                x_time_padded = torch.cat((time_cache, x), dim = 1)
+                x_time_padded = cat((time_cache, x), dim = 1)
             else:
                 x_time_padded = pad_at_dim(x, (1, 0), dim = 1)
 
@@ -3190,8 +3353,8 @@ class VideoDecoderNetwork(Module):
 
         # generate decoder positional embedding and concat the latent token
 
-        spatial_pos_height = torch.linspace(-1., 1., num_patch_height, device = device)
-        spatial_pos_width = torch.linspace(-1., 1., num_patch_width, device = device)
+        spatial_pos_height = linspace(-1., 1., num_patch_height, device = device)
+        spatial_pos_width = linspace(-1., 1., num_patch_width, device = device)
 
         space_height_width_coor = stack(torch.meshgrid(spatial_pos_height, spatial_pos_width, indexing = 'ij'), dim = -1)
 
@@ -3220,7 +3383,7 @@ class VideoDecoderNetwork(Module):
                 aug_id = aug_id.long() + 1
 
             if isinstance(aug_id, int):
-                aug_id = torch.full((batch,), aug_id, device = device, dtype = torch.long)
+                aug_id = full((batch,), aug_id, device = device, dtype = torch.long)
 
             maybe_aug_token = self.aug_cond_embedding(aug_id)
             maybe_aug_token = repeat(maybe_aug_token, 'b d -> b t 1 d', t = time_len)
@@ -3661,7 +3824,7 @@ class VideoTokenizer(Module):
         latent_tokens = self.latents_to_decoder(latents)
 
         if self.has_flow:
-            time_indices = default(time_indices, torch.zeros(batch, device = device, dtype = torch.long))
+            time_indices = default(time_indices, zeros(batch, device = device, dtype = torch.long))
             time_embedding = self.time_embed(time_indices)
             time_embedding = rearrange(time_embedding, 'b d -> b 1 1 d')
             latent_tokens = latent_tokens + time_embedding
@@ -3716,10 +3879,10 @@ class VideoTokenizer(Module):
 
         batch, time_len, device = *latents.shape[:2], latents.device
 
-        noise = torch.randn(batch, self.channels, time_len, height, width, device=device)
+        noise = randn(batch, self.channels, time_len, height, width, device=device)
 
         steps = self.decoder_flow_steps
-        times = torch.linspace(0., 1., steps + 1, device = device)
+        times = linspace(0., 1., steps + 1, device = device)
 
         video = noise
 
@@ -3728,7 +3891,7 @@ class VideoTokenizer(Module):
 
         for i, time in enumerate(times[:-1].unbind()):
 
-            time_indices = torch.full((batch,), i, device = device, dtype = torch.long)
+            time_indices = full((batch,), i, device = device, dtype = torch.long)
 
             pred_video = self.decode_step(latents, noised_video = video, time_indices = time_indices, height = height, width = width, aug_id = aug_id)
 
@@ -3787,7 +3950,7 @@ class VideoTokenizer(Module):
                 aug_id = int(aug_id) + 1
 
             if not is_tensor(aug_id):
-                aug_id = torch.tensor(aug_id, device = device)
+                aug_id = tensor(aug_id, device = device)
 
             if aug_id.dtype == torch.bool:
                 aug_id = aug_id.long() + 1
@@ -3797,7 +3960,7 @@ class VideoTokenizer(Module):
             cfg_dropout_aug = default(cfg_dropout_aug, self.training)
 
             if cfg_dropout_aug:
-                drop_mask = torch.rand(batch, device = device) < self.aug_cfg_dropout_prob
+                drop_mask = rand(batch, device = device) < self.aug_cfg_dropout_prob
                 aug_id = torch.where(drop_mask, 0, aug_id)
 
         # time cache setup
@@ -3838,7 +4001,7 @@ class VideoTokenizer(Module):
             if not exists(patch_mask):
                 min_mask_prob, max_mask_prob = self.per_image_patch_mask_prob
 
-                mask_prob = torch.empty(tokens.shape[:2], device = tokens.device).uniform_(min_mask_prob, max_mask_prob) # (b t)
+                mask_prob = empty(tokens.shape[:2], device = tokens.device).uniform_(min_mask_prob, max_mask_prob) # (b t)
 
                 mask_prob = repeat(mask_prob, 'b t -> b t vh vw', vh = tokens.shape[2], vw = tokens.shape[3])
                 patch_mask = torch.bernoulli(mask_prob) == 1.
@@ -3947,11 +4110,11 @@ class VideoTokenizer(Module):
             elif self.has_separate_flow_decoder and self.decoder_flow_steps > 1:
                 is_flow_step = random() < self.flow_decoder_train_prob
                 low, high = (1, self.decoder_flow_steps) if is_flow_step else (0, 1)
-                time_indices = torch.randint(low, high, (batch,), device = device)
+                time_indices = randint(low, high, (batch,), device = device)
             else:
-                time_indices = torch.randint(0, self.decoder_flow_steps, (batch,), device = device)
+                time_indices = randint(0, self.decoder_flow_steps, (batch,), device = device)
 
-            noise = torch.randn_like(video)
+            noise = randn_like(video)
 
             t = time_indices.float() / self.decoder_flow_steps
             t = pad_right_ndim_to(t, video.ndim)
@@ -4259,7 +4422,9 @@ class DynamicsWorldModel(Module):
         lapo_action_loss_weight = 1.,
         lapo_fdm_loss_weight = 1.,
         lapo_raw_latent_fdm_loss_weight = 1.,
-        tem_loss_weight = 1.
+        tem_loss_weight = 1.,
+        actor_spr = False,
+        actor_nlp_kwargs = dict()
     ):
         super().__init__()
         self.dim = dim
@@ -4318,7 +4483,7 @@ class DynamicsWorldModel(Module):
         self.num_video_views = num_video_views
 
         if self.video_has_multi_view:
-            self.view_emb = nn.Parameter(torch.randn(num_video_views, dim) * 1e-2)
+            self.view_emb = nn.Parameter(randn(num_video_views, dim) * 1e-2)
 
         # proprioception
 
@@ -4358,7 +4523,7 @@ class DynamicsWorldModel(Module):
         # register tokens
 
         self.num_register_tokens = num_register_tokens
-        self.register_tokens = Parameter(torch.randn(num_register_tokens, dim) * 1e-2)
+        self.register_tokens = Parameter(randn(num_register_tokens, dim) * 1e-2)
 
         # signal and step sizes
 
@@ -4389,7 +4554,7 @@ class DynamicsWorldModel(Module):
         self.eps_latent_pred = eps_latent_pred
 
         if self.should_pred_state:
-            self.state_pred_token = nn.Parameter(torch.randn(dim) * 1e-2)
+            self.state_pred_token = nn.Parameter(randn(dim) * 1e-2)
 
             self.to_state_pred = Sequential(
                 RMSNorm(dim),
@@ -4452,6 +4617,18 @@ class DynamicsWorldModel(Module):
             num_unembed_preds = multi_token_pred_len,
             squeeze_unembed_preds = False
         )
+
+        # next latent prediction for actor
+        
+        self.actor_spr = actor_spr
+        self.actor_spr_predictor = None
+        
+        if actor_spr:
+            self.actor_spr_predictor = ActorSPRWrapper(
+                self.action_embedder,
+                dim = dim * 4,
+                **actor_nlp_kwargs
+            )
 
         # latent autoregressive loss with sigreg
 
@@ -4739,22 +4916,32 @@ class DynamicsWorldModel(Module):
             *self.policy_head.parameters(),
             *self.action_embedder.unembed_parameters() # includes the unembed from the action-embedder
         ]
+
         if exists(self.actor_transformer):
             params.extend(self.actor_transformer.parameters())
+
+        if self.actor_spr:
+            params.extend(self.actor_spr_predictor.parameters())
+
         return params
 
     def value_head_parameters(self):
         params = list(self.value_head.parameters())
+
         if exists(self.critic_transformer):
             params.extend(self.critic_transformer.parameters())
+
         return params
 
     def image_encoder_parameters(self):
         params = []
+
         if exists(self.video_tokenizer):
             params.extend(self.video_tokenizer.parameters())
+
         if self.has_aux_image_encoder:
             params.extend(self.aux_image_encoder.parameters())
+
         return params
 
     def parameters(self, *args, **kwargs):
@@ -4830,7 +5017,7 @@ class DynamicsWorldModel(Module):
 
         tournament_size = max(2, ceil(num_selected * tournament_frac))
 
-        tournaments = torch.randn((num_children, num_selected), device = self.device).argsort(dim = -1)[:, :tournament_size]
+        tournaments = randn((num_children, num_selected), device = self.device).argsort(dim = -1)[:, :tournament_size]
 
         parent_ids = selected_fitness[tournaments].topk(2, dim = -1).indices # get top 2 winners as parents
 
@@ -4838,7 +5025,7 @@ class DynamicsWorldModel(Module):
 
         # crossover by random interpolation from parent1 to parent2
 
-        random_uniform_mix = torch.randn((num_children, dim_gene), device = self.device).sigmoid()
+        random_uniform_mix = randn((num_children, dim_gene), device = self.device).sigmoid()
 
         parent1, parent2 = parents.unbind(dim = 1)
         children = parent1.lerp(parent2, random_uniform_mix)
@@ -5187,7 +5374,7 @@ class DynamicsWorldModel(Module):
 
                 value_bins = self.value_head(value_embed)
                 bootstrap_value = self.reward_encoder.bins_to_scalar_value(value_bins)
-                values = torch.cat((values, bootstrap_value), dim = 1)
+                values = cat((values, bootstrap_value), dim = 1)
 
                 # pad everything out for the truncated state
 
@@ -5561,11 +5748,25 @@ class DynamicsWorldModel(Module):
 
         entropy_loss = masked_mean(entropy_loss, mask)
 
+        # maybe actor next latent prediction loss
+        
+        actor_spr_loss = self.zero
+
+        if self.actor_spr:
+            actor_spr_loss, _ = self.actor_spr_predictor(
+                policy_embed = policy_embed,
+                discrete_actions = discrete_actions,
+                continuous_actions = continuous_actions,
+                mask = mask
+            )
+            actor_spr_loss = actor_spr_loss
+
         # total policy loss
 
         total_policy_loss = (
             policy_loss +
-            entropy_loss * self.policy_entropy_weight
+            entropy_loss * self.policy_entropy_weight +
+            actor_spr_loss
         )
 
         # maybe take policy optimizer step
@@ -5775,7 +5976,7 @@ class DynamicsWorldModel(Module):
 
         # maybe return terminals
 
-        decoded_terminals = torch.zeros((batch_size,), device = self.device, dtype = torch.bool)
+        decoded_terminals = zeros((batch_size,), device = self.device, dtype = torch.bool)
         decoded_lens = full((batch_size,), time_steps, device = self.device)
 
         should_predict_terminals = return_terminals and self.predict_terminals
@@ -6267,7 +6468,7 @@ class DynamicsWorldModel(Module):
 
                 signal_levels = _randint(0, self.max_steps, (batch, time), device = device) // num_step_sizes[:, None] * num_step_sizes[:, None] # times are discretized to step sizes
             else:
-                step_sizes_log2 = torch.zeros((batch,), device = device).long() # zero because zero is equivalent to step size of 1
+                step_sizes_log2 = zeros((batch,), device = device).long() # zero because zero is equivalent to step size of 1
                 signal_levels = _randint(0, self.max_steps, (batch, time), device = device)
 
         # times is from 0 to 1
@@ -6416,7 +6617,7 @@ class DynamicsWorldModel(Module):
                     latent_ar_action_embed = pad_at_dim(latent_ar_action_embed, (0, 1), value = 0., dim = 1)
 
         elif self.action_embedder.has_actions:
-            action_tokens = torch.zeros_like(agent_tokens[:, :, 0:1])
+            action_tokens = zeros_like(agent_tokens[:, :, 0:1])
             next_action_tokens = action_tokens
 
         else:
@@ -6432,7 +6633,7 @@ class DynamicsWorldModel(Module):
                 aug_id = int(aug_id) + 1
 
             if not is_tensor(aug_id):
-                aug_id = torch.tensor(aug_id, device = device)
+                aug_id = tensor(aug_id, device = device)
 
             if aug_id.dtype == torch.bool:
                 aug_id = aug_id.long() + 1
@@ -6442,7 +6643,7 @@ class DynamicsWorldModel(Module):
             cfg_dropout_aug = default(cfg_dropout_aug, self.training)
 
             if cfg_dropout_aug:
-                drop_mask = torch.rand(batch, device = device) < self.aug_cfg_dropout_prob
+                drop_mask = rand(batch, device = device) < self.aug_cfg_dropout_prob
                 aug_id = torch.where(drop_mask, 0, aug_id)
 
             maybe_aug_token = self.aug_cond_embedding(aug_id)
@@ -6697,7 +6898,7 @@ class DynamicsWorldModel(Module):
             shortcut_flow_losses = F.mse_loss(shortcut_pred, shortcut_pred_target, reduction = 'none')
             shortcut_flow_losses = shortcut_flow_losses * shortcut_loss_weight
         else:
-            shortcut_flow_losses = torch.zeros_like(flow_losses)
+            shortcut_flow_losses = zeros_like(flow_losses)
 
         # loss weighting with their ramp function
 
@@ -6968,7 +7169,7 @@ class DynamicsWorldModel(Module):
 
             if self.latent_ar_action_conditioned:
                 if not exists(latent_ar_action_embed):
-                    latent_ar_action_embed = torch.zeros((*latents.shape[:2], self.action_embedder.dim), device = self.device, dtype = torch.float32)
+                    latent_ar_action_embed = zeros((*latents.shape[:2], self.action_embedder.dim), device = self.device, dtype = torch.float32)
 
                 cond_action = repeat(latent_ar_action_embed, 'b t d -> b t n d', n = space_source_hiddens.shape[2])
 

@@ -685,13 +685,15 @@ def test_cache_generate():
 @param('env_can_truncate', (False, True))
 @param('store_agent_embed', (False, True))
 @param('predict_terminals', (False, True))
+@param('actor_spr', (False, True))
 def test_online_rl(
     vectorized,
     objective,
     env_can_terminate,
     env_can_truncate,
     store_agent_embed,
-    predict_terminals
+    predict_terminals,
+    actor_spr
 ):
     from dreamer4.dreamer4 import DynamicsWorldModel, VideoTokenizer
 
@@ -721,7 +723,8 @@ def test_online_rl(
         pred_orig_latent = True,
         num_discrete_actions = 4,
         attn_dim_head = 16,
-        prob_shortcut_train = 0.9
+        prob_shortcut_train = 0.9,
+        actor_spr = actor_spr
     )
 
     from dreamer4.mocks import MockEnv
@@ -1844,3 +1847,51 @@ def test_space_pope(space_attention_use_pope):
     from einops import rearrange
     flex_dense = flex_block_mask.to_dense()
     assert torch.all(dense_mask == rearrange(flex_dense, '1 1 q k -> q k'))
+
+def test_actor_spr_wrapper():
+    from dreamer4.dreamer4 import ActionEmbedder, ActorSPRWrapper
+
+    # parameters
+    batch_size = 2
+    seq_len = 10
+    dim = 64
+    num_discrete_actions = 4
+    num_continuous_actions = 2
+
+    action_embedder = ActionEmbedder(
+        dim = dim,
+        num_discrete_actions = num_discrete_actions,
+        num_continuous_actions = num_continuous_actions,
+        can_unembed = True,
+        unembed_dim = dim * 4,
+        num_unembed_preds = 1
+    )
+
+    wrapper = ActorSPRWrapper(
+        action_embedder = action_embedder,
+        dim = dim * 4,
+        num_rollouts = 3,
+        spr_loss_weight = 1.0,
+        kl_loss_weight = 1.0,
+        sigreg_loss_weight = 0.05
+    )
+
+    policy_embed = torch.randn(batch_size, seq_len, dim * 4)
+    discrete_actions = torch.randint(0, num_discrete_actions, (batch_size, seq_len, 1))
+    continuous_actions = torch.randn(batch_size, seq_len, num_continuous_actions)
+    mask = torch.ones(batch_size, seq_len, dtype=torch.bool)
+
+    total_loss, losses = wrapper(
+        policy_embed=policy_embed,
+        discrete_actions=discrete_actions,
+        continuous_actions=continuous_actions,
+        mask=mask
+    )
+
+    assert total_loss.ndim == 0
+    assert total_loss.item() >= 0
+
+    spr_loss, kl_loss, sigreg_loss = losses
+    assert spr_loss.item() >= 0
+    assert kl_loss.item() >= 0
+    assert sigreg_loss.item() >= 0
