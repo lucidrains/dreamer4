@@ -1244,7 +1244,7 @@ class ActionEmbedder(Module):
             tgt_dist = MultiCategorical(tgt_logits, use_parallel_multi_discrete = True)
 
             discrete_kl = src_dist.kl_div(tgt_dist)
-            
+
             if reduce_across_num_actions:
                 discrete_kl = discrete_kl.sum(dim = -1)
 
@@ -2102,10 +2102,10 @@ class ActorSPRWrapper(Module):
             )
 
             discrete_kl, cont_kl = frozen_action_embedder.kl_div(
-                (pred_discrete_logits, pred_cont_params),
-                (target_discrete_logits, target_cont_params)
+                (target_discrete_logits, target_cont_params),
+                (pred_discrete_logits, pred_cont_params)
             )
-            
+
             step_kl = self.zero
 
             if exists(discrete_kl):
@@ -4619,10 +4619,10 @@ class DynamicsWorldModel(Module):
         )
 
         # next latent prediction for actor
-        
+
         self.actor_spr = actor_spr
         self.actor_spr_predictor = None
-        
+
         if actor_spr:
             self.actor_spr_predictor = ActorSPRWrapper(
                 self.action_embedder,
@@ -5749,7 +5749,7 @@ class DynamicsWorldModel(Module):
         entropy_loss = masked_mean(entropy_loss, mask)
 
         # maybe actor next latent prediction loss
-        
+
         actor_spr_loss = self.zero
 
         if self.actor_spr:
