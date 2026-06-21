@@ -37,7 +37,7 @@ from assoc_scan import AssocScan
 
 from h_net_dynamic_chunking import HNet
 
-from PoPE_pytorch import PoPE, flash_attn_with_pope
+from PoPE_pytorch import PoPE, AxialPoPE, flash_attn_with_pope
 
 from discrete_continuous_embed_readout import MultiCategorical, Readout
 from discrete_continuous_embed_readout.discrete_continuous_embed_readout import BetaDist, rescale
@@ -1536,8 +1536,8 @@ def special_token_mask(q, k, seq_len, num_tokens, special_attend_only_itself = F
 
     is_special_start_index = seq_len - num_tokens
 
-    q_is_special = q >= is_special_start_index
-    k_is_special = k >= is_special_start_index
+    q_is_special = bq >= is_special_start_index
+    k_is_special = bk >= is_special_start_index
 
     if special_attend_only_itself:
         out = ~(q_is_special & ~k_is_special) # modality attends to everything, but latent can only attend to itself (proposed attention pattern for encoder of video tokenizer)
@@ -1737,6 +1737,8 @@ class Attention(Module):
         return_intermediates = False,
         rotary_pos_emb = None,
         pope_pos_emb = None,
+        pope_pos_emb_indices = None,
+        causal = False,
         residual_values = None,  # (b n h d)
         attend_fn: Callable | None = None
     ):
@@ -1799,7 +1801,7 @@ class Attention(Module):
         # attention
 
         if exists(pope_pos_emb):
-            out = flash_attn_with_pope(q, k, v, pos_emb = pope_pos_emb, causal = True, head_dimension_at_first = True)
+            out = flash_attn_with_pope(q, k, v, pos_emb = pope_pos_emb, pope_pos_emb_indices = pope_pos_emb_indices, causal = causal, head_dimension_at_first = True)
         else:
             attend_fn = default(attend_fn, naive_attend)
             out = attend_fn(q, k, v)
@@ -2363,6 +2365,7 @@ class AxialSpaceTimeTransformer(Module):
         value_residual = True,               # https://arxiv.org/abs/2410.17897 - but with learned mixing from OSS
         rnn_time = False,
         time_attention_use_pope = False,
+        space_attention_use_pope = False,
         use_attn_pool = True,
         mot_temporal = False,
         h_net_layer: int | None = None,
@@ -2381,13 +2384,16 @@ class AxialSpaceTimeTransformer(Module):
 
         # time rotary embedding
 
-        self.time_attention_use_pope = time_attention_use_pope
+        query_heads = attn_kwargs.get('query_heads', attn_heads)
 
-        if time_attention_use_pope:
-            query_heads = attn_kwargs.get('query_heads', attn_heads)
-            self.time_rotary = PoPE(attn_dim_head, heads = query_heads)
-        else:
-            self.time_rotary = Rotary1D(attn_dim_head)
+        self.time_attention_use_pope = time_attention_use_pope
+        self.time_rotary = PoPE(attn_dim_head, heads = query_heads) if time_attention_use_pope else Rotary1D(attn_dim_head)
+
+        self.space_attention_use_pope = space_attention_use_pope
+
+        self.space_rotary = None
+        if space_attention_use_pope:
+            self.space_rotary = AxialPoPE(attn_dim_head, heads = query_heads, axial_dims = (attn_dim_head // 2, attn_dim_head // 2))
 
         # project initial for value residuals
 
@@ -2587,6 +2593,16 @@ class AxialSpaceTimeTransformer(Module):
 
         time_pos_emb = self.time_rotary(time, offset = token_count)
 
+        space_pos_emb = None
+        space_pope_pos_emb_indices = None
+
+        if self.space_attention_use_pope:
+            assert exists(space_height) and exists(space_width), 'space_height and space_width must be known to use space AxialPoPE'
+            space_pos_emb = self.space_rotary((space_height, space_width))
+
+            if num_spatial_special > 0:
+                space_pope_pos_emb_indices = torch.arange(space_height * space_width, device = device)
+
         # value residual
 
         residual_values = None
@@ -2646,9 +2662,20 @@ class AxialSpaceTimeTransformer(Module):
 
             attend_fn = time_attend if layer_is_time else space_attend
 
-            is_pope = layer_is_time and self.time_attention_use_pope
-            layer_rotary_pos_emb = time_pos_emb if layer_is_time and not is_pope else None
-            layer_pope_pos_emb = time_pos_emb if is_pope else None
+            is_time_pope = layer_is_time and self.time_attention_use_pope
+            is_space_pope = not layer_is_time and self.space_attention_use_pope
+
+            layer_rotary_pos_emb = time_pos_emb if layer_is_time and not is_time_pope else None
+
+            layer_pope_pos_emb = None
+            layer_pope_pos_emb_indices = None
+
+            if is_time_pope:
+                layer_pope_pos_emb = time_pos_emb
+
+            if is_space_pope:
+                layer_pope_pos_emb = space_pos_emb
+                layer_pope_pos_emb_indices = space_pope_pos_emb_indices
 
             # maybe past kv cache
 
@@ -2663,6 +2690,8 @@ class AxialSpaceTimeTransformer(Module):
             attn_kwargs = dict(
                 rotary_pos_emb = layer_rotary_pos_emb,
                 pope_pos_emb = layer_pope_pos_emb,
+                pope_pos_emb_indices = layer_pope_pos_emb_indices,
+                causal = layer_is_time,
                 attend_fn = attend_fn,
                 kv_cache = maybe_kv_cache,
                 residual_values = layer_residual_values,
@@ -3062,6 +3091,7 @@ class VideoDecoderNetwork(Module):
         moss_kwargs,
         decoder_moss_layers,
         time_attention_use_pope,
+        space_attention_use_pope,
         image_height = None,
         image_width = None
     ):
@@ -3281,6 +3311,7 @@ class VideoTokenizer(Module):
         latent_sigreg_loss_kwargs = dict(num_slices = 256),
         latent_consistency_loss_weight = 0.,
         time_attention_use_pope = False,
+        space_attention_use_pope = False,
         decoder_flow_times_beta_alpha = 1.,
         decoder_flow_times_beta_beta = 1.,
         h_net_layer: int | None = None,
@@ -3429,6 +3460,7 @@ class VideoTokenizer(Module):
             space_width = num_patch_width,
             final_norm = True,
             time_attention_use_pope = time_attention_use_pope,
+            space_attention_use_pope = space_attention_use_pope,
             mot_temporal = mot_temporal,
             rnn_time = use_time_rnn,
             h_net_layer = h_net_layer,
@@ -3473,6 +3505,7 @@ class VideoTokenizer(Module):
             moss_kwargs = moss_kwargs,
             decoder_moss_layers = decoder_moss_layers,
             time_attention_use_pope = time_attention_use_pope,
+            space_attention_use_pope = space_attention_use_pope,
             image_height = image_height,
             image_width = image_width
         )

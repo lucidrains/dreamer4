@@ -1,6 +1,6 @@
 [project]
 name = "dreamer4"
-version = "0.12.1"
+version = "0.12.2"
 description = "Dreamer4 - PyTorch"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -35,7 +35,7 @@ dependencies = [
     "ema-pytorch",
     "hl-gauss-pytorch",
     "h-net-dynamic-chunking>=0.5.12",
-    "PoPE_pytorch>=0.1.1",
+    "PoPE_pytorch>=0.2.1",
     "torch>=2.4",
     "torch-einops-utils>=0.1.2",
     "torchvision",

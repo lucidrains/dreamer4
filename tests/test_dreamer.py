@@ -1791,3 +1791,56 @@ def test_separate_flow_decoder(
     latents = tokenizer(video, return_latents = True)
     decoded_video = tokenizer.decode(latents, height=32, width=32)
     assert decoded_video.shape == video.shape
+
+@param('space_attention_use_pope', (False, True))
+def test_space_pope(space_attention_use_pope):
+    from dreamer4.dreamer4 import VideoTokenizer, special_token_mask, block_mask_special_tokens_right
+    import torch
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    try:
+        from torch.nn.attention.flex_attention import create_block_mask
+        has_flex = True
+    except ImportError:
+        has_flex = False
+
+    tokenizer = VideoTokenizer(
+        dim = 16,
+        dim_latent = 16,
+        patch_size = 4,
+        num_latent_tokens = 4,
+        channels = 3,
+        image_height = 16,
+        image_width = 16,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        time_block_every = 1,
+        attn_dim_head = 16,
+        attn_heads = 2,
+        lpips_loss_weight = 0.,
+        space_attention_use_pope = space_attention_use_pope
+    ).to(device)
+
+    # test forward
+    video = torch.randn(1, 3, 2, 16, 16, device = device)
+    loss = tokenizer(video)
+    assert loss.numel() == 1
+
+    # if checking pope mask
+    if not space_attention_use_pope or not has_flex:
+        return
+
+    space_seq_len = (16 // 4) ** 2 + 4
+    num_latents = 4
+
+    q_seq = torch.arange(space_seq_len, device = device)
+    k_seq = torch.arange(space_seq_len, device = device)
+    dense_mask = special_token_mask(q_seq, k_seq, space_seq_len, num_latents, False)
+
+    block_mask_fn = block_mask_special_tokens_right(space_seq_len, num_latents, False)
+    flex_block_mask = create_block_mask(block_mask_fn, 1, 1, space_seq_len, space_seq_len, device = device)
+
+    from einops import rearrange
+    flex_dense = flex_block_mask.to_dense()
+    assert torch.all(dense_mask == rearrange(flex_dense, '1 1 q k -> q k'))
