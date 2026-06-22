@@ -118,7 +118,8 @@ def main(
     max_pixel_shift = 3,
     aug_prob = 0.5,
     separate_flow_decoder = False,
-    flow_decoder_train_prob = 0.5
+    flow_decoder_train_prob = 0.5,
+    encode_temporal_diff = False
 ):
     # clear old artifacts
 
@@ -210,7 +211,8 @@ def main(
         latent_init_patch_size = latent_init_patch_size,
         has_aug_conditioning = use_pixel_shift_aug,
         separate_flow_decoder = separate_flow_decoder,
-        flow_decoder_train_prob = flow_decoder_train_prob
+        flow_decoder_train_prob = flow_decoder_train_prob,
+        encode_temporal_diff = encode_temporal_diff
     )
 
     # trainer

@@ -48,6 +48,7 @@ from torch_einops_utils import (
     maybe,
     align_dims_left,
     pad_at_dim,
+    pad_left_at_dim,
     pad_right_at_dim,
     pad_right_at_dim_to,
     pad_right_ndim_to,
@@ -3491,12 +3492,14 @@ class VideoTokenizer(Module):
         has_aug_conditioning = False,
         aug_cfg_dropout_prob = 0.1,
         separate_flow_decoder = False,
-        flow_decoder_train_prob = 0.5
+        flow_decoder_train_prob = 0.5,
+        encode_temporal_diff = False
     ):
         super().__init__()
 
         self.patch_size = patch_size
         self.channels = channels
+        self.encode_temporal_diff = encode_temporal_diff
         self.dim = dim
         self.dim_latent = dim_latent
         self.num_latent_tokens = num_latent_tokens
@@ -3534,15 +3537,17 @@ class VideoTokenizer(Module):
 
         self.use_shifted_patch_tokenization = use_shifted_patch_tokenization
 
+        encoder_channels = channels * (2 if encode_temporal_diff else 1)
+
         def patch_to_tokens_fn(p):
             return Sequential(
                 Rearrange('b c t (h p1) (w p2) -> b t h w (p1 p2 c)', p1 = p, p2 = p),
-                Linear(channels * p ** 2, dim),
+                Linear(encoder_channels * p ** 2, dim),
                 LayerNormNoBias(dim)
             )
 
         if use_shifted_patch_tokenization:
-            self.patch_to_tokens = ShiftedPatchTokenization(dim = dim, patch_size = patch_size, channels = channels, **spt_kwargs)
+            self.patch_to_tokens = ShiftedPatchTokenization(dim = dim, patch_size = patch_size, channels = encoder_channels, **spt_kwargs)
         else:
             self.patch_to_tokens = patch_to_tokens_fn(patch_size)
 
@@ -3939,6 +3944,13 @@ class VideoTokenizer(Module):
         batch, _, time, height, width = video.shape
         patch_size, device = self.patch_size, video.device
 
+        video_input = video
+
+        if self.encode_temporal_diff and not is_image:
+            diff = video[:, :, 1:] - video[:, :, :-1]
+            diff = pad_left_at_dim(diff, 1, dim = 2)
+            video_input = torch.cat((video, diff), dim = 1)
+
         assert divisible_by(height, patch_size) and divisible_by(width, patch_size)
 
         # augmentation conditioning - process once, used by both encoder and decoder
@@ -3976,12 +3988,12 @@ class VideoTokenizer(Module):
         next_spt_cache = None
 
         if self.use_shifted_patch_tokenization:
-            tokens, next_spt_cache = self.patch_to_tokens(video, time_cache = spt_cache, return_time_cache = True)
+            tokens, next_spt_cache = self.patch_to_tokens(video_input, time_cache = spt_cache, return_time_cache = True)
         else:
-            tokens = self.patch_to_tokens(video)
+            tokens = self.patch_to_tokens(video_input)
 
         if self.has_latent_init_patch:
-            latent_init_tokens = self.latent_init_patch_to_tokens(video)
+            latent_init_tokens = self.latent_init_patch_to_tokens(video_input)
         else:
             latent_init_tokens = tokens
 

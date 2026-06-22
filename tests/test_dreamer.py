@@ -1895,3 +1895,30 @@ def test_actor_spr_wrapper():
     assert spr_loss.item() >= 0
     assert kl_loss.item() >= 0
     assert sigreg_loss.item() >= 0
+
+@param('encode_temporal_diff', (False, True))
+def test_temporal_diff(encode_temporal_diff):
+    from dreamer4.dreamer4 import VideoTokenizer
+
+    tokenizer = VideoTokenizer(
+        16,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        time_block_every = 1,
+        dim_latent = 16,
+        patch_size = 16,
+        attn_dim_head = 8,
+        num_latent_tokens = 4,
+        lpips_loss_weight = 0.,
+        encode_temporal_diff = encode_temporal_diff
+    )
+
+    video = torch.randn(2, 3, 4, 32, 32)
+
+    loss, (losses, recon_video, *rest) = tokenizer(video, return_intermediates = True)
+    loss.backward()
+
+    latents = tokenizer.tokenize(video)
+    out = tokenizer.decode(latents, height = 32, width = 32)
+
+    assert out.shape == video.shape
