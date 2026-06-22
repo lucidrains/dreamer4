@@ -662,7 +662,13 @@ class LatentAutoregressiveLoss(Module):
             net = nn.Sequential(
                 project_in,
                 norm,
-                MLP(dim, dim * 4, dim, activation = nn.SiLU())
+                create_mlp(
+                    dim * 4,
+                    depth = 1,
+                    dim_in = dim,
+                    dim_out = dim,
+                    activation = nn.SiLU(),
+                )
             )
 
         self.net = net
@@ -3726,6 +3732,7 @@ class VideoTokenizer(Module):
                 use_rmsnorm = latent_ar_use_rmsnorm,
                 sigreg_loss_kwargs = latent_ar_sigreg_loss_kwargs,
                 sigreg_num_subspaces = latent_ar_sigreg_num_subspaces,
+                predict_residual = True,
                 **latent_ar_kwargs
             )
 
