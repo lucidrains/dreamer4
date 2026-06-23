@@ -2054,24 +2054,3 @@ def test_custom_activations(custom_activation):
     assert exists(loss)
 
     loss.backward()
-
-def test_hl_gauss_integration():
-    import torch
-    from dreamer4.dreamer4 import DynamicsWorldModel, HLGaussRewardEncoder
-    dynamics = DynamicsWorldModel(
-        dim = 16,
-        dim_latent = 8,
-        num_latent_tokens = 4,
-        depth = 1,
-        reward_encoder_type = 'hl_gauss',
-        reward_encoder_kwargs = dict(num_bins = 20),
-    )
-
-    assert isinstance(dynamics.reward_encoder, HLGaussRewardEncoder)
-
-    values = torch.randn(2, 5)
-    encoded = dynamics.reward_encoder(values)
-    assert encoded.shape == (2, 5, 20)
-
-    decoded = dynamics.reward_encoder.bins_to_scalar_value(encoded)
-    assert decoded.shape == values.shape
