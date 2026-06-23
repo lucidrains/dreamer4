@@ -3,6 +3,8 @@ data/
 logs_*/
 
 logs/
+runs/
+checkpoints_halfcheetah_imagination/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

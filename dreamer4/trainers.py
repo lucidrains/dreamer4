@@ -400,15 +400,16 @@ class VideoTokenizerTrainer(Module):
                     video_height, video_width = video.shape[-2:]
 
                     if self.model.has_flow:
-                        latents = sample_model.tokenize(video)
+                        latents = sample_model.tokenize(video, aug_id = aug_id)
                         recon_video, all_pred_videos = sample_model.decode(
                             latents,
                             height = video_height,
                             width = video_width,
+                            aug_id = aug_id,
                             return_recons_across_steps = True
                         )
                     else:
-                        _, (_, recon_video) = sample_model(video, return_intermediates = True)
+                        _, (_, recon_video) = sample_model(video, return_intermediates = True, aug_id = aug_id)
                         all_pred_videos = [recon_video]
 
                 recon_video = recon_video.clamp(0., 1.)
@@ -792,6 +793,9 @@ class BehaviorCloneTrainer(Module):
         is_autoregressive = exists(self.sample_autoregressive_actions) and self.sample_autoregressive_actions
 
         if not is_tensor(batch_data):
+            if 'aug_id' in batch_data:
+                kwargs['aug_id'] = batch_data['aug_id'][:self.sample_batch_size]
+
             action_idx = max(0, self.sample_prompt_frames - 2)
             for action_key in ('continuous_actions', 'discrete_actions'):
                 if action_key not in batch_data:

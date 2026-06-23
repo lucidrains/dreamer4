@@ -1,7 +1,9 @@
 from dreamer4.dreamer4 import (
     VideoTokenizer,
     DynamicsWorldModel,
-    AxialSpaceTimeTransformer
+    AxialSpaceTimeTransformer,
+    ReLUSquared,
+    relu_squared
 )
 
 
