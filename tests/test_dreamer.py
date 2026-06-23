@@ -1922,3 +1922,80 @@ def test_temporal_diff(encode_temporal_diff):
     out = tokenizer.decode(latents, height = 32, width = 32)
 
     assert out.shape == video.shape
+
+@param('custom_activation', (False, True))
+def test_custom_activations(custom_activation):
+    from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
+
+    act = 'relu_squared' if custom_activation else 'silu'
+    ff_kwargs = dict(activation=act)
+
+    tokenizer = VideoTokenizer(
+        dim=16,
+        encoder_depth=1,
+        decoder_depth=1,
+        time_block_every=1,
+        dim_latent=16,
+        patch_size=16,
+        num_latent_tokens=4,
+        decoder_pos_emb_mlp_activation=act,
+        ff_kwargs=ff_kwargs
+    )
+
+    world_model = DynamicsWorldModel(
+        dim=16,
+        video_tokenizer=tokenizer,
+        dim_latent=16,
+        max_steps=16,
+        num_tasks=2,
+        num_latent_tokens=4,
+        depth=1,
+        num_spatial_tokens=2,
+        num_discrete_actions=4,
+        spatial_pre_encoder_depth=1,
+        action_pre_encoder_depth=1,
+        ssl_lapo=True,
+        ssl_tem=True,
+        lapo_kwargs=dict(
+            latent_action_embed_mlp_activation=act,
+            pred_next_state_embed_mlp_activation=act,
+            pred_raw_latent_mlp_activation=act
+        ),
+        tem_kwargs=dict(
+            learned_relative_encode_mlp_activation=act,
+            init_hiddens_mlp_activation=act,
+            sensory_encoder_mlp_activation=act,
+            sensory_decoder_mlp_activation=act
+        ),
+        actor_spr=True,
+        actor_nlp_kwargs=dict(
+            dynamics_mlp_activation=act
+        ),
+        latent_ar=True,
+        latent_ar_layer=0,
+        latent_ar_kwargs=dict(
+            mlp_activation=act
+        ),
+        policy_head_mlp_activation=act,
+        value_head_mlp_activation=act,
+        agent_state_pred_mlp_activation=act,
+        state_terminal_pred_mlp_activation=act,
+        ff_kwargs=ff_kwargs
+    )
+
+    assert exists(tokenizer)
+    assert exists(world_model)
+
+    video = torch.randn(1, 3, 2, 32, 32)
+    actions = torch.randint(0, 4, (1, 2, 1))
+
+    latents = tokenizer(video, return_latents=True)
+    assert exists(latents)
+
+    loss = world_model(
+        video=video,
+        discrete_actions=actions
+    )
+    assert exists(loss)
+
+    loss.backward()

@@ -445,6 +445,27 @@ def create_multi_token_prediction_targets(
 
     return out, mask
 
+# activations
+
+from x_mlps_pytorch.activations import ReluSquared, SugarBSiLU
+
+Activation = str | Module
+
+ACTIVATIONS = dict(
+    silu = nn.SiLU,
+    relu_squared = ReluSquared,
+    sugar_bsilu = SugarBSiLU,
+    relu = nn.ReLU,
+    gelu = nn.GELU,
+)
+
+def get_activation(act: Activation) -> Module:
+    if isinstance(act, str):
+        assert act in ACTIVATIONS, f'activation {act} not found in {list(ACTIVATIONS.keys())}'
+        return ACTIVATIONS[act]()
+
+    return act
+
 # FIRE - Frobenius-Isometry Reinitialization
 # Han et al. https://arxiv.org/abs/2602.08040
 # Shrink and perturb - Ash et al. https://arxiv.org/abs/1910.08475
@@ -643,7 +664,8 @@ class LatentAutoregressiveLoss(Module):
         loss_type: Literal['smooth_l1', 'cosine'] = 'smooth_l1',
         detach_target = True,
         predict_residual = False,
-        net: Module | None = None
+        net: Module | None = None,
+        mlp_activation: Activation = 'silu'
     ):
         super().__init__()
         dim_in = default(dim_in, dim)
@@ -667,7 +689,7 @@ class LatentAutoregressiveLoss(Module):
                     depth = 1,
                     dim_in = dim,
                     dim_out = dim,
-                    activation = nn.SiLU(),
+                    activation = get_activation(mlp_activation),
                 )
             )
 
@@ -1848,19 +1870,24 @@ class Attention(Module):
 
 # feedforward
 
-class SwiGLUFeedforward(Module):
+class FeedForward(Module):
     def __init__(
         self,
         dim,
         expansion_factor = 4,
-        pre_rmsnorm = True
+        pre_rmsnorm = True,
+        activation: Activation = 'silu',
+        use_glu: bool | None = None
     ):
         super().__init__()
         self.norm = RMSNorm(dim) if pre_rmsnorm else Identity()
 
-        dim_inner = int(dim * expansion_factor * 2 / 3)
+        self.activation = get_activation(activation)
 
-        self.proj_in = Linear(dim, dim_inner * 2)
+        self.use_glu = default(use_glu, activation in {'silu', 'gelu'})
+        dim_inner = int(dim * expansion_factor * (2 / 3 if self.use_glu else 1))
+
+        self.proj_in = Linear(dim, dim_inner * (2 if self.use_glu else 1))
         self.proj_out = Linear(dim_inner, dim)
 
     def muon_parameters(self):
@@ -1872,8 +1899,13 @@ class SwiGLUFeedforward(Module):
     def forward(self, x):
         x = self.norm(x)
 
-        x, gates = self.proj_in(x).chunk(2, dim = -1)
-        x = x * F.gelu(gates)
+        x = self.proj_in(x)
+
+        if self.use_glu:
+            x, gates = x.chunk(2, dim = -1)
+            x = x * self.activation(gates)
+        else:
+            x = self.activation(x)
 
         return self.proj_out(x)
 
@@ -1987,7 +2019,8 @@ class ActorSPRWrapper(Module):
         dynamics_hidden_dim = None,
         dynamics_num_layers = 3,
         sigreg_loss_weight = 0.,
-        sigreg_loss_kwargs: dict = dict()
+        sigreg_loss_kwargs: dict = dict(),
+        dynamics_mlp_activation: Activation = 'silu'
     ):
         super().__init__()
         self.action_embedder = action_embedder
@@ -2152,6 +2185,9 @@ class LAPO(Module):
         expansion_factor = 4,
         pred_actions = True,
         use_fdm = True,
+        latent_action_embed_mlp_activation: Activation = 'silu',
+        pred_next_state_embed_mlp_activation: Activation = 'silu',
+        pred_raw_latent_mlp_activation: Activation = 'silu'
     ):
         super().__init__()
         assert num_discrete_actions > 0 or num_continuous_actions > 0
@@ -2163,7 +2199,7 @@ class LAPO(Module):
         # state + next state projected embeddings -> latent action - IDM
 
         self.state_norm = RMSNorm(dim_embed)
-        self.to_latent_action_embed = MLP(dim_embed * 2, dim_mlp_hidden, dim_latent_action, activation = nn.SiLU())
+        self.to_latent_action_embed = MLP(dim_embed * 2, dim_mlp_hidden, dim_latent_action, activation = get_activation(latent_action_embed_mlp_activation))
 
         # simplicial embed for action bottleneck
 
@@ -2178,7 +2214,7 @@ class LAPO(Module):
         # forward dynamics model - projected space
 
         self.use_fdm = use_fdm
-        self.to_pred_next_state_embed = MLP(dim_embed + dim_latent_action, dim_mlp_hidden, dim_project, activation = nn.SiLU()) if use_fdm else None
+        self.to_pred_next_state_embed = MLP(dim_embed + dim_latent_action, dim_mlp_hidden, dim_project, activation = get_activation(pred_next_state_embed_mlp_activation)) if use_fdm else None
 
         # forward dynamics model - raw latent space
 
@@ -2187,7 +2223,7 @@ class LAPO(Module):
 
         if self.has_raw_latent_fdm:
             dim_raw_latent_concat = dim_raw_latent * num_raw_latent_tokens
-            self.to_pred_raw_latent = MLP(dim_embed + dim_latent_action, dim_mlp_hidden, dim_mlp_hidden, dim_raw_latent_concat, activation = nn.SiLU())
+            self.to_pred_raw_latent = MLP(dim_embed + dim_latent_action, dim_mlp_hidden, dim_mlp_hidden, dim_raw_latent_concat, activation = get_activation(pred_raw_latent_mlp_activation))
             self.num_raw_latent_tokens = num_raw_latent_tokens
             self.dim_raw_latent = dim_raw_latent
 
@@ -2201,7 +2237,7 @@ class LAPO(Module):
     ):
         # pool spatial tokens
 
-        state_embed = reduce(space_tokens, 'b t n d -> b t d', 'mean')
+        state_embed = reduce(space_tokens, 'b t ... d -> b t d', 'mean')
 
         # consecutive state pairs
 
@@ -2265,7 +2301,11 @@ class TEM(Module):
         dim_head = 64,
         talking_heads = True,
         first_state_as_init_hidden = True,
-        learn_relative_actions = False
+        learn_relative_actions = False,
+        learned_relative_encode_mlp_activation: Activation = 'silu',
+        init_hiddens_mlp_activation: Activation = 'silu',
+        sensory_encoder_mlp_activation: Activation = 'silu',
+        sensory_decoder_mlp_activation: Activation = 'silu'
     ):
         super().__init__()
 
@@ -2282,7 +2322,7 @@ class TEM(Module):
             dim_action_embed * 2,
             dim_action_embed * 2,
             dim_action_embed,
-            activation = nn.SiLU()
+            activation = get_activation(learned_relative_encode_mlp_activation)
         ) if learn_relative_actions else None
 
         if first_state_as_init_hidden:
@@ -2290,7 +2330,7 @@ class TEM(Module):
                 dim_encoded_sensory,
                 dim_structure,
                 dim_structure,
-                activation = nn.SiLU()
+                activation = get_activation(init_hiddens_mlp_activation)
             )
         else:
             self.init_hiddens = Parameter(randn(1, 1, dim_structure) * 1e-2)
@@ -2301,7 +2341,7 @@ class TEM(Module):
             dim_raw_latent,
             dim_structure,
             dim_encoded_sensory,
-            activation = nn.SiLU()
+            activation = get_activation(sensory_encoder_mlp_activation)
         )
 
         self.structural_norm = RMSNorm(dim_structure)
@@ -2356,7 +2396,7 @@ class TEM(Module):
             dim_structure,
             dim_structure,
             dim_raw_latent * num_raw_latent_tokens,
-            activation = nn.SiLU()
+            activation = get_activation(sensory_decoder_mlp_activation)
         )
 
         self.register_buffer('zero', tensor(0.), persistent = False)
@@ -2371,7 +2411,7 @@ class TEM(Module):
 
         # pool and encode spatial latents
 
-        pooled_latents = reduce(raw_latents, 'b t n d -> b t d', 'mean')
+        pooled_latents = reduce(raw_latents, 'b t ... d -> b t d', 'mean')
         encoded_sensory = self.sensory_encoder(pooled_latents)
 
         # path integration
@@ -2603,12 +2643,12 @@ class AxialSpaceTimeTransformer(Module):
             rearrange_from_attend = Rearrange('b s t ... -> b t s ...') if is_time_block else Identity()
 
             attn_block = Residual(Attention(dim = dim, heads = attn_heads, dim_head = attn_dim_head, value_residual = value_residual, **attn_kwargs))
-            ff_block = Residual(SwiGLUFeedforward(dim = dim, **ff_kwargs))
+            ff_block = Residual(FeedForward(dim = dim, **ff_kwargs))
 
             mot_block = None
             if is_time_block and self.mot_temporal:
                 special_attn_block = Residual(Attention(dim = dim, heads = attn_heads, dim_head = attn_dim_head, **attn_kwargs))
-                special_ff_block = Residual(SwiGLUFeedforward(dim = dim, **ff_kwargs))
+                special_ff_block = Residual(FeedForward(dim = dim, **ff_kwargs))
                 mot_block = ModuleList([special_attn_block, special_ff_block])
 
             layers.append(ModuleList([
@@ -2658,7 +2698,7 @@ class AxialSpaceTimeTransformer(Module):
 
         if self.should_special_cross_attend:
             self.final_special_cross_attn = Residual(Attention(dim = dim, heads = attn_heads, dim_head = attn_dim_head, pre_context_rmsnorm = True, **attn_kwargs))
-            self.final_special_ff = Residual(SwiGLUFeedforward(dim = dim, **ff_kwargs))
+            self.final_special_ff = Residual(FeedForward(dim = dim, **ff_kwargs))
 
         # hierarchical temporal transformer
 
@@ -2673,7 +2713,7 @@ class AxialSpaceTimeTransformer(Module):
         muon_params = []
 
         for m in self.modules():
-            if isinstance(m, (Attention, SwiGLUFeedforward)):
+            if isinstance(m, (Attention, FeedForward)):
                 muon_params.extend(m.muon_parameters())
 
         return muon_params
@@ -2770,7 +2810,7 @@ class AxialSpaceTimeTransformer(Module):
             assert exists(space_height) and exists(space_width), 'space_height and space_width must be known to use space AxialPoPE'
             space_pos_emb = self.space_rotary((space_height, space_width))
 
-            if num_spatial_special > 0:
+            if self.num_special_tokens > 0:
                 space_pope_pos_emb_indices = arange(space_height * space_width, device = device)
 
         # value residual
@@ -3024,7 +3064,8 @@ class CausalDepthwiseConv3d(Module):
     def __init__(
         self,
         dim,
-        kernel_size = 3
+        kernel_size = 3,
+        activation: Activation = 'silu'
     ):
         super().__init__()
         assert is_odd(kernel_size), 'kernel size must be odd'
@@ -3041,7 +3082,7 @@ class CausalDepthwiseConv3d(Module):
             groups = dim
         )
 
-        self.act = nn.SiLU()
+        self.act = get_activation(activation)
         self.proj = Linear(dim, dim)
 
     def forward(
@@ -3198,6 +3239,7 @@ class SlotAttention(Module):
         ff_mult = 4,
         num_slots = None,
         spatial_mix = False,
+        spatial_mixer_activation: Activation = 'silu',
         **kwargs
     ):
         super().__init__()
@@ -3212,11 +3254,11 @@ class SlotAttention(Module):
             self.spatial_mixer = Sequential(
                 RMSNorm(dim),
                 nn.Conv1d(num_slots, hidden_slots, 1),
-                nn.SiLU(),
+                get_activation(spatial_mixer_activation),
                 nn.Conv1d(hidden_slots, num_slots, 1)
             )
 
-        self.ff = SwiGLUFeedforward(
+        self.ff = FeedForward(
             dim = dim,
             expansion_factor = ff_mult,
             pre_rmsnorm = True
@@ -3262,6 +3304,9 @@ class VideoDecoderNetwork(Module):
         decoder_moss_layers,
         time_attention_use_pope,
         space_attention_use_pope,
+        full_spatial_attn = False,
+        decoder_pos_emb_mlp_activation: Activation = 'silu',
+        decoder_pos_mlp_depth = 2,
         image_height = None,
         image_width = None
     ):
@@ -3276,7 +3321,8 @@ class VideoDecoderNetwork(Module):
             dim_in = 2,
             dim = dim * 2,
             dim_out = dim,
-            depth = 2,
+            depth = decoder_pos_mlp_depth,
+            activation = get_activation(decoder_pos_emb_mlp_activation),
         )
 
         # slot attention
@@ -3336,7 +3382,9 @@ class VideoDecoderNetwork(Module):
             spatial_modules = moss_modules,
             space_height = num_patch_height,
             space_width = num_patch_width,
-            time_attention_use_pope = time_attention_use_pope
+            full_spatial_attn = full_spatial_attn,
+            time_attention_use_pope = time_attention_use_pope,
+            space_attention_use_pope = space_attention_use_pope
         )
 
     def muon_parameters(self):
@@ -3450,6 +3498,7 @@ class VideoTokenizer(Module):
         ff_kwargs: dict = dict(),
         decoder_pos_mlp_depth = 2,
         channels = 3,
+        decoder_pos_emb_mlp_activation: Activation = 'silu',
         per_image_patch_mask_prob = (0., 0.9), # probability of patch masking appears to be per image probabilities drawn uniformly between 0. and 0.9 - if you are a phd student and think i'm mistakened, please open an issue
         lpips_loss_network: Module | None = None,
         lpips_loss_weight = 0.2,
@@ -3678,8 +3727,11 @@ class VideoTokenizer(Module):
             has_aug_conditioning = has_aug_conditioning,
             moss_kwargs = moss_kwargs,
             decoder_moss_layers = decoder_moss_layers,
+            decoder_pos_emb_mlp_activation = decoder_pos_emb_mlp_activation,
+            decoder_pos_mlp_depth = decoder_pos_mlp_depth,
             time_attention_use_pope = time_attention_use_pope,
             space_attention_use_pope = space_attention_use_pope,
+            full_spatial_attn = decoder_full_spatial_attn,
             image_height = image_height,
             image_width = image_width
         )
@@ -4309,7 +4361,7 @@ class SelfFlow(Module):
 
         self.teacher_time_modifier_fn = teacher_time_modifier_fn
 
-        self.student_predict_head = SwiGLUFeedforward(dim = model.dim)
+        self.student_predict_head = FeedForward(dim = model.dim)
 
     def forward(
         self,
@@ -4438,12 +4490,18 @@ class DynamicsWorldModel(Module):
         ssl_tem = False,
         tem_first_state_as_init_hidden = True,
         tem_learn_relative_actions = False,
+        lapo_kwargs: dict = dict(),
+        tem_kwargs: dict = dict(),
         lapo_action_loss_weight = 1.,
         lapo_fdm_loss_weight = 1.,
         lapo_raw_latent_fdm_loss_weight = 1.,
         tem_loss_weight = 1.,
         actor_spr = False,
-        actor_nlp_kwargs = dict()
+        actor_nlp_kwargs = dict(),
+        policy_head_mlp_activation: Activation = 'silu',
+        agent_state_pred_mlp_activation: Activation = 'silu',
+        state_terminal_pred_mlp_activation: Activation = 'silu',
+        value_head_mlp_activation: Activation = 'silu'
     ):
         super().__init__()
         self.dim = dim
@@ -4612,7 +4670,8 @@ class DynamicsWorldModel(Module):
             dim_in = dim,
             dim = dim * 4,
             dim_out = dim * 4,
-            depth = policy_head_mlp_depth
+            depth = policy_head_mlp_depth,
+            activation = get_activation(policy_head_mlp_activation)
         )
 
         # aug conditioning
@@ -4692,7 +4751,8 @@ class DynamicsWorldModel(Module):
                     dim_in = dim_agent_state_in,
                     dim = dim_agent_state_in * 2,
                     dim_out = num_latent_tokens * dim_latent * 2,
-                    depth = 2
+                    depth = 2,
+                    activation = get_activation(agent_state_pred_mlp_activation)
                 ),
                 Rearrange('... (n d two) -> ... n d two', n = num_latent_tokens, two = 2)
             )
@@ -4734,7 +4794,8 @@ class DynamicsWorldModel(Module):
                     dim_in = dim_latent,
                     dim = dim_latent * 4,
                     dim_out = 1,
-                    **predict_terminal_mlp_kwargs
+                    **predict_terminal_mlp_kwargs,
+                    activation = get_activation(state_terminal_pred_mlp_activation)
                 ),
                 Rearrange('... 1 -> ...')
             )
@@ -4746,6 +4807,7 @@ class DynamicsWorldModel(Module):
             dim = dim * 4,
             dim_out = self.reward_encoder.num_bins,
             depth = value_head_mlp_depth,
+            activation = get_activation(value_head_mlp_activation)
         )
 
         # pre encoder and ssl modules
@@ -4798,6 +4860,7 @@ class DynamicsWorldModel(Module):
                 num_continuous_actions = num_continuous_actions,
                 pred_actions = lapo_pred_actions,
                 use_fdm = lapo_use_fdm,
+                **lapo_kwargs
             )
 
         self.has_tem = ssl_tem
@@ -4808,7 +4871,8 @@ class DynamicsWorldModel(Module):
                 dim_raw_latent = dim_latent,
                 num_raw_latent_tokens = num_latent_tokens,
                 first_state_as_init_hidden = tem_first_state_as_init_hidden,
-                learn_relative_actions = tem_learn_relative_actions
+                learn_relative_actions = tem_learn_relative_actions,
+                **tem_kwargs
             )
 
         # efficient axial space / time transformer

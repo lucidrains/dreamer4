@@ -166,6 +166,7 @@ class TransformerPPOAgent(nn.Module):
         latent_ar_sigreg_num_subspaces = None,
         mot_temporal = False,
         actor_spr = False,
+        activation = 'silu',
     ):
         super().__init__()
         self.use_image_input = use_image_input
@@ -246,6 +247,26 @@ class TransformerPPOAgent(nn.Module):
             latent_ar_sigreg_num_subspaces = latent_ar_sigreg_num_subspaces,
             mot_temporal = mot_temporal,
             actor_spr = actor_spr,
+            policy_head_mlp_activation = activation,
+            value_head_mlp_activation = activation,
+            agent_state_pred_mlp_activation = activation,
+            lapo_kwargs = dict(
+                latent_action_embed_mlp_activation = activation,
+                pred_next_state_embed_mlp_activation = activation,
+                pred_raw_latent_mlp_activation = activation
+            ),
+            tem_kwargs = dict(
+                learned_relative_encode_mlp_activation = activation,
+                init_hiddens_mlp_activation = activation,
+                sensory_encoder_mlp_activation = activation,
+                sensory_decoder_mlp_activation = activation
+            ),
+            actor_nlp_kwargs = dict(
+                spatial_pooling_mlp_activation = activation
+            ),
+            latent_ar_kwargs = dict(
+                predict_next_latent_mlp_activation = activation
+            )
         )
 
     @property
@@ -330,6 +351,7 @@ def main(
     sigreg_num_subspaces = 1,
     mot_temporal = False,
     actor_spr = False,
+    activation = 'silu',
     experiment_name = 'dreamer4',
     run_name = None,
 ):
@@ -385,6 +407,7 @@ def main(
         latent_ar_sigreg_num_subspaces = sigreg_num_subspaces,
         mot_temporal = mot_temporal,
         actor_spr = actor_spr,
+        activation = activation,
     ).to(device)
 
     # optimizers

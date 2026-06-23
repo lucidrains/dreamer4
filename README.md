@@ -16,6 +16,8 @@ Implementation of Danijar's [latest iteration](https://arxiv.org/abs/2509.24527v
 
 - `@njha` in discord channel for finding an issue with the flow loss weight for the dynamics model!
 
+- [@CarsonBurke](https://github.com/CarsonBurke) for his [pull request](https://github.com/lucidrains/dreamer4/pull/25) enabling configurable activations!
+
 ## Install
 
 ```bash
