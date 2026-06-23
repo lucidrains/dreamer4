@@ -18,6 +18,8 @@ Implementation of Danijar's [latest iteration](https://arxiv.org/abs/2509.24527v
 
 - [@CarsonBurke](https://github.com/CarsonBurke) for his [pull request](https://github.com/lucidrains/dreamer4/pull/25) enabling configurable activations!
 
+- [@CarsonBurke](https://github.com/CarsonBurke) for adding the [HL-Gauss reward encoder](https://github.com/lucidrains/dreamer4/pull/28)!
+
 ## Install
 
 ```bash
