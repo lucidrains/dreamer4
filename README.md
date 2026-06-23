@@ -14,6 +14,10 @@ Implementation of Danijar's [latest iteration](https://arxiv.org/abs/2509.24527v
 
 - [@CarsonBurke](https://github.com/CarsonBurke) for identifying and contributing bug fixes!
 
+- `@njha` in discord channel for finding an issue with the flow loss weight for the dynamics model!
+
+- [@CarsonBurke](https://github.com/CarsonBurke) for his [pull request](https://github.com/lucidrains/dreamer4/pull/25) enabling configurable activations!
+
 ## Install
 
 ```bash
@@ -283,6 +287,88 @@ Passing `--condition_on_actions True` lets you explicitly prompt with velocity a
     archivePrefix = {arXiv},
     primaryClass = {cs.LG},
     url     = {https://arxiv.org/abs/2401.16025},
+}
+```
+
+```bibtex
+@misc{zhao2026subjepasubspacegaussianregularization,
+    title   = {Sub-JEPA: Subspace Gaussian Regularization for Stable End-to-End World Models},
+    author  = {Kai Zhao and Dongliang Nie and Yuchen Lin and Zhehan Luo and Yixiao Gu and Deng-Ping Fan and Dan Zeng},
+    year    = {2026},
+    eprint  = {2605.09241},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2605.09241},
+}
+```
+
+```bibtex
+@misc{wu2025h3aehighcompressionhigh,
+    title   = {H3AE: High Compression, High Speed, and High Quality AutoEncoder for Video Diffusion Models},
+    author  = {Yushu Wu and Yanyu Li and Ivan Skorokhodov and Anil Kag and Willi Menapace and Sharath Girish and Aliaksandr Siarohin and Yanzhi Wang and Sergey Tulyakov},
+    year    = {2025},
+    eprint  = {2504.10567},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.CV},
+    url     = {https://arxiv.org/abs/2504.10567},
+}
+```
+
+```bibtex
+@misc{han2026firefrobeniusisometryreinitializationbalancing,
+    title   = {FIRE: Frobenius-Isometry Reinitialization for Balancing the Stability-Plasticity Tradeoff},
+    author  = {Isaac Han and Sangyeon Park and Seungwon Oh and Donghu Kim and Hojoon Lee and Kyung-Joong Kim},
+    year    = {2026},
+    eprint  = {2602.08040},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2602.08040},
+}
+```
+
+```bibtex
+@misc{ash2020warmstartingneuralnetworktraining,
+    title   = {On Warm-Starting Neural Network Training},
+    author  = {Jordan T. Ash and Ryan P. Adams},
+    year    = {2020},
+    eprint  = {1910.08475},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/1910.08475},
+}
+```
+
+```bibtex
+@inproceedings{wu2023invertedattention,
+    title   = {Inverted-Attention Transformers can Learn Object Representations: Insights from Slot Attention},
+    author  = {Yi-Fu Wu and Klaus Greff and Gamaleldin Fathy Elsayed and Michael Curtis Mozer and Thomas Kipf and Sjoerd van Steenkiste},
+    booktitle = {UniReps:  the First Workshop on Unifying Representations in Neural Models},
+    year    = {2023},
+    url     = {https://openreview.net/forum?id=WgQZNoQ5AB}
+}
+```
+
+```bibtex
+@misc{schwarzer2021dataefficientreinforcementlearningselfpredictive,
+    title   = {Data-Efficient Reinforcement Learning with Self-Predictive Representations},
+    author  = {Max Schwarzer and Ankesh Anand and Rishab Goel and R Devon Hjelm and Aaron Courville and Philip Bachman},
+    year    = {2021},
+    eprint  = {2007.05929},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2007.05929},
+}
+```
+
+```bibtex
+@misc{teoh2026nextlatentpredictiontransformerslearn,
+    title   = {Next-Latent Prediction Transformers Learn Compact World Models},
+    author  = {Jayden Teoh and Manan Tomar and Kwangjun Ahn and Edward S. Hu and Tim Pearce and Pratyusha Sharma and Akshay Krishnamurthy and Riashat Islam and Alex Lamb and John Langford},
+    year    = {2026},
+    eprint  = {2511.05963},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2511.05963},
 }
 ```
 

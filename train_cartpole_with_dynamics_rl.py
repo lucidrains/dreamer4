@@ -149,7 +149,7 @@ class TransformerPPOAgent(nn.Module):
         use_attn_pool = False,
         pmpo_kl_div_loss_weight = 0.05,
         use_continuous_actions = False,
-        continuous_dist_type: Literal['gaussian', 'squashed_gaussian', 'beta'] = 'gaussian',
+        continuous_dist_type: Literal['gaussian', 'squashed_gaussian', 'beta'] = 'beta',
         continuous_dist_kwargs: dict = dict(),
         continuous_target_action_range: tuple[float, float] | None = None,
         depth = 3,
@@ -157,11 +157,17 @@ class TransformerPPOAgent(nn.Module):
         critic_depth = 0,
         spatial_pre_encoder_depth = 0,
         action_pre_encoder_depth = 0,
-        agent_predicts_latent = True,
+        agent_predicts_latent = False,
         ssl_lapo = False,
         ssl_lapo_use_fdm = True,
         ssl_lapo_pred_actions = True,
         ssl_tem = False,
+        latent_ar_sigreg_loss_kwargs = dict(num_slices = 256),
+        latent_ar_sigreg_num_subspaces = None,
+        mot_temporal = False,
+        actor_spr = False,
+        activation = 'silu',
+        reward_encoder_type = 'hl_gauss',
     ):
         super().__init__()
         self.use_image_input = use_image_input
@@ -207,6 +213,7 @@ class TransformerPPOAgent(nn.Module):
             num_register_tokens = 1,
             num_discrete_actions = 0 if use_continuous_actions else 2,
             num_continuous_actions = 1 if use_continuous_actions else 0,
+            reward_encoder_type = reward_encoder_type,
             continuous_dist_type = continuous_dist_type,
             continuous_dist_kwargs = continuous_dist_kwargs,
             continuous_target_action_range = continuous_target_action_range,
@@ -238,6 +245,30 @@ class TransformerPPOAgent(nn.Module):
             lapo_use_fdm = ssl_lapo_use_fdm,
             lapo_pred_actions = ssl_lapo_pred_actions,
             ssl_tem = ssl_tem,
+            latent_ar_sigreg_loss_kwargs = latent_ar_sigreg_loss_kwargs,
+            latent_ar_sigreg_num_subspaces = latent_ar_sigreg_num_subspaces,
+            mot_temporal = mot_temporal,
+            actor_spr = actor_spr,
+            policy_head_mlp_activation = activation,
+            value_head_mlp_activation = activation,
+            agent_state_pred_mlp_activation = activation,
+            lapo_kwargs = dict(
+                latent_action_embed_mlp_activation = activation,
+                pred_next_state_embed_mlp_activation = activation,
+                pred_raw_latent_mlp_activation = activation
+            ),
+            tem_kwargs = dict(
+                learned_relative_encode_mlp_activation = activation,
+                init_hiddens_mlp_activation = activation,
+                sensory_encoder_mlp_activation = activation,
+                sensory_decoder_mlp_activation = activation
+            ),
+            actor_nlp_kwargs = dict(
+                spatial_pooling_mlp_activation = activation
+            ),
+            latent_ar_kwargs = dict(
+                predict_next_latent_mlp_activation = activation
+            )
         )
 
     @property
@@ -291,13 +322,14 @@ def main(
     seed = 42,
     use_wandb = False,
     objective: Literal['ppo', 'pmpo', 'spo'] = 'ppo',
+    reward_encoder_type: Literal['hl_gauss', 'symexp_two_hot'] = 'hl_gauss',
     use_image_input = False,
     use_conv_encoder = False,
     vectorized = False,
     num_envs = 8,
     cpu = False,
     use_continuous_actions = False,
-    continuous_dist_type: Literal['gaussian', 'squashed_gaussian', 'beta'] = 'gaussian',
+    continuous_dist_type: Literal['gaussian', 'squashed_gaussian', 'beta'] = 'beta',
     use_time_rnn = True,
     ssl_every_rl_updates = 0,
     ssl_max_epochs = 25,
@@ -318,7 +350,13 @@ def main(
     lapo_use_fdm = True,
     lapo_pred_actions = True,
     tem = False,
-    use_delight_gating = True
+    use_delight_gating = True,
+    sigreg_num_subspaces = 1,
+    mot_temporal = False,
+    actor_spr = False,
+    activation = 'silu',
+    experiment_name = 'dreamer4',
+    run_name = None,
 ):
     torch.manual_seed(seed)
 
@@ -331,7 +369,7 @@ def main(
         use_asym_critic = True
 
     if use_wandb:
-        wandb.init(project = 'dreamer4-cartpole')
+        wandb.init(project = experiment_name, name = run_name)
 
     accelerator = Accelerator(
         gradient_accumulation_steps = grad_accum_every,
@@ -343,7 +381,7 @@ def main(
     def log(msg):
         accelerator.print(msg)
 
-    results_folder = Path('./results')
+    results_folder = Path(f'./results_{run_name}' if run_name else './results')
     shutil.rmtree(results_folder, ignore_errors = True)
     results_folder.mkdir(exist_ok = True, parents = True)
 
@@ -359,7 +397,6 @@ def main(
         use_attn_pool = use_attn_pool,
         use_continuous_actions = use_continuous_actions,
         continuous_dist_type = continuous_dist_type,
-        continuous_target_action_range = (-1., 1.),
         depth = depth,
         actor_depth = actor_depth,
         critic_depth = critic_depth,
@@ -369,7 +406,12 @@ def main(
         ssl_lapo = lapo,
         ssl_lapo_use_fdm = lapo_use_fdm,
         ssl_lapo_pred_actions = lapo_pred_actions,
-        ssl_tem = tem
+        ssl_tem = tem,
+        reward_encoder_type = reward_encoder_type,
+        latent_ar_sigreg_num_subspaces = sigreg_num_subspaces,
+        mot_temporal = mot_temporal,
+        actor_spr = actor_spr,
+        activation = activation,
     ).to(device)
 
     # optimizers

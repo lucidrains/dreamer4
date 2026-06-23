@@ -2,10 +2,12 @@ from __future__ import annotations
 from typing import Literal
 
 import math
-from collections import OrderedDict
+from collections import OrderedDict, namedtuple
 from random import randint
+from functools import wraps
 
 import torch
+import torch.nn.functional as F
 from torch import is_tensor, tensor
 from torch.nn import Module
 from torch.optim import AdamW
@@ -35,6 +37,9 @@ from dreamer4.dreamer4 import (
 
 from ema_pytorch import EMA
 
+import einx
+from torch_einops_utils import pack_with_inverse
+
 # helpers
 
 def exists(v):
@@ -45,6 +50,45 @@ def default(v, d):
 
 def divisible_by(num, den):
     return (num % den) == 0
+
+# augmentation
+
+AugmentedOutput = namedtuple('AugmentedOutput', ['video', 'aug_id'])
+
+def randomly_apply_aug(aug_fn):
+    @wraps(aug_fn)
+    def wrapper(video, prob = 0.5, **kwargs):
+        batch, device = video.shape[0], video.device
+        mask = torch.rand(batch, device = device) < prob
+        aug_id = mask
+
+        aug_video = aug_fn(video, **kwargs)
+
+        video = einx.where('b, b ..., b ... -> b ...', mask, aug_video, video)
+        return AugmentedOutput(video, aug_id)
+    return wrapper
+
+@randomly_apply_aug
+def pixel_shift_aug(video, max_pixel_shift = 3):
+    video, unpack = pack_with_inverse(video, 'b * h w')
+
+    batch, _, height, width = video.shape
+    device = video.device
+
+    shifts_x = torch.randint(-max_pixel_shift, max_pixel_shift + 1, (batch,), device = device)
+    shifts_y = torch.randint(-max_pixel_shift, max_pixel_shift + 1, (batch,), device = device)
+
+    padded_video = F.pad(video, (max_pixel_shift,) * 4, mode = 'reflect')
+    shifted_video = torch.empty_like(video)
+
+    for i in range(batch):
+        shift_y, shift_x = shifts_y[i].item(), shifts_x[i].item()
+        y_start, x_start = max_pixel_shift - shift_y, max_pixel_shift - shift_x
+        shifted_video[i] = padded_video[i, ..., y_start:y_start + height, x_start:x_start + width]
+
+    shifted_video = unpack(shifted_video)
+
+    return shifted_video
 
 def video_tensor_to_gif(
     tensor,
@@ -67,12 +111,15 @@ def video_tensor_to_gif(
         optimize = optimize
     )
 
-def save_video_grid_as_gif(video, path):
+def video_tensor_to_grid(video):
     batch = video.shape[0]
     num_rows = int(math.sqrt(batch))
     num_keep = num_rows ** 2
     video = video[:num_keep]
-    grid = rearrange(video, '(row col) c f h w -> c f (row h) (col w)', row = num_rows)
+    return rearrange(video, '(row col) c f h w -> c f (row h) (col w)', row = num_rows)
+
+def save_video_grid_as_gif(video, path):
+    grid = video_tensor_to_grid(video)
     video_tensor_to_gif(grid.cpu(), str(path))
 
 def cycle(dl):
@@ -101,29 +148,45 @@ class VideoTokenizerTrainer(Module):
         cpu = False,
         use_ema = False,
         ema_decay = 0.999,
-        use_tensorboard_logger = False,
+        use_tensorboard = False,
+        use_wandb = False,
         log_dir: str | None = None,
         project_name = 'dreamer4',
+        run_name: str | None = None,
         log_video = False,
         video_fps = -1,
         log_video_every = 1000,
         checkpoint_every = 2500,
-        checkpoint_folder = './checkpoints_tokenizer'
+        checkpoint_folder = './checkpoints_tokenizer',
+        custom_aug_fn = None,
+        aug_prob = 0.5
     ):
         super().__init__()
         batch_size = min(batch_size, len(dataset))
 
-        if use_tensorboard_logger:
+        assert not (use_tensorboard and use_wandb), 'use either tensorboard or wandb, not both'
+
+        self.use_tensorboard = use_tensorboard
+        self.use_wandb = use_wandb
+
+        if use_tensorboard:
             accelerate_kwargs.update(log_with = 'tensorboard', project_dir = log_dir)
+        elif use_wandb:
+            accelerate_kwargs.update(log_with = 'wandb', project_dir = log_dir)
 
         self.accelerator = Accelerator(
             cpu = cpu,
             **accelerate_kwargs
         )
 
-        if use_tensorboard_logger:
-            self.accelerator.init_trackers(project_name)
+        if use_tensorboard or use_wandb:
+            init_kwargs = dict()
+            if exists(run_name) and use_wandb:
+                init_kwargs = {'wandb': {'name': run_name}}
 
+            self.accelerator.init_trackers(project_name, init_kwargs = init_kwargs)
+
+        self.video_logger = None
         if log_video:
             assert video_fps > 0, "Video fps must be passed in and positive when log_video=True"
 
@@ -135,7 +198,7 @@ class VideoTokenizerTrainer(Module):
                 self.results_folder = Path(log_dir) / 'results'
                 self.results_folder.mkdir(parents = True, exist_ok = True)
 
-            if use_tensorboard_logger:
+            if use_tensorboard:
                 self.video_logger = self.accelerator.get_tracker("tensorboard").writer.add_video
 
         self.log_video_flag = log_video
@@ -147,6 +210,9 @@ class VideoTokenizerTrainer(Module):
         self.use_ema = use_ema
         self.ema_decay = ema_decay
         self.checkpoint_path = checkpoint_path
+
+        self.aug_prob = aug_prob
+        self.custom_aug_fn = custom_aug_fn
 
         self.dataset = dataset
         self.train_dataloader = DataLoader(dataset, batch_size = batch_size, drop_last = True, shuffle = True)
@@ -220,19 +286,21 @@ class VideoTokenizerTrainer(Module):
         self.accelerator.log(data, step = self.step.item())
 
     def log_video(self, video, tag: str):
-        if exists(self.video_logger):
-            self.video_logger(
-                tag,
-                rearrange(video, 'b c t h w -> b t c h w'),
-                self.step.item(),
-                self.fps
-            )
+        grid = video_tensor_to_grid(video)
+
+        if self.use_tensorboard and exists(self.video_logger):
+            self.video_logger(tag, rearrange(grid, 'c f h w -> 1 f c h w'), self.step.item(), self.fps)
+
+        if self.use_wandb:
+            import wandb
+            video_np = (rearrange(grid, 'c f h w -> f c h w').cpu().numpy() * 255).astype('uint8')
+            wandb.log({tag: wandb.Video(video_np, fps = self.fps, format = 'mp4')}, step = self.step.item())
 
     def load(self, path):
         path = Path(path)
         assert path.exists(), f"checkpoint not found at {path}"
 
-        pkg = torch.load(str(path), map_location = 'cpu', weights_only = True)
+        pkg = torch.load(str(path), map_location = 'cpu', weights_only = False)
 
         if 'step' in pkg:
             self.step.copy_(tensor(pkg['step']))
@@ -252,7 +320,7 @@ class VideoTokenizerTrainer(Module):
             ema_model.load_state_dict(pkg.get('model', pkg), strict = False)
             return
 
-        ema_pkg = torch.load(str(ema_path), map_location = 'cpu', weights_only = True)
+        ema_pkg = torch.load(str(ema_path), map_location = 'cpu', weights_only = False)
         ema_model.load_state_dict(ema_pkg.get('model', ema_pkg), strict = False)
 
     def forward(
@@ -284,11 +352,16 @@ class VideoTokenizerTrainer(Module):
                 video = data['video'] if is_dict else data
                 time_lens = data.get('time_lens') if is_dict else None
 
+                aug_id = None
+                if exists(self.custom_aug_fn):
+                    video, aug_id = self.custom_aug_fn(video, prob = self.aug_prob)
+
                 loss, (losses, recon_video) = self.model(
                     video,
                     time_lens = time_lens,
                     update_loss_ema = True,
-                    return_intermediates = True
+                    return_intermediates = True,
+                    aug_id = aug_id
                 )
 
                 loss = loss / self.grad_accum_every
@@ -309,9 +382,11 @@ class VideoTokenizerTrainer(Module):
             self.log(
                 loss = total_loss,
                 recon_loss = losses.recon.item(),
+                flow_recon_loss = losses.flow_recon.item(),
                 lpips_loss = losses.lpips.item(),
                 time_decorr_loss = losses.time_decorr.item(),
                 space_decorr_loss = losses.space_decorr.item(),
+                latent_ortho_loss = losses.latent_ortho.item(),
                 latent_ar_loss = losses.latent_ar.item()
             )
 
@@ -322,27 +397,46 @@ class VideoTokenizerTrainer(Module):
                 sample_model.eval()
 
                 with torch.no_grad():
+                    video_height, video_width = video.shape[-2:]
+
                     if self.model.has_flow:
                         latents = sample_model.tokenize(video)
-                        recon_video = sample_model.decode(latents, height = video.shape[-2], width = video.shape[-1])
+                        recon_video, all_pred_videos = sample_model.decode(
+                            latents,
+                            height = video_height,
+                            width = video_width,
+                            return_recons_across_steps = True
+                        )
                     else:
                         _, (_, recon_video) = sample_model(video, return_intermediates = True)
+                        all_pred_videos = [recon_video]
 
                 recon_video = recon_video.clamp(0., 1.)
                 self.log_video(video, "original_video")
                 self.log_video(recon_video, "reconstructed_video")
 
+                if sample_model.has_flow:
+                    recon_timestep_zero = all_pred_videos[0].clamp(0., 1.)
+                    self.log_video(recon_timestep_zero, "recon_timestep_zero")
+
                 if exists(self.results_folder):
-                    combined_video = torch.cat((video, recon_video), dim = -1)
+                    videos_to_concat = (video, recon_timestep_zero, recon_video) if sample_model.has_flow else (video, recon_video)
+
+                    combined_video = torch.cat(videos_to_concat, dim = -1)
                     gif_path = self.results_folder / f'sample-{self.step.item()}.gif'
                     save_video_grid_as_gif(combined_video, gif_path)
 
             # display active losses in pbar
+
             postfix_kwargs = dict(loss = f"{total_loss:.4f}")
 
             recon_loss = losses.recon.item()
             if recon_loss > 0.:
                 postfix_kwargs['recon'] = f"{recon_loss:.4f}"
+
+            flow_recon_loss = losses.flow_recon.item()
+            if flow_recon_loss > 0.:
+                postfix_kwargs['flow_recon'] = f"{flow_recon_loss:.4f}"
 
             lpips_loss = losses.lpips.item()
             if lpips_loss > 0.:
@@ -356,9 +450,17 @@ class VideoTokenizerTrainer(Module):
             if space_decorr_loss > 0.:
                 postfix_kwargs['space_decorr'] = f"{space_decorr_loss:.4f}"
 
+            latent_ortho_loss = losses.latent_ortho.item()
+            if latent_ortho_loss > 0.:
+                postfix_kwargs['latent_ortho'] = f"{latent_ortho_loss:.4f}"
+
             latent_ar_loss = losses.latent_ar.item()
             if latent_ar_loss > 0.:
                 postfix_kwargs['latent_ar'] = f"{latent_ar_loss:.4f}"
+
+            latent_consistency_loss = losses.latent_consistency.item()
+            if latent_consistency_loss > 0.:
+                postfix_kwargs['latent_consistency'] = f"{latent_consistency_loss:.4f}"
 
             pbar.set_postfix(**postfix_kwargs)
 
@@ -415,9 +517,11 @@ class BehaviorCloneTrainer(Module):
         accelerate_kwargs: dict = dict(),
         optim_kwargs: dict = dict(),
         cpu = False,
-        use_tensorboard_logger = False,
+        use_tensorboard = False,
+        use_wandb = False,
         log_dir: str | None = None,
         project_name = 'dreamer4',
+        run_name: str | None = None,
         log_video = True,
         log_video_every = 100,
         checkpoint_every = 5000,
@@ -438,21 +542,37 @@ class BehaviorCloneTrainer(Module):
         self_flow_loss_weight = 1.0,
         self_flow_kwargs: dict = dict(),
         collate_fn = None,
-        custom_sample_fn = None
+        custom_sample_fn = None,
+        custom_aug_fn = None,
+        aug_prob = 0.5
     ):
         super().__init__()
+
+        self.aug_prob = aug_prob
+        self.custom_aug_fn = custom_aug_fn
+
         batch_size = min(batch_size, len(dataset))
 
-        if use_tensorboard_logger:
+        assert not (use_tensorboard and use_wandb), 'use either tensorboard or wandb, not both'
+
+        self.use_tensorboard = use_tensorboard
+        self.use_wandb = use_wandb
+
+        if use_tensorboard:
             accelerate_kwargs.update(log_with = 'tensorboard', project_dir = log_dir)
+        elif use_wandb:
+            accelerate_kwargs.update(log_with = 'wandb', project_dir = log_dir)
 
         self.accelerator = Accelerator(
             cpu = cpu,
             **accelerate_kwargs
         )
 
-        if use_tensorboard_logger:
-            self.accelerator.init_trackers(project_name)
+        if use_tensorboard or use_wandb:
+            init_kwargs = dict()
+            if exists(run_name) and use_wandb:
+                init_kwargs = {'wandb': {'name': run_name}}
+            self.accelerator.init_trackers(project_name, init_kwargs = init_kwargs)
 
         self.model = model
         self.dataset = dataset
@@ -475,7 +595,7 @@ class BehaviorCloneTrainer(Module):
             self.self_flow_module = SelfFlow(
                 model = model,
                 student_layer = self_flow_student_layer,
-                teacher_layer = self_flow_teacher_layer,
+                teacher_layer = self_flow_layer,
                 **self_flow_kwargs
             )
 
@@ -530,7 +650,7 @@ class BehaviorCloneTrainer(Module):
                 self.results_folder = Path(log_dir) / 'results'
                 self.results_folder.mkdir(parents = True, exist_ok = True)
 
-            if use_tensorboard_logger:
+            if use_tensorboard:
                 self.video_logger = self.accelerator.get_tracker("tensorboard").writer.add_video
 
         self.log_video_flag = log_video
@@ -587,19 +707,21 @@ class BehaviorCloneTrainer(Module):
         self.accelerator.log(data, step = self.step.item())
 
     def log_video(self, video, tag: str):
-        if exists(self.video_logger):
-            self.video_logger(
-                tag,
-                rearrange(video, 'b c t h w -> b t c h w'),
-                self.step.item(),
-                self.fps
-            )
+        grid = video_tensor_to_grid(video)
+
+        if self.use_tensorboard and exists(self.video_logger):
+            self.video_logger(tag, rearrange(grid, 'c f h w -> 1 f c h w'), self.step.item(), self.fps)
+
+        if self.use_wandb:
+            import wandb
+            video_np = (rearrange(grid, 'c f h w -> f c h w').cpu().numpy() * 255).astype('uint8')
+            wandb.log({tag: wandb.Video(video_np, fps = self.fps, format = 'mp4')}, step = self.step.item())
 
     def load(self, path):
         path = Path(path)
         assert path.exists(), f"checkpoint not found at {path}"
 
-        pkg = torch.load(str(path), map_location = 'cpu', weights_only = True)
+        pkg = torch.load(str(path), map_location = 'cpu', weights_only = False)
 
         if 'step' in pkg:
             self.step.copy_(tensor(pkg['step']))
@@ -618,7 +740,7 @@ class BehaviorCloneTrainer(Module):
             ema_model.load_state_dict(pkg.get('model', pkg), strict = False)
             return
 
-        ema_pkg = torch.load(str(ema_path), map_location = 'cpu', weights_only = True)
+        ema_pkg = torch.load(str(ema_path), map_location = 'cpu', weights_only = False)
         ema_model.load_state_dict(ema_pkg.get('model', ema_pkg), strict = False)
 
     def save_checkpoint(self):
@@ -769,6 +891,12 @@ class BehaviorCloneTrainer(Module):
                 if is_tensor(batch_data):
                     batch_data = dict(video = batch_data)
 
+                if exists(self.custom_aug_fn) and 'video' in batch_data:
+                    aug_out = self.custom_aug_fn(batch_data['video'], prob = self.aug_prob)
+
+                    batch_data['video'] = aug_out.video
+                    batch_data['aug_id'] = aug_out.aug_id
+
                 batch_data['return_intermediates'] = True
 
                 if self.self_flow:
@@ -874,21 +1002,26 @@ class DreamTrainer(Module):
         accelerate_kwargs: dict = dict(),
         optim_kwargs: dict = dict(),
         cpu = False,
-        use_tensorboard_logger = False,
+        use_tensorboard = False,
+        use_wandb = False,
         log_dir: str | None = None,
         project_name = 'dreamer4'
     ):
         super().__init__()
 
-        if use_tensorboard_logger:
+        assert not (use_tensorboard and use_wandb), 'use either tensorboard or wandb, not both'
+
+        if use_tensorboard:
             accelerate_kwargs.update(log_with = 'tensorboard', project_dir = log_dir)
+        elif use_wandb:
+            accelerate_kwargs.update(log_with = 'wandb', project_dir = log_dir)
 
         self.accelerator = Accelerator(
             cpu = cpu,
             **accelerate_kwargs
         )
 
-        if use_tensorboard_logger:
+        if use_tensorboard or use_wandb:
             self.accelerator.init_trackers(project_name)
 
         self.model = model
@@ -1011,21 +1144,26 @@ class SimTrainer(Module):
         accelerate_kwargs: dict = dict(),
         optim_kwargs: dict = dict(),
         cpu = False,
-        use_tensorboard_logger = False,
+        use_tensorboard = False,
+        use_wandb = False,
         log_dir = None,
         project_name = 'dreamer4'
     ):
         super().__init__()
 
-        if use_tensorboard_logger:
+        assert not (use_tensorboard and use_wandb), 'use either tensorboard or wandb, not both'
+
+        if use_tensorboard:
             accelerate_kwargs.update(log_with = 'tensorboard', project_dir = log_dir)
+        elif use_wandb:
+            accelerate_kwargs.update(log_with = 'wandb', project_dir = log_dir)
 
         self.accelerator = Accelerator(
             cpu = cpu,
             **accelerate_kwargs
         )
 
-        if use_tensorboard_logger:
+        if use_tensorboard or use_wandb:
             self.accelerator.init_trackers(project_name)
 
         self.model = model

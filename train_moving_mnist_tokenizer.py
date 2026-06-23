@@ -12,14 +12,17 @@
 #   "accelerate",
 #   "adam-atan2-pytorch",
 #   "tensorboard",
+#   "wandb",
 #   "dreamer4"
 # ]
 # [tool.uv.sources]
 # dreamer4 = { path = "." }
 # ///
 
+from functools import partial
 from math import sqrt
 from pathlib import Path
+import shutil
 
 import numpy as np
 import torch
@@ -49,7 +52,7 @@ def default(v, d):
 
 from dataset_moving_mnist import MovingMNISTDataset
 
-from dreamer4.trainers import VideoTokenizerTrainer
+from dreamer4.trainers import VideoTokenizerTrainer, pixel_shift_aug
 
 # main
 
@@ -60,7 +63,8 @@ def main(
     checkpoint_path = None,
     num_train_steps = 100_000,
     num_latents = 32,
-    batch_size = 64,
+    batch_size = 16,
+    encoder_moss_layers = (2,),
     grad_accum_every = 1,
     min_velocity = -2,
     max_velocity = 3,
@@ -81,6 +85,7 @@ def main(
     checkpoint_folder = './logs_mnist_tokenizer/checkpoints',
     time_decorr_loss_weight = 4e-3,
     space_decorr_loss_weight = 4e-3,
+    latent_ortho_loss_weight = 0.,
     use_loss_normalization = False,
     encoder_add_decorr_aux_loss = True,
     use_causal_conv3d = True,
@@ -93,16 +98,37 @@ def main(
     latent_ar_sigreg_num_slices = 256,
     decoder_v_space_loss = True,
     time_attention_use_pope = False,
+    space_attention_use_pope = False,
     restrict_latent_grads_to_noise = True,
     decoder_flow_times_beta_alpha = 1.,
-    decoder_flow_times_beta_beta = 1.
+    decoder_flow_times_beta_beta = 1.,
+    latent_consistency_loss_weight = 0.,
+    use_h_net = False,
+    h_net_target_length = 2.,
+    clear_runs = False,
+    experiment_name = 'dreamer4',
+    run_name = None,
+    slot_attention_initted_latents = False,
+    decoder_slot_attention_initted_spatial_tokens = False,
+    slot_attention_inverted = True,
+    encoder_slot_spatial_mix = True,
+    decoder_slot_spatial_mix = False,
+    latent_init_patch_size = None,
+    use_pixel_shift_aug = False,
+    max_pixel_shift = 3,
+    aug_prob = 0.5,
+    separate_flow_decoder = False,
+    flow_decoder_train_prob = 0.5,
+    encode_temporal_diff = False
 ):
-    import shutil
-
     # clear old artifacts
 
     log_path = Path(log_dir)
     ckpt_folder_path = Path(checkpoint_folder)
+
+    if clear_runs and log_path.exists():
+        shutil.rmtree(log_path)
+
     latest_checkpoint = None
 
     if exists(checkpoint_path):
@@ -118,8 +144,6 @@ def main(
 
     log_path.mkdir(exist_ok = True, parents = True)
 
-    log_path.mkdir(exist_ok = True, parents = True)
-
     # dataset
 
     dataset = MovingMNISTDataset(
@@ -130,7 +154,18 @@ def main(
         max_velocity = max_velocity
     )
 
+    # augmentation
+
+    custom_aug_fn = partial(pixel_shift_aug, max_pixel_shift=max_pixel_shift) if use_pixel_shift_aug else None
+
     # tokenizer
+
+    h_net_kwargs = dict(
+        depth = 2,
+        heads = attn_heads,
+        dim_head = attn_dim_head,
+        target_avg_token_length = h_net_target_length
+    ) if use_h_net else None
 
     tokenizer = VideoTokenizer(
         dim = dim,
@@ -148,6 +183,7 @@ def main(
         encoder_add_decorr_aux_loss = encoder_add_decorr_aux_loss,
         time_decorr_loss_weight = time_decorr_loss_weight,
         space_decorr_loss_weight = space_decorr_loss_weight,
+        latent_ortho_loss_weight = latent_ortho_loss_weight,
         use_loss_normalization = use_loss_normalization,
         use_causal_conv3d = use_causal_conv3d,
         causal_conv3d_kernel_size = causal_conv3d_kernel_size,
@@ -159,9 +195,24 @@ def main(
         latent_ar_sigreg_loss_kwargs = dict(num_slices = latent_ar_sigreg_num_slices),
         decoder_v_space_loss = decoder_v_space_loss,
         time_attention_use_pope = time_attention_use_pope,
+        space_attention_use_pope = space_attention_use_pope,
         latent_grad_only_at_noise = restrict_latent_grads_to_noise,
         decoder_flow_times_beta_alpha = decoder_flow_times_beta_alpha,
-        decoder_flow_times_beta_beta = decoder_flow_times_beta_beta
+        decoder_flow_times_beta_beta = decoder_flow_times_beta_beta,
+        encoder_moss_layers = encoder_moss_layers,
+        latent_consistency_loss_weight = latent_consistency_loss_weight,
+        h_net_layer = encoder_depth // 2 if use_h_net else None,
+        h_net_kwargs = h_net_kwargs,
+        slot_attention_initted_latents = slot_attention_initted_latents,
+        decoder_slot_attention_initted_spatial_tokens = decoder_slot_attention_initted_spatial_tokens,
+        slot_attention_inverted = slot_attention_inverted,
+        encoder_slot_spatial_mix = encoder_slot_spatial_mix,
+        decoder_slot_spatial_mix = decoder_slot_spatial_mix,
+        latent_init_patch_size = latent_init_patch_size,
+        has_aug_conditioning = use_pixel_shift_aug,
+        separate_flow_decoder = separate_flow_decoder,
+        flow_decoder_train_prob = flow_decoder_train_prob,
+        encode_temporal_diff = encode_temporal_diff
     )
 
     # trainer
@@ -175,7 +226,7 @@ def main(
         grad_accum_every = grad_accum_every,
         learning_rate = lr,
         num_train_steps = num_train_steps,
-        use_tensorboard_logger = True,
+        use_wandb = True,
         log_dir = log_dir,
         log_video = True,
         video_fps = 4,
@@ -184,6 +235,10 @@ def main(
         ema_decay = ema_decay,
         checkpoint_every = checkpoint_every,
         checkpoint_folder = checkpoint_folder,
+        project_name = experiment_name,
+        run_name = run_name,
+        custom_aug_fn = custom_aug_fn,
+        aug_prob = aug_prob
     )
 
     if exists(latest_checkpoint):

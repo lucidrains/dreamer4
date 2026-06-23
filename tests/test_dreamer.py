@@ -664,7 +664,6 @@ def test_bc_trainer(
         num_discrete_actions = 4,
         attn_dim_head = 16,
         prob_shortcut_train = 0.9,
-        num_residual_streams = 1
     )
 
     trainer = BehaviorCloneTrainer(
@@ -676,7 +675,7 @@ def test_bc_trainer(
         cpu = True,
         self_flow = self_flow,
         self_flow_student_layer = -3,
-        self_flow_teacher_layer = -1,
+        self_flow_layer = -1,
         self_flow_loss_weight = 1.0
     )
 
@@ -741,13 +740,15 @@ def test_cache_generate():
 @param('env_can_truncate', (False, True))
 @param('store_agent_embed', (False, True))
 @param('predict_terminals', (False, True))
+@param('actor_spr', (False, True))
 def test_online_rl(
     vectorized,
     objective,
     env_can_terminate,
     env_can_truncate,
     store_agent_embed,
-    predict_terminals
+    predict_terminals,
+    actor_spr
 ):
     from dreamer4.dreamer4 import DynamicsWorldModel, VideoTokenizer
 
@@ -777,7 +778,8 @@ def test_online_rl(
         pred_orig_latent = True,
         num_discrete_actions = 4,
         attn_dim_head = 16,
-        prob_shortcut_train = 0.9
+        prob_shortcut_train = 0.9,
+        actor_spr = actor_spr
     )
 
     from dreamer4.mocks import MockEnv
@@ -1285,3 +1287,791 @@ def test_aux_encoder_combinations(use_tokenizer, use_aux_encoder):
 
     experience = dynamics.interact_with_env(mock_env, max_timesteps = 2, env_is_vectorized = False)
     assert experience.latents.shape[-2] == num_tokens
+
+@param('latent_consistency_loss_weight', (0., 1.))
+def test_latent_consistency_loss(latent_consistency_loss_weight):
+    import torch
+    from dreamer4.dreamer4 import VideoTokenizer
+
+    model = VideoTokenizer(
+        dim = 16,
+        dim_latent = 16,
+        patch_size = 8,
+        image_height = 64,
+        image_width = 64,
+        num_latent_tokens = 4,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        time_block_every = 1,
+        attn_heads = 1,
+        attn_dim_head = 16,
+        latent_consistency_loss_weight = latent_consistency_loss_weight
+    )
+
+    video = torch.randn(2, 3, 2, 64, 64)
+    loss, (losses, recon_video) = model(video, return_intermediates=True)
+
+    assert loss.numel() == 1
+
+    if latent_consistency_loss_weight > 0.:
+        assert losses.latent_consistency.item() > 0.
+    else:
+        assert losses.latent_consistency.item() == 0.
+
+def test_moss_sequential_caching():
+    from dreamer4.dreamer4 import VideoTokenizer
+
+    tokenizer = VideoTokenizer(
+        dim = 128,
+        dim_latent = 32,
+        patch_size = 4,
+        num_latent_tokens = 32,
+        channels = 3,
+        image_height = 16,
+        image_width = 16,
+        encoder_depth = 4,
+        decoder_depth = 2,
+        encoder_moss_layers = (2,),
+        decoder_moss_layers = (1,),
+        moss_kwargs = dict(causal = True),
+        lpips_loss_weight = 0.,
+        use_causal_conv3d = False,
+        use_shifted_patch_tokenization = False
+    )
+
+    tokenizer.eval()
+
+    video = torch.randn(1, 3, 5, 16, 16)
+
+    with torch.no_grad():
+
+        # parallel encode
+
+        parallel_latents = tokenizer(video, return_latents = True)
+
+        # sequential encode with caching
+
+        time_cache = None
+        seq_latents = []
+
+        for t in range(5):
+            frame = video[:, :, t:t+1]
+            frame_latents, time_cache = tokenizer(frame, return_latents = True, return_time_cache = True, time_cache = time_cache)
+            seq_latents.append(frame_latents)
+
+        seq_latents = torch.cat(seq_latents, dim = 1)
+
+        assert torch.allclose(parallel_latents, seq_latents, atol = 1e-4)
+
+        # test decoder with moss
+
+        loss = tokenizer(video)
+        assert loss.numel() == 1
+
+@param('slot_attention_initted_latents', (False, True))
+@param('decoder_slot_attention_initted_spatial_tokens', (False, True))
+def test_tokenizer_slot_attention(
+    slot_attention_initted_latents,
+    decoder_slot_attention_initted_spatial_tokens
+):
+    from dreamer4.dreamer4 import VideoTokenizer
+
+    tokenizer = VideoTokenizer(
+        16,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        time_block_every = 1,
+        dim_latent = 16,
+        patch_size = 16,
+        attn_dim_head = 8,
+        num_latent_tokens = 4,
+        slot_attention_initted_latents = slot_attention_initted_latents,
+        decoder_slot_attention_initted_spatial_tokens = decoder_slot_attention_initted_spatial_tokens
+    )
+
+    video = torch.randn(2, 3, 4, 32, 32)
+    loss = tokenizer(video)
+    assert loss.numel() == 1
+
+    latents = tokenizer(video, return_latents = True)
+    assert latents.shape[-1] == 16
+
+    recon = tokenizer.decode(latents, 32, 32)
+    assert recon.shape == video.shape
+import pytest
+
+def test_tokenizer_with_h_net():
+    from dreamer4.dreamer4 import VideoTokenizer
+    import torch
+
+    tokenizer = VideoTokenizer(
+        dim = 128,
+        dim_latent = 32,
+        patch_size = 4,
+        num_latent_tokens = 32,
+        channels = 3,
+        image_height = 32,
+        image_width = 32,
+        encoder_depth = 2,
+        decoder_depth = 2,
+        time_block_every = 2,
+        attn_dim_head = 32,
+        attn_heads = 4,
+        h_net_layer = 1,
+        h_net_kwargs = dict(depth = 2, heads = 4, dim_head = 32)
+    )
+
+    video = torch.randn(2, 3, 4, 32, 32)
+    loss, (losses, recon) = tokenizer(video, return_intermediates=True)
+
+    assert recon.shape == video.shape
+    assert isinstance(losses.h_net, torch.Tensor)
+    assert losses.h_net.item() > 0.
+
+def test_dynamics_apply_fire():
+    from dreamer4.dreamer4 import DynamicsWorldModel
+    import torch
+
+    model = DynamicsWorldModel(
+        dim = 32,
+        dim_latent = 16,
+        num_latent_tokens = 16,
+        depth = 2,
+        attn_heads = 2,
+        num_continuous_actions = 4,
+        num_discrete_actions = 0,
+        multi_token_pred_len = 1,
+        use_loss_normalization = False
+    )
+
+    model.apply_fire_(num_iters = 2)
+
+def test_axial_space_time_transformer_with_h_net():
+    from dreamer4.dreamer4 import AxialSpaceTimeTransformer
+    import torch
+
+    transformer = AxialSpaceTimeTransformer(
+        dim = 128,
+        depth = 4,
+        attn_heads = 4,
+        attn_dim_head = 32,
+        time_block_every = 2,
+        space_height = 8,
+        space_width = 8,
+        h_net_layer = 1,
+        h_net_kwargs = dict(depth = 2, heads = 4, dim_head = 32)
+    )
+
+    tokens = torch.randn(2, 4, 8 * 8, 128) # (b, t, s, d)
+    out, intermediates = transformer(tokens, return_intermediates = True)
+
+    assert out.shape == tokens.shape
+    assert isinstance(intermediates.h_net_loss, torch.Tensor)
+    assert intermediates.h_net_loss.item() > 0.
+
+def test_dynamics_model_with_h_net_caching():
+    from dreamer4.dreamer4 import DynamicsWorldModel
+    import torch
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    model = DynamicsWorldModel(
+        dim=32,
+        dim_latent=16,
+        num_latent_tokens=16,
+        depth=2,
+        time_block_every=1,  # use 1 to test full temporal attention
+        spatial_pre_encoder_depth=2,
+        action_pre_encoder_depth=2,
+        value_head_mlp_depth=1,
+        policy_head_mlp_depth=1,
+        attn_heads=2,
+        num_continuous_actions=4,
+        num_discrete_actions=0,
+        multi_token_pred_len=1,
+        use_loss_normalization=False,
+        transformer_kwargs=dict(
+            h_net_layer=1,
+            h_net_kwargs=dict(depth=1, heads=2, dim_head=16)
+        )
+    ).to(device)
+
+    model.eval()
+
+    seq_len = 4
+    batch_size = 2
+
+    actions_seq = torch.randn(batch_size, seq_len, 4, device='cpu')
+    latents = torch.randn(batch_size, seq_len, 16, 16, device='cpu')
+    signal_levels = torch.randint(0, 10, (batch_size, seq_len), device='cpu')
+    step_sizes_log2 = torch.zeros((batch_size,), device='cpu', dtype=torch.long)
+
+    with torch.no_grad():
+        parallel_pred, (embeds, _) = model(
+            latents=latents,
+            continuous_actions=actions_seq,
+            signal_levels=signal_levels,
+            step_sizes_log2=step_sizes_log2,
+            latent_is_noised=True,
+            return_pred_only=True,
+            return_intermediates=True
+        )
+
+        seq_embeds_list = []
+        seq_flow_list = []
+        time_cache = None
+
+        for t in range(seq_len):
+            latents_t = latents[:, t:t+1]
+            signal_levels_t = signal_levels[:, t:t+1]
+
+            if t == 0:
+                actions_t = torch.zeros_like(actions_seq[:, 0:1])
+            else:
+                actions_t = actions_seq[:, t-1:t]
+
+            pred_t, (embeds_t, intermediates) = model(
+                latents=latents_t,
+                continuous_actions=actions_t,
+                signal_levels=signal_levels_t,
+                step_sizes_log2=step_sizes_log2,
+                latent_is_noised=True,
+                time_cache=time_cache,
+                return_pred_only=True,
+                return_intermediates=True
+            )
+            time_cache = intermediates
+            seq_embeds_list.append(embeds_t.agent)
+            seq_flow_list.append(pred_t.flow)
+
+        seq_agent_tokens = torch.cat(seq_embeds_list, dim=1)
+        seq_flow = torch.cat(seq_flow_list, dim=1)
+
+    assert torch.allclose(embeds.agent, seq_agent_tokens, atol=1e-5), "Agent tokens diverge"
+    assert torch.allclose(parallel_pred.flow, seq_flow, atol=1e-5), "Flow output diverges"
+
+@pytest.mark.parametrize('mot_temporal', [True, False])
+def test_tokenizer_mot_temporal(mot_temporal):
+    from dreamer4.dreamer4 import VideoTokenizer
+    import torch
+
+    tokenizer = VideoTokenizer(
+        dim = 16,
+        dim_latent = 8,
+        patch_size = 2,
+        num_latent_tokens = 4,
+        channels = 3,
+        image_height = 8,
+        image_width = 8,
+        encoder_depth = 2,
+        decoder_depth = 2,
+        time_block_every = 2,
+        attn_dim_head = 16,
+        attn_heads = 2,
+        mot_temporal = mot_temporal
+    )
+
+    tokenizer.eval()
+
+    batch_size = 2
+    seq_len = 3
+
+    video = torch.randn(batch_size, 3, seq_len, 8, 8)
+
+    with torch.no_grad():
+        latents_parallel, _ = tokenizer(
+            video,
+            return_latents=True,
+            return_time_cache=True
+        )
+
+        seq_latents_list = []
+        time_cache = None
+
+        for t in range(seq_len):
+            video_t = video[:, :, t:t+1]
+            latents_t, time_cache = tokenizer(
+                video_t,
+                return_latents=True,
+                time_cache=time_cache,
+                return_time_cache=True
+            )
+            seq_latents_list.append(latents_t)
+
+        latents_seq = torch.cat(seq_latents_list, dim=1)
+
+    assert torch.allclose(latents_parallel, latents_seq, atol = 1e-5), "Tokenizer latents diverge"
+
+@pytest.mark.parametrize('mot_temporal', [True, False])
+def test_dynamics_mot_temporal(mot_temporal):
+    from dreamer4.dreamer4 import DynamicsWorldModel
+    import torch
+    import torch.nn.functional as F
+
+    model = DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 4,
+        num_latent_tokens = 4,
+        num_spatial_tokens = 4,
+        num_agents = 1,
+        num_discrete_actions = 2,
+        depth = 2,
+        mot_temporal = mot_temporal
+    )
+
+    model.eval()
+
+    batch_size = 2
+    seq_len = 3
+
+    latents = torch.randn(batch_size, seq_len, 4, 4)
+    actions = torch.randint(0, 2, (batch_size, seq_len, 1))
+    signal_levels = torch.randint(0, 10, (batch_size, seq_len))
+    step_sizes_log2 = torch.zeros((batch_size,), dtype=torch.long)
+
+    with torch.no_grad():
+        pred_parallel, _ = model(
+            latents = latents,
+            discrete_actions = actions,
+            signal_levels = signal_levels,
+            step_sizes_log2 = step_sizes_log2,
+            latent_is_noised = True,
+            return_pred_only = True,
+            return_intermediates = True
+        )
+
+        seq_flow_list = []
+        time_cache = None
+
+        padded_actions = F.pad(actions[:, :-1], (0, 0, 1, 0), value = 0)
+
+        for t in range(seq_len):
+            latents_t = latents[:, t:t+1]
+            signal_levels_t = signal_levels[:, t:t+1]
+            actions_t = padded_actions[:, t:t+1]
+
+            pred_t, (_, intermediates) = model(
+                latents = latents_t,
+                discrete_actions = actions_t,
+                signal_levels = signal_levels_t,
+                step_sizes_log2 = step_sizes_log2,
+                latent_is_noised = True,
+                time_cache = time_cache,
+                return_pred_only = True,
+                return_intermediates = True
+            )
+            time_cache = intermediates
+            seq_flow_list.append(pred_t.flow)
+
+        seq_flow = torch.cat(seq_flow_list, dim=1)
+
+    assert torch.allclose(pred_parallel.flow, seq_flow, atol = 1e-5), "Dynamics flow output diverges"
+
+def test_latent_init_patch_size():
+    from dreamer4.dreamer4 import VideoTokenizer
+
+    tokenizer = VideoTokenizer(
+        dim = 16,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        time_block_every = 1,
+        dim_latent = 16,
+        patch_size = 8,
+        latent_init_patch_size = 4,
+        attn_dim_head = 8,
+        num_latent_tokens = 4,
+        image_height = 32,
+        image_width = 32,
+        slot_attention_initted_latents = True
+    )
+
+    video = torch.randn(2, 3, 2, 32, 32)
+    latents = tokenizer(video, return_latents=True)
+    assert latents.shape[-1] == 16
+    assert latents.shape[-2] == 4
+
+    loss = tokenizer(video)
+    assert loss.numel() == 1
+
+    # Also test same patch size
+    tokenizer_same = VideoTokenizer(
+        dim = 16,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        time_block_every = 1,
+        dim_latent = 16,
+        patch_size = 8,
+        latent_init_patch_size = 8,
+        attn_dim_head = 8,
+        num_latent_tokens = 4,
+        image_height = 32,
+        image_width = 32,
+        slot_attention_initted_latents = True
+    )
+
+    latents_same = tokenizer_same(video, return_latents=True)
+    assert latents_same.shape[-1] == 16
+    assert latents_same.shape[-2] == 4
+
+def test_aug_conditioning():
+    from dreamer4.dreamer4 import VideoTokenizer
+    tokenizer = VideoTokenizer(
+        dim = 128,
+        dim_latent = 16,
+        patch_size = 8,
+        encoder_depth = 2,
+        decoder_depth = 2,
+        attn_dim_head = 8,
+        num_latent_tokens = 4,
+        image_height = 32,
+        image_width = 32,
+        has_aug_conditioning = True
+    )
+
+    video = torch.randn(2, 3, 5, 32, 32)
+    aug_id = torch.randint(0, 3, (2,))
+
+    latents = tokenizer(video, aug_id = aug_id, return_latents = True)
+    assert latents.shape[-1] == 16
+    assert latents.shape[-2] == 4
+
+    loss = tokenizer(video, aug_id = aug_id)
+    assert loss.numel() == 1
+    assert loss >= 0.
+
+def test_dynamics_aug_conditioning():
+    from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
+
+    tokenizer = VideoTokenizer(
+        dim = 16,
+        dim_latent = 16,
+        patch_size = 8,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        attn_dim_head = 8,
+        num_latent_tokens = 4,
+        image_height = 32,
+        image_width = 32,
+        has_aug_conditioning = True
+    )
+
+    dynamics = DynamicsWorldModel(
+        dim = 16,
+        video_tokenizer = tokenizer,
+        dim_latent = 16,
+        max_steps = 64,
+        num_latent_tokens = 4,
+        depth = 1,
+        num_discrete_actions = 4,
+        attn_dim_head = 8,
+        has_aug_conditioning = True
+    )
+
+    video = torch.randn(2, 3, 5, 32, 32)
+    discrete_actions = torch.randint(0, 4, (2, 4, 1))
+    aug_id = torch.randint(0, 3, (2,))
+
+    loss, *_ = dynamics(video = video, discrete_actions = discrete_actions, aug_id = aug_id, return_all_losses = True)
+
+    assert loss.numel() == 1
+    assert loss >= 0.
+
+    loss_int, *_ = dynamics(video = video, discrete_actions = discrete_actions, aug_id = 1, return_all_losses = True)
+    assert loss_int.numel() == 1
+
+@param('loss_type, detach_target, sigreg_num_subspaces, predict_residual', [
+    ('smooth_l1', False, 4, True),
+    ('cosine', True, None, False)
+])
+def test_latent_ar_loss(loss_type, detach_target, sigreg_num_subspaces, predict_residual):
+    from dreamer4.dreamer4 import LatentAutoregressiveLoss
+    import torch
+
+    latent_ar_loss = LatentAutoregressiveLoss(
+        dim = 512,
+        loss_type = loss_type,
+        detach_target = detach_target,
+        sigreg_num_subspaces = sigreg_num_subspaces,
+        predict_residual = predict_residual
+    )
+
+    loss, sigreg, pred = latent_ar_loss(torch.randn(2, 4, 512))
+    assert loss.ndim == 0
+
+    loss, pred = latent_ar_loss(torch.randn(2, 4, 512), return_unreduced_loss = True)
+    assert loss.shape == (2, 3, 512)
+
+@param('decoder_flow_steps, separate_flow_decoder, override_grad_frac', [
+    (1, False, None),
+    (4, False, None),
+    (4, True, None),
+    (4, True, lambda t: (t < 0.5).float())
+])
+def test_separate_flow_decoder(
+    decoder_flow_steps,
+    separate_flow_decoder,
+    override_grad_frac
+):
+    from dreamer4.dreamer4 import VideoTokenizer
+    import torch
+
+    tokenizer = VideoTokenizer(
+        dim = 256,
+        dim_latent = 16,
+        patch_size = 4,
+        image_height = 32,
+        image_width = 32,
+        num_latent_tokens = 4,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        decoder_flow_steps = decoder_flow_steps,
+        separate_flow_decoder = separate_flow_decoder,
+        flow_decoder_train_prob = 0.5,
+        latent_receive_grad_frac = override_grad_frac
+    )
+    video = torch.randn(1, 3, 2, 32, 32)
+
+    # test parameter separation
+    if separate_flow_decoder:
+        decoder_params = list(tokenizer.decoder.parameters())
+        flow_decoder_params = list(tokenizer.flow_decoder.parameters())
+
+        assert len(decoder_params) == len(flow_decoder_params)
+        for p1, p2 in zip(decoder_params, flow_decoder_params):
+            assert p1 is not p2, 'parameters must not be shared between base decoder and flow decoder'
+
+    # test forward
+    loss = tokenizer(video)
+    assert loss.numel() == 1
+    loss.backward()
+
+    # test inference
+    latents = tokenizer(video, return_latents = True)
+    decoded_video = tokenizer.decode(latents, height=32, width=32)
+    assert decoded_video.shape == video.shape
+
+@param('space_attention_use_pope', (False, True))
+def test_space_pope(space_attention_use_pope):
+    from dreamer4.dreamer4 import VideoTokenizer, special_token_mask, block_mask_special_tokens_right
+    import torch
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    try:
+        from torch.nn.attention.flex_attention import create_block_mask
+        has_flex = True
+    except ImportError:
+        has_flex = False
+
+    tokenizer = VideoTokenizer(
+        dim = 16,
+        dim_latent = 16,
+        patch_size = 4,
+        num_latent_tokens = 4,
+        channels = 3,
+        image_height = 16,
+        image_width = 16,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        time_block_every = 1,
+        attn_dim_head = 16,
+        attn_heads = 2,
+        lpips_loss_weight = 0.,
+        space_attention_use_pope = space_attention_use_pope
+    ).to(device)
+
+    # test forward
+    video = torch.randn(1, 3, 2, 16, 16, device = device)
+    loss = tokenizer(video)
+    assert loss.numel() == 1
+
+    # if checking pope mask
+    if not space_attention_use_pope or not has_flex:
+        return
+
+    space_seq_len = (16 // 4) ** 2 + 4
+    num_latents = 4
+
+    q_seq = torch.arange(space_seq_len, device = device)
+    k_seq = torch.arange(space_seq_len, device = device)
+    dense_mask = special_token_mask(q_seq, k_seq, space_seq_len, num_latents, False)
+
+    block_mask_fn = block_mask_special_tokens_right(space_seq_len, num_latents, False)
+    flex_block_mask = create_block_mask(block_mask_fn, 1, 1, space_seq_len, space_seq_len, device = device)
+
+    from einops import rearrange
+    flex_dense = flex_block_mask.to_dense()
+    assert torch.all(dense_mask == rearrange(flex_dense, '1 1 q k -> q k'))
+
+def test_actor_spr_wrapper():
+    from dreamer4.dreamer4 import ActionEmbedder, ActorSPRWrapper
+
+    # parameters
+    batch_size = 2
+    seq_len = 10
+    dim = 64
+    num_discrete_actions = 4
+    num_continuous_actions = 2
+
+    action_embedder = ActionEmbedder(
+        dim = dim,
+        num_discrete_actions = num_discrete_actions,
+        num_continuous_actions = num_continuous_actions,
+        can_unembed = True,
+        unembed_dim = dim * 4,
+        num_unembed_preds = 1
+    )
+
+    wrapper = ActorSPRWrapper(
+        action_embedder = action_embedder,
+        dim = dim * 4,
+        num_rollouts = 3,
+        spr_loss_weight = 1.0,
+        kl_loss_weight = 1.0,
+        sigreg_loss_weight = 0.05
+    )
+
+    policy_embed = torch.randn(batch_size, seq_len, dim * 4)
+    discrete_actions = torch.randint(0, num_discrete_actions, (batch_size, seq_len, 1))
+    continuous_actions = torch.randn(batch_size, seq_len, num_continuous_actions)
+    mask = torch.ones(batch_size, seq_len, dtype=torch.bool)
+
+    total_loss, losses = wrapper(
+        policy_embed=policy_embed,
+        discrete_actions=discrete_actions,
+        continuous_actions=continuous_actions,
+        mask=mask
+    )
+
+    assert total_loss.ndim == 0
+    assert total_loss.item() >= 0
+
+    spr_loss, kl_loss, sigreg_loss = losses
+    assert spr_loss.item() >= 0
+    assert kl_loss.item() >= 0
+    assert sigreg_loss.item() >= 0
+
+@param('encode_temporal_diff', (False, True))
+def test_temporal_diff(encode_temporal_diff):
+    from dreamer4.dreamer4 import VideoTokenizer
+
+    tokenizer = VideoTokenizer(
+        16,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        time_block_every = 1,
+        dim_latent = 16,
+        patch_size = 16,
+        attn_dim_head = 8,
+        num_latent_tokens = 4,
+        lpips_loss_weight = 0.,
+        encode_temporal_diff = encode_temporal_diff
+    )
+
+    video = torch.randn(2, 3, 4, 32, 32)
+
+    loss, (losses, recon_video, *rest) = tokenizer(video, return_intermediates = True)
+    loss.backward()
+
+    latents = tokenizer.tokenize(video)
+    out = tokenizer.decode(latents, height = 32, width = 32)
+
+    assert out.shape == video.shape
+
+@param('custom_activation', (False, True))
+def test_custom_activations(custom_activation):
+    from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
+
+    act = 'relu_squared' if custom_activation else 'silu'
+    ff_kwargs = dict(activation=act)
+
+    tokenizer = VideoTokenizer(
+        dim=16,
+        encoder_depth=1,
+        decoder_depth=1,
+        time_block_every=1,
+        dim_latent=16,
+        patch_size=16,
+        num_latent_tokens=4,
+        decoder_pos_emb_mlp_activation=act,
+        ff_kwargs=ff_kwargs
+    )
+
+    world_model = DynamicsWorldModel(
+        dim=16,
+        video_tokenizer=tokenizer,
+        dim_latent=16,
+        max_steps=16,
+        num_tasks=2,
+        num_latent_tokens=4,
+        depth=1,
+        num_spatial_tokens=2,
+        num_discrete_actions=4,
+        spatial_pre_encoder_depth=1,
+        action_pre_encoder_depth=1,
+        ssl_lapo=True,
+        ssl_tem=True,
+        lapo_kwargs=dict(
+            latent_action_embed_mlp_activation=act,
+            pred_next_state_embed_mlp_activation=act,
+            pred_raw_latent_mlp_activation=act
+        ),
+        tem_kwargs=dict(
+            learned_relative_encode_mlp_activation=act,
+            init_hiddens_mlp_activation=act,
+            sensory_encoder_mlp_activation=act,
+            sensory_decoder_mlp_activation=act
+        ),
+        actor_spr=True,
+        actor_nlp_kwargs=dict(
+            dynamics_mlp_activation=act
+        ),
+        latent_ar=True,
+        latent_ar_layer=0,
+        latent_ar_kwargs=dict(
+            mlp_activation=act
+        ),
+        policy_head_mlp_activation=act,
+        value_head_mlp_activation=act,
+        agent_state_pred_mlp_activation=act,
+        state_terminal_pred_mlp_activation=act,
+        ff_kwargs=ff_kwargs
+    )
+
+    assert exists(tokenizer)
+    assert exists(world_model)
+
+    video = torch.randn(1, 3, 2, 32, 32)
+    actions = torch.randint(0, 4, (1, 2, 1))
+
+    latents = tokenizer(video, return_latents=True)
+    assert exists(latents)
+
+    loss = world_model(
+        video=video,
+        discrete_actions=actions
+    )
+    assert exists(loss)
+
+    loss.backward()
+
+def test_hl_gauss_integration():
+    import torch
+    from dreamer4.dreamer4 import DynamicsWorldModel, HLGaussRewardEncoder
+    dynamics = DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 8,
+        num_latent_tokens = 4,
+        depth = 1,
+        reward_encoder_type = 'hl_gauss',
+        reward_encoder_kwargs = dict(num_bins = 20),
+    )
+
+    assert isinstance(dynamics.reward_encoder, HLGaussRewardEncoder)
+
+    values = torch.randn(2, 5)
+    encoded = dynamics.reward_encoder(values)
+    assert encoded.shape == (2, 5, 20)
+
+    decoded = dynamics.reward_encoder.bins_to_scalar_value(encoded)
+    assert decoded.shape == values.shape
