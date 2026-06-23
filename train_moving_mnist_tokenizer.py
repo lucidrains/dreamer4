@@ -98,6 +98,7 @@ def main(
     latent_ar_sigreg_num_slices = 256,
     decoder_v_space_loss = True,
     time_attention_use_pope = False,
+    space_attention_use_pope = False,
     restrict_latent_grads_to_noise = True,
     decoder_flow_times_beta_alpha = 1.,
     decoder_flow_times_beta_beta = 1.,
@@ -116,7 +117,10 @@ def main(
     use_pixel_shift_aug = False,
     max_pixel_shift = 3,
     aug_prob = 0.5,
-    use_wandb = False
+    use_wandb = False,
+    separate_flow_decoder = False,
+    flow_decoder_train_prob = 0.5,
+    encode_temporal_diff = False
 ):
     # clear old artifacts
 
@@ -192,6 +196,7 @@ def main(
         latent_ar_sigreg_loss_kwargs = dict(num_slices = latent_ar_sigreg_num_slices),
         decoder_v_space_loss = decoder_v_space_loss,
         time_attention_use_pope = time_attention_use_pope,
+        space_attention_use_pope = space_attention_use_pope,
         latent_grad_only_at_noise = restrict_latent_grads_to_noise,
         decoder_flow_times_beta_alpha = decoder_flow_times_beta_alpha,
         decoder_flow_times_beta_beta = decoder_flow_times_beta_beta,
@@ -205,7 +210,10 @@ def main(
         encoder_slot_spatial_mix = encoder_slot_spatial_mix,
         decoder_slot_spatial_mix = decoder_slot_spatial_mix,
         latent_init_patch_size = latent_init_patch_size,
-        has_aug_conditioning = use_pixel_shift_aug
+        has_aug_conditioning = use_pixel_shift_aug,
+        separate_flow_decoder = separate_flow_decoder,
+        flow_decoder_train_prob = flow_decoder_train_prob,
+        encode_temporal_diff = encode_temporal_diff
     )
 
     # trainer

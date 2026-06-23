@@ -914,13 +914,15 @@ def test_cache_generate():
 @param('env_can_truncate', (False, True))
 @param('store_agent_embed', (False, True))
 @param('predict_terminals', (False, True))
+@param('actor_spr', (False, True))
 def test_online_rl(
     vectorized,
     objective,
     env_can_terminate,
     env_can_truncate,
     store_agent_embed,
-    predict_terminals
+    predict_terminals,
+    actor_spr
 ):
     from dreamer4.dreamer4 import DynamicsWorldModel, VideoTokenizer
 
@@ -950,7 +952,8 @@ def test_online_rl(
         pred_orig_latent = True,
         num_discrete_actions = 4,
         attn_dim_head = 16,
-        prob_shortcut_train = 0.9
+        prob_shortcut_train = 0.9,
+        actor_spr = actor_spr
     )
 
     from dreamer4.mocks import MockEnv
@@ -2049,3 +2052,202 @@ def test_dynamics_var_len_action_loss_with_time_minus_one_actions():
 
     assert loss.numel() == 1
     assert losses.discrete_actions.numel() == 1
+
+@param('loss_type, detach_target, sigreg_num_subspaces, predict_residual', [
+    ('smooth_l1', False, 4, True),
+    ('cosine', True, None, False)
+])
+def test_latent_ar_loss(loss_type, detach_target, sigreg_num_subspaces, predict_residual):
+    from dreamer4.dreamer4 import LatentAutoregressiveLoss
+    import torch
+
+    latent_ar_loss = LatentAutoregressiveLoss(
+        dim = 512,
+        loss_type = loss_type,
+        detach_target = detach_target,
+        sigreg_num_subspaces = sigreg_num_subspaces,
+        predict_residual = predict_residual
+    )
+
+    loss, sigreg, pred = latent_ar_loss(torch.randn(2, 4, 512))
+    assert loss.ndim == 0
+
+    loss, pred = latent_ar_loss(torch.randn(2, 4, 512), return_unreduced_loss = True)
+    assert loss.shape == (2, 3, 512)
+
+@param('decoder_flow_steps, separate_flow_decoder, override_grad_frac', [
+    (1, False, None),
+    (4, False, None),
+    (4, True, None),
+    (4, True, lambda t: (t < 0.5).float())
+])
+def test_separate_flow_decoder(
+    decoder_flow_steps,
+    separate_flow_decoder,
+    override_grad_frac
+):
+    from dreamer4.dreamer4 import VideoTokenizer
+    import torch
+
+    tokenizer = VideoTokenizer(
+        dim = 256,
+        dim_latent = 16,
+        patch_size = 4,
+        image_height = 32,
+        image_width = 32,
+        num_latent_tokens = 4,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        decoder_flow_steps = decoder_flow_steps,
+        separate_flow_decoder = separate_flow_decoder,
+        flow_decoder_train_prob = 0.5,
+        latent_receive_grad_frac = override_grad_frac
+    )
+    video = torch.randn(1, 3, 2, 32, 32)
+
+    # test parameter separation
+    if separate_flow_decoder:
+        decoder_params = list(tokenizer.decoder.parameters())
+        flow_decoder_params = list(tokenizer.flow_decoder.parameters())
+
+        assert len(decoder_params) == len(flow_decoder_params)
+        for p1, p2 in zip(decoder_params, flow_decoder_params):
+            assert p1 is not p2, 'parameters must not be shared between base decoder and flow decoder'
+
+    # test forward
+    loss = tokenizer(video)
+    assert loss.numel() == 1
+    loss.backward()
+
+    # test inference
+    latents = tokenizer(video, return_latents = True)
+    decoded_video = tokenizer.decode(latents, height=32, width=32)
+    assert decoded_video.shape == video.shape
+
+@param('space_attention_use_pope', (False, True))
+def test_space_pope(space_attention_use_pope):
+    from dreamer4.dreamer4 import VideoTokenizer, special_token_mask, block_mask_special_tokens_right
+    import torch
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    try:
+        from torch.nn.attention.flex_attention import create_block_mask
+        has_flex = True
+    except ImportError:
+        has_flex = False
+
+    tokenizer = VideoTokenizer(
+        dim = 16,
+        dim_latent = 16,
+        patch_size = 4,
+        num_latent_tokens = 4,
+        channels = 3,
+        image_height = 16,
+        image_width = 16,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        time_block_every = 1,
+        attn_dim_head = 16,
+        attn_heads = 2,
+        lpips_loss_weight = 0.,
+        space_attention_use_pope = space_attention_use_pope
+    ).to(device)
+
+    # test forward
+    video = torch.randn(1, 3, 2, 16, 16, device = device)
+    loss = tokenizer(video)
+    assert loss.numel() == 1
+
+    # if checking pope mask
+    if not space_attention_use_pope or not has_flex:
+        return
+
+    space_seq_len = (16 // 4) ** 2 + 4
+    num_latents = 4
+
+    q_seq = torch.arange(space_seq_len, device = device)
+    k_seq = torch.arange(space_seq_len, device = device)
+    dense_mask = special_token_mask(q_seq, k_seq, space_seq_len, num_latents, False)
+
+    block_mask_fn = block_mask_special_tokens_right(space_seq_len, num_latents, False)
+    flex_block_mask = create_block_mask(block_mask_fn, 1, 1, space_seq_len, space_seq_len, device = device)
+
+    from einops import rearrange
+    flex_dense = flex_block_mask.to_dense()
+    assert torch.all(dense_mask == rearrange(flex_dense, '1 1 q k -> q k'))
+
+def test_actor_spr_wrapper():
+    from dreamer4.dreamer4 import ActionEmbedder, ActorSPRWrapper
+
+    # parameters
+    batch_size = 2
+    seq_len = 10
+    dim = 64
+    num_discrete_actions = 4
+    num_continuous_actions = 2
+
+    action_embedder = ActionEmbedder(
+        dim = dim,
+        num_discrete_actions = num_discrete_actions,
+        num_continuous_actions = num_continuous_actions,
+        can_unembed = True,
+        unembed_dim = dim * 4,
+        num_unembed_preds = 1
+    )
+
+    wrapper = ActorSPRWrapper(
+        action_embedder = action_embedder,
+        dim = dim * 4,
+        num_rollouts = 3,
+        spr_loss_weight = 1.0,
+        kl_loss_weight = 1.0,
+        sigreg_loss_weight = 0.05
+    )
+
+    policy_embed = torch.randn(batch_size, seq_len, dim * 4)
+    discrete_actions = torch.randint(0, num_discrete_actions, (batch_size, seq_len, 1))
+    continuous_actions = torch.randn(batch_size, seq_len, num_continuous_actions)
+    mask = torch.ones(batch_size, seq_len, dtype=torch.bool)
+
+    total_loss, losses = wrapper(
+        policy_embed=policy_embed,
+        discrete_actions=discrete_actions,
+        continuous_actions=continuous_actions,
+        mask=mask
+    )
+
+    assert total_loss.ndim == 0
+    assert total_loss.item() >= 0
+
+    spr_loss, kl_loss, sigreg_loss = losses
+    assert spr_loss.item() >= 0
+    assert kl_loss.item() >= 0
+    assert sigreg_loss.item() >= 0
+
+@param('encode_temporal_diff', (False, True))
+def test_temporal_diff(encode_temporal_diff):
+    from dreamer4.dreamer4 import VideoTokenizer
+
+    tokenizer = VideoTokenizer(
+        16,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        time_block_every = 1,
+        dim_latent = 16,
+        patch_size = 16,
+        attn_dim_head = 8,
+        num_latent_tokens = 4,
+        lpips_loss_weight = 0.,
+        encode_temporal_diff = encode_temporal_diff
+    )
+
+    video = torch.randn(2, 3, 4, 32, 32)
+
+    loss, (losses, recon_video, *rest) = tokenizer(video, return_intermediates = True)
+    loss.backward()
+
+    latents = tokenizer.tokenize(video)
+    out = tokenizer.decode(latents, height = 32, width = 32)
+
+    assert out.shape == video.shape

@@ -166,6 +166,7 @@ class TransformerPPOAgent(nn.Module):
         latent_ar_sigreg_loss_kwargs = dict(num_slices = 256),
         latent_ar_sigreg_num_subspaces = None,
         mot_temporal = False,
+        actor_spr = False,
     ):
         super().__init__()
         self.use_image_input = use_image_input
@@ -245,6 +246,7 @@ class TransformerPPOAgent(nn.Module):
             latent_ar_sigreg_loss_kwargs = latent_ar_sigreg_loss_kwargs,
             latent_ar_sigreg_num_subspaces = latent_ar_sigreg_num_subspaces,
             mot_temporal = mot_temporal,
+            actor_spr = actor_spr,
         )
 
     @property
@@ -328,6 +330,7 @@ def main(
     use_delight_gating = True,
     sigreg_num_subspaces = 1,
     mot_temporal = False,
+    actor_spr = False,
     experiment_name = 'dreamer4',
     run_name = None,
 ):
@@ -382,6 +385,7 @@ def main(
         ssl_tem = tem,
         latent_ar_sigreg_num_subspaces = sigreg_num_subspaces,
         mot_temporal = mot_temporal,
+        actor_spr = actor_spr,
     ).to(device)
 
     # optimizers
