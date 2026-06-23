@@ -318,8 +318,20 @@ def straight_through(src, tgt):
     return tgt + src - src.detach()
 
 def frac_gradient(t, frac = 1.):
-    t_grad = t * frac
-    return straight_through(t_grad, t.detach())
+    assert 0. <= frac <= 1.
+
+    if frac == 1.:
+        return t
+
+    return t.detach().lerp(t, frac)
+
+class FracGradient(Module):
+    def __init__(self, frac = 0.):
+        super().__init__()
+        self.frac = frac
+
+    def forward(self, x):
+        return frac_gradient(x, self.frac)
 
 def with_seed(seed):
     def decorator(fn):
@@ -4432,6 +4444,7 @@ class DynamicsWorldModel(Module):
         state_pred_loss_weight = 0.1,
         state_entropy_bonus_weight = 0.05,
         agent_predicts_state = False,
+        agent_predicts_state_frac_gradient = 0.,
         agent_state_pred_loss_weight = 0.1,
         eps_latent_pred = 1e-6,
         num_discrete_actions: int | tuple[int, ...] = 0,
@@ -4738,22 +4751,21 @@ class DynamicsWorldModel(Module):
         # agent predicting state
 
         self.agent_predicts_state = agent_predicts_state
+        self.agent_predicts_state_frac_gradient = agent_predicts_state_frac_gradient
         self.agent_state_pred_loss_weight = agent_state_pred_loss_weight
 
         if self.agent_predicts_state:
             dim_agent_state_in = dim * 2 if self.action_embedder.has_actions else dim
 
             self.to_agent_state_pred = Sequential(
+                FracGradient(agent_predicts_state_frac_gradient),
                 Linear(dim_agent_state_in, dim_agent_state_in),
                 RMSNorm(dim_agent_state_in),
                 SEM(dim = dim, dim_in = dim_agent_state_in, **agent_predict_sem_kwargs),
-                create_mlp(
-                    dim_in = dim_agent_state_in,
-                    dim = dim_agent_state_in * 2,
-                    dim_out = num_latent_tokens * dim_latent * 2,
-                    depth = 2,
-                    activation = get_activation(agent_state_pred_mlp_activation)
-                ),
+                Residual(FeedForward(dim_agent_state_in, activation = agent_state_pred_mlp_activation, **ff_kwargs)),
+                Residual(FeedForward(dim_agent_state_in, activation = agent_state_pred_mlp_activation, **ff_kwargs)),
+                RMSNorm(dim_agent_state_in),
+                Linear(dim_agent_state_in, num_latent_tokens * dim_latent * 2),
                 Rearrange('... (n d two) -> ... n d two', n = num_latent_tokens, two = 2)
             )
 
