@@ -167,6 +167,7 @@ class TransformerPPOAgent(nn.Module):
         mot_temporal = False,
         actor_spr = False,
         activation = 'silu',
+        reward_encoder_type = 'hl_gauss',
     ):
         super().__init__()
         self.use_image_input = use_image_input
@@ -212,6 +213,7 @@ class TransformerPPOAgent(nn.Module):
             num_register_tokens = 1,
             num_discrete_actions = 0 if use_continuous_actions else 2,
             num_continuous_actions = 1 if use_continuous_actions else 0,
+            reward_encoder_type = reward_encoder_type,
             continuous_dist_type = continuous_dist_type,
             continuous_dist_kwargs = continuous_dist_kwargs,
             continuous_target_action_range = continuous_target_action_range,
@@ -320,6 +322,7 @@ def main(
     seed = 42,
     use_wandb = False,
     objective: Literal['ppo', 'pmpo', 'spo'] = 'ppo',
+    reward_encoder_type: Literal['hl_gauss', 'symexp_two_hot'] = 'hl_gauss',
     use_image_input = False,
     use_conv_encoder = False,
     vectorized = False,
@@ -404,6 +407,7 @@ def main(
         ssl_lapo_use_fdm = lapo_use_fdm,
         ssl_lapo_pred_actions = lapo_pred_actions,
         ssl_tem = tem,
+        reward_encoder_type = reward_encoder_type,
         latent_ar_sigreg_num_subspaces = sigreg_num_subspaces,
         mot_temporal = mot_temporal,
         actor_spr = actor_spr,
