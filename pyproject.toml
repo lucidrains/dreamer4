@@ -35,6 +35,7 @@ dependencies = [
     "ema-pytorch",
     "hl-gauss-pytorch",
     "h-net-dynamic-chunking>=0.5.12",
+    "memmap-replay-buffer>=0.1.4",
     "PoPE_pytorch>=0.2.1",
     "torch>=2.4",
     "torch-einops-utils>=0.1.2",

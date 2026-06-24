@@ -2054,3 +2054,76 @@ def test_custom_activations(custom_activation):
     assert exists(loss)
 
     loss.backward()
+
+def test_memmap_replay(tmp_path):
+    from torch.utils._pytree import tree_flatten
+    from dreamer4.dreamer4 import Actions, Experience, is_tensor, DynamicsWorldModel, combine_experiences
+
+    time = 10
+
+    def make_exp(batch):
+        return Experience(
+            latents = torch.randn(batch, time, 32),
+            actions = Actions(discrete = torch.randint(0, 2, (batch, time, 1)), continuous = None),
+            rewards = torch.randn(batch, time),
+            terminals = torch.randint(0, 2, (batch,), dtype = torch.bool),
+            lens = torch.full((batch,), time),
+            is_truncated = torch.zeros((batch,), dtype = torch.bool),
+            episode_return = torch.randn(batch)
+        )
+
+    # combine multiple experiences and write to buffer
+
+    exp = combine_experiences([make_exp(2), make_exp(3)])
+    batch = 5
+
+    buffer = Experience.create_memmap_replay_buffer(
+        exp,
+        str(tmp_path / 'buffer'),
+        max_episodes = 10,
+        max_timesteps = time,
+        overwrite = True,
+        circular = True
+    )
+
+    exp.add_to_memmap_buffer(buffer)
+    assert len(buffer) == batch
+
+    # rehydrate from buffer and verify round-trip
+
+    rehydrated = Experience.from_buffer_dict(next(iter(buffer.dataloader(batch_size = batch))))
+
+    exp_flat, _ = tree_flatten(vars(exp))
+    re_flat, _ = tree_flatten(vars(rehydrated))
+
+    for orig, recon in zip(exp_flat, re_flat):
+        if is_tensor(recon):
+            orig_t = orig if is_tensor(orig) else torch.tensor([orig] * batch)
+            assert torch.allclose(orig_t.float(), recon.float())
+        else:
+            assert orig == recon
+
+    # verify rehydrated experience can be fed through world model
+
+    world_model = DynamicsWorldModel(
+        dim = 64,
+        dim_latent = 32,
+        num_discrete_actions = 2,
+        num_spatial_tokens = 4,
+        num_latent_tokens = 1
+    )
+
+    loss = world_model(
+        latents = rehydrated.latents,
+        discrete_actions = rehydrated.actions.discrete,
+        rewards = rehydrated.rewards,
+        terminals = rehydrated.terminals
+    )
+
+    assert loss.ndim == 0
+    loss.backward()
+
+    # clear and verify empty
+
+    buffer.clear()
+    assert len(buffer) == 0

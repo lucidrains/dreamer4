@@ -58,7 +58,7 @@ from dreamer4.dreamer4 import (
     VideoTokenizer
 )
 
-from env_ssl_wrapper import ImageObservationWrapper
+from memmap_replay_buffer import ReplayBuffer
 
 # env
 
@@ -80,6 +80,7 @@ def make_env(seed, use_image_input = False, vectorized = False, num_envs = 8, us
     if use_image_input:
         if vectorized:
             raise NotImplementedError('Image observation wrapper not yet implemented for vectorized environments')
+        from env_ssl_wrapper import ImageObservationWrapper
         env = ImageObservationWrapper(env)
 
     return env
@@ -261,34 +262,6 @@ class TransformerPPOAgent(nn.Module):
     def device(self):
         return next(self.parameters()).device
 
-# experience processing
-
-def slice_experience(exp, idx):
-    slice_maybe = lambda t: t[idx] if is_tensor(t) else t
-
-    old_action_unembeds = tuple(slice_maybe(t) for t in exp.old_action_unembeds) if exists(exp.old_action_unembeds) else None
-
-    actions = Actions(slice_maybe(exp.actions.discrete), slice_maybe(exp.actions.continuous)) if exists(exp.actions) else None
-    log_probs = Actions(slice_maybe(exp.log_probs.discrete), slice_maybe(exp.log_probs.continuous)) if exists(exp.log_probs) else None
-
-    return Experience(
-        latents = slice_maybe(exp.latents),
-        video = slice_maybe(exp.video),
-        critic_state = slice_maybe(exp.critic_state),
-        rewards = slice_maybe(exp.rewards),
-        terminals = slice_maybe(exp.terminals),
-        actions = actions,
-        log_probs = log_probs,
-        old_action_unembeds = old_action_unembeds,
-        values = slice_maybe(exp.values),
-        step_size = slice_maybe(exp.step_size),
-        is_truncated = slice_maybe(exp.is_truncated),
-        lens = slice_maybe(exp.lens),
-        agent_index = slice_maybe(exp.agent_index),
-        is_from_world_model = slice_maybe(exp.is_from_world_model),
-        episode_return = slice_maybe(exp.episode_return)
-    )
-
 # training loop
 
 def main(
@@ -436,8 +409,10 @@ def main(
     # rollout state
 
     recent_returns = deque(maxlen = 20)
-    memories = deque(maxlen = update_episodes)
-    ppo_replay_buffer = deque(maxlen = ppo_replay_updates) if ppo_replay_updates > 0 else None
+
+    replay_buffer = None
+    replay_buffer_size = update_episodes * max(1, ppo_replay_updates + 1)
+
     ssl_memories = deque(maxlen = ssl_max_memories) if should_ssl else None
     num_ssl_updates = 0
 
@@ -465,9 +440,19 @@ def main(
 
         # store to replay buffers
 
-        cpu_experience = experience.to('cpu')
+        cpu_experience = experience.cpu()
 
-        memories.append(cpu_experience)
+        if not exists(replay_buffer):
+            replay_buffer = Experience.create_memmap_replay_buffer(
+                cpu_experience,
+                results_folder / 'replay_data',
+                max_episodes = replay_buffer_size,
+                max_timesteps = max_timesteps + 1,
+                circular = True,
+                overwrite = True
+            )
+
+        cpu_experience.add_to_memmap_buffer(replay_buffer)
 
         if exists(ssl_memories):
             ssl_memories.append(cpu_experience)
@@ -509,34 +494,33 @@ def main(
         if is_rl_update:
             agent.train()
 
-            exp_batch_list = list(memories)
-
-            if exists(ppo_replay_buffer) and len(ppo_replay_buffer) > 0:
-                for past_batch in ppo_replay_buffer:
-                    exp_batch_list.extend(past_batch)
-
-            exp_batch = combine_experiences(exp_batch_list).to(device)
-
-            total_envs = exp_batch.latents.shape[0] if exists(exp_batch.latents) else exp_batch.critic_state.shape[0]
-
             epoch_policy_loss = 0.
             epoch_value_loss = 0.
             epoch_conv_grad_norm = 0.
 
             for _ in range(update_epochs):
-                batches = torch.randperm(total_envs, device = device).split(batch_size)
+                dataloader = replay_buffer.dataloader(
+                    batch_size = batch_size,
+                    shuffle = True,
+                    return_mask = False
+                )
 
-                for i, batch_idx in enumerate(batches):
-                    micro = slice_experience(exp_batch, batch_idx)
+                num_batches = len(dataloader)
+
+                for i, batch_dict in enumerate(dataloader):
+                    micro = Experience.from_buffer_dict(batch_dict).to(device)
 
                     if agent.dynamics.has_image_encoder:
                         micro.latents = None
 
-                    if exists(micro.critic_state) and exists(micro.rewards) and micro.critic_state.shape[1] < micro.rewards.shape[1]:
-                        micro.critic_state = pad_at_dim(micro.critic_state, (0, micro.rewards.shape[1] - micro.critic_state.shape[1]), dim = 1)
+                    if exists(micro.rewards):
+                        time = micro.rewards.shape[1]
 
-                    if exists(micro.video) and exists(micro.rewards) and micro.video.shape[2] < micro.rewards.shape[1]:
-                        micro.video = pad_at_dim(micro.video, (0, micro.rewards.shape[1] - micro.video.shape[2]), dim = 2)
+                        if exists(micro.critic_state) and micro.critic_state.shape[1] < time:
+                            micro.critic_state = pad_at_dim(micro.critic_state, (0, time - micro.critic_state.shape[1]), dim = 1)
+
+                        if exists(micro.video) and micro.video.shape[2] < time:
+                            micro.video = pad_at_dim(micro.video, (0, time - micro.video.shape[2]), dim = 2)
 
                     policy_loss, value_loss = agent.dynamics.learn_from_experience(
                         experience = micro,
@@ -548,19 +532,19 @@ def main(
                     total_loss = (policy_loss + value_loss) / grad_accum_every
                     accelerator.backward(total_loss)
 
-                    is_last_batch = (i + 1) == len(batches)
+                    is_last_batch = (i + 1) == num_batches
 
                     if divisible_by(i + 1, grad_accum_every) or is_last_batch:
                         if agent.dynamics.has_image_encoder:
                             conv_grad = nn.utils.clip_grad_norm_(agent.dynamics.image_encoder_parameters(), float('inf'))
-                            epoch_conv_grad_norm += conv_grad.item() / len(batches)
+                            epoch_conv_grad_norm += conv_grad.item() / num_batches
 
                         accelerator.clip_grad_norm_(agent.parameters(), max_grad_norm)
                         optimizer.step()
                         optimizer.zero_grad()
 
-                    epoch_policy_loss += policy_loss.item() / len(batches)
-                    epoch_value_loss += value_loss.item() / len(batches)
+                    epoch_policy_loss += policy_loss.item() / num_batches
+                    epoch_value_loss += value_loss.item() / num_batches
 
             avg_policy_loss = epoch_policy_loss / update_epochs
             avg_value_loss = epoch_value_loss / update_epochs
@@ -578,13 +562,7 @@ def main(
                     value_loss = avg_value_loss
                 ))
 
-            # store current batch into replay buffer before clearing
-
-            if exists(ppo_replay_buffer):
-                ppo_replay_buffer.append(list(memories))
-
             num_policy_updates += 1
-            memories.clear()
 
             agent.eval()
 

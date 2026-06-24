@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as F
 from torch.distributions import Normal, Beta, kl
 from torch.nn import Module, ModuleList, ModuleDict, Embedding, Parameter, Linear, RMSNorm
-from torch import nn, cat, stack, arange, tensor, Tensor, is_tensor, full, zeros, ones, randint, rand, randn, randn_like, empty, full, linspace, arange, rand_like, ones_like, zeros_like
+from torch import nn, cat, stack, tensor, Tensor, is_tensor, zeros, ones, randint, rand, randn, randn_like, empty, full, linspace, arange, rand_like, ones_like, zeros_like
 from torch.utils._pytree import tree_map, tree_flatten, tree_unflatten
 
 from torch_einops_utils.nn import Identity, Sequential
@@ -42,6 +42,8 @@ from PoPE_pytorch import PoPE, AxialPoPE, flash_attn_with_pope
 
 from discrete_continuous_embed_readout import MultiCategorical, Readout
 from discrete_continuous_embed_readout.discrete_continuous_embed_readout import BetaDist, rescale
+
+from memmap_replay_buffer import ReplayBuffer
 
 from hl_gauss_pytorch import HLGaussLoss
 
@@ -142,7 +144,7 @@ class Experience:
     terminals: Tensor | None = None
     actions: Actions | None = None
     log_probs: Actions | None = None
-    old_action_unembeds: tuple[MaybeTensor, MaybeTensor] | None = None
+    old_action_unembeds: Actions | None = None
     values: MaybeTensor = None
     step_size: int | None = None
     lens: MaybeTensor = None
@@ -151,16 +153,100 @@ class Experience:
     is_from_world_model: bool | Tensor = True
     episode_return: Tensor | None = None
 
+    _meta_fields = frozenset({
+        'step_size',
+        'lens',
+        'is_truncated',
+        'terminals',
+        'agent_index',
+        'is_from_world_model',
+        'episode_return'
+    })
+
+    @property
+    def payload(self):
+        return default(default(self.latents, self.video), self.critic_state)
+
+    # memmap replay buffer
+
+    def to_buffer_dict(self):
+        data_dict, meta_dict = {}, {}
+
+        for k, v in vars(self).items():
+            is_meta = k in self.__class__._meta_fields
+            target = meta_dict if is_meta else data_dict
+
+            if isinstance(v, Actions):
+                if exists(v.discrete):    target[f'{k}_discrete'] = v.discrete
+                if exists(v.continuous):  target[f'{k}_continuous'] = v.continuous
+            elif exists(v):
+                target[k] = v
+
+        return data_dict, meta_dict
+
+    @classmethod
+    def create_memmap_replay_buffer(cls, template_experience, *args, **kwargs):
+        from memmap_replay_buffer import ReplayBuffer
+
+        data_dict, meta_dict = template_experience.to_buffer_dict()
+
+        def infer_field(v, is_meta = False):
+            if not is_tensor(v):
+                return type(v).__name__
+
+            shape = v.shape[1:] if is_meta else v.shape[2:]
+            return (tensor_dtype_to_string(v), shape)
+
+        inferred_kwargs = dict(
+            fields = {k: infer_field(v) for k, v in data_dict.items()},
+            meta_fields = {k: infer_field(v, is_meta = True) for k, v in meta_dict.items()}
+        )
+
+        return ReplayBuffer(*args, **inferred_kwargs, **kwargs)
+
+    def add_to_memmap_buffer(self, buffer):
+        data_dict, meta_dict = self.to_buffer_dict()
+        batch_size, time_steps = self.payload.shape[:2]
+
+        meta_batch = {k: (v if is_tensor(v) else [v] * batch_size) for k, v in meta_dict.items()}
+
+        with buffer.batched_episode(batch_size = batch_size, **meta_batch):
+            for step in range(time_steps):
+                buffer.store_batch(**{k: v[:, step] for k, v in data_dict.items()})
+
+    @classmethod
+    def from_buffer_dict(cls, data_dict):
+        kwargs = {}
+
+        for f in fields(cls):
+            k = f.name
+            disc_key, cont_key = f'{k}_discrete', f'{k}_continuous'
+
+            # specially handle actions, which were flattened to discrete and continuous keys
+
+            if disc_key in data_dict or cont_key in data_dict:
+                kwargs[k] = Actions(data_dict.get(disc_key), data_dict.get(cont_key))
+                continue
+
+            # otherwise just copy over the key
+
+            if k in data_dict:
+                kwargs[k] = data_dict[k]
+
+        return cls(**kwargs)
+
+    # tensor-like methods
+
     def cpu(self):
         return self.to(torch.device('cpu'))
 
     def to(self, device):
         experience_dict = {f.name: getattr(self, f.name) for f in fields(self)}
-        experience_dict = tree_map(lambda t: t.to(device) if is_tensor(t) else t, experience_dict)
+        experience_dict = tree_map_tensor(lambda t: t.to(device), experience_dict)
         return Experience(**experience_dict)
 
 def combine_experiences(
-    exps: list[Experiences]
+    exps: list[Experience]
 ) -> Experience:
 
     assert len(exps) > 0
@@ -169,7 +255,8 @@ def combine_experiences(
 
     for exp in exps:
         payload = default(exp.latents, exp.video)
-        batch, time, device = *payload.shape[:2], payload.device
+        batch, time = payload.shape[:2]
+        device = payload.device
 
         if not exists(exp.lens):
             exp.lens = full((batch,), time, device = device)
@@ -263,6 +350,14 @@ def cast_to_tensor(t, device, dtype = None):
     t = t if is_tensor(t) else tensor(t)
     t = t.to(dtype) if exists(dtype) else t
     return t.to(device)
+
+def tensor_dtype_to_string(t: Tensor) -> str:
+    if t.dtype == torch.bool:
+        return 'bool'
+    elif t.is_floating_point():
+        return 'float'
+    else:
+        return 'int'
 
 @contextmanager
 def temp_requires_grad(
@@ -5598,7 +5693,12 @@ class DynamicsWorldModel(Module):
         step_mask = lens_to_mask(episode_lens, time_dim)
         episode_return = einsum(rewards, step_mask.float(), 'b t, b t -> b')
 
-        one_experience = Experience(
+        old_action_unembeds = None
+
+        if exists(acc_policy_embed) and store_old_action_unembeds:
+            old_action_unembeds = Actions(*self.action_embedder.unembed(acc_policy_embed, pred_head_index = 0))
+
+        return Experience(
             latents = acc_latents,
             video = video,
             critic_state = stacked_states,
@@ -5607,7 +5707,7 @@ class DynamicsWorldModel(Module):
             actions = Actions(discrete_actions, continuous_actions),
             log_probs = Actions(discrete_log_probs, continuous_log_probs),
             values = values,
-            old_action_unembeds = self.action_embedder.unembed(acc_policy_embed, pred_head_index = 0) if exists(acc_policy_embed) and store_old_action_unembeds else None,
+            old_action_unembeds = old_action_unembeds,
             agent_embed = acc_agent_embed if store_agent_embed else None,
             step_size = step_size,
             agent_index = agent_index,
@@ -5617,8 +5717,6 @@ class DynamicsWorldModel(Module):
             is_from_world_model = False,
             episode_return = episode_return
         )
-
-        return one_experience
 
     # ppo
 
@@ -5785,7 +5883,13 @@ class DynamicsWorldModel(Module):
                     return_intermediates = True
                 )
 
-            agent_embeds = embeds.agent[..., agent_index, :]
+            # handle agent_index is a batched tensor from replay buffer - todo, examine multi-agent scenario learning
+
+            if is_tensor(agent_index):
+                batch_indices = torch.arange(agent_index.shape[0], device = agent_index.device)
+                agent_embeds = embeds.agent[batch_indices, :, agent_index]
+            else:
+                agent_embeds = embeds.agent[..., agent_index, :]
 
         # maybe detach agent embed
 
@@ -6462,31 +6566,29 @@ class DynamicsWorldModel(Module):
 
         # experience
 
+        old_action_unembeds = None
+
+        if exists(acc_policy_embed) and store_old_action_unembeds:
+            old_action_unembeds = Actions(*self.action_embedder.unembed(acc_policy_embed, pred_head_index = 0))
+
         gen = Experience(
             latents = latents,
             video = video,
             proprio = proprio if has_proprio else None,
             agent_embed = acc_agent_embed if store_agent_embed else None,
-            old_action_unembeds = self.action_embedder.unembed(acc_policy_embed, pred_head_index = 0) if exists(acc_policy_embed) and store_old_action_unembeds else None,
+            old_action_unembeds = old_action_unembeds,
             step_size = step_size,
             agent_index = agent_index,
             lens = decoded_lens,
             is_truncated = is_truncated,
             terminals = decoded_terminals,
             is_from_world_model = True,
-            episode_return = episode_return
+            episode_return = episode_return,
+            rewards = decoded_rewards if return_rewards_per_frame else None,
+            actions = Actions(decoded_discrete_actions, decoded_continuous_actions) if return_agent_actions else None,
+            log_probs = Actions(decoded_discrete_log_probs, decoded_continuous_log_probs) if return_log_probs_and_values else None,
+            values = decoded_values if return_log_probs_and_values else None
         )
-
-        if return_rewards_per_frame:
-            gen.rewards = decoded_rewards
-
-        if return_agent_actions:
-            gen.actions = Actions(decoded_discrete_actions, decoded_continuous_actions)
-
-        if return_log_probs_and_values:
-            gen.log_probs = Actions(decoded_discrete_log_probs, decoded_continuous_log_probs)
-
-            gen.values = decoded_values
 
         if not return_time_cache:
             return gen
