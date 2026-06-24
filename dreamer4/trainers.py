@@ -220,6 +220,35 @@ class VideoDataset(Dataset):
         tensor = self.transform(tensor)
         return rearrange(tensor, 'f c h w -> c f h w')
 
+class VideoDatasetFromReplayBuffer(Dataset):
+    def __init__(
+        self,
+        replay_buffer,
+        transform = None
+    ):
+        super().__init__()
+        self.dataset = replay_buffer.dataset()
+        self.transform = default(transform, T.Lambda(lambda t: t))
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        data = self.dataset[index]
+
+        video = data['video']
+        time_lens = data['lens']
+
+        if video.ndim == 4:
+            video = rearrange(video, 'f c h w -> c f h w')
+
+        video = self.transform(video)
+
+        return dict(
+            video = video,
+            time_lens = time_lens
+        )
+
 def video_tensor_collate_fn(data):
     if not data:
         return data

@@ -607,6 +607,54 @@ def test_tokenizer_trainer():
 
     trainer()
 
+def test_tokenizer_trainer_with_replay_buffer(tmp_path):
+    from dreamer4.trainers import VideoTokenizerTrainer, VideoDatasetFromReplayBuffer
+    from dreamer4.dreamer4 import VideoTokenizer, Experience
+
+    time = 4
+    batch = 5
+
+    exp = Experience(
+        latents = torch.randn(batch, time, 16),
+        video = torch.randn(batch, time, 3, 32, 32),
+        lens = torch.full((batch,), time)
+    )
+
+    buffer = Experience.create_memmap_replay_buffer(
+        exp,
+        str(tmp_path / 'buffer'),
+        max_episodes = 10,
+        max_timesteps = time,
+        overwrite = True,
+        circular = True
+    )
+
+    exp.add_to_memmap_buffer(buffer)
+
+    dataset = VideoDatasetFromReplayBuffer(buffer)
+
+    tokenizer = VideoTokenizer(
+        16,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        time_block_every = 1,
+        dim_latent = 16,
+        patch_size = 16,
+        attn_dim_head = 16,
+        num_latent_tokens = 4
+    )
+
+    trainer = VideoTokenizerTrainer(
+        tokenizer,
+        dataset = dataset,
+        num_train_steps = 1,
+        batch_size = 2,
+        cpu = True,
+        max_grad_norm = 0.5
+    )
+
+    trainer()
+
 @param('with_actions', (True, False))
 @param('with_rewards', (True, False))
 @param('self_flow', (True, False))
