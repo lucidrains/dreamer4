@@ -8,7 +8,8 @@
 #     "fire",
 #     "pillow",
 #     "wandb",
-#     "gymnasium[mujoco]"
+#     "gymnasium[mujoco]",
+#     "env-ssl-wrapper>=0.0.2"
 # ]
 # [tool.uv.sources]
 # dreamer4 = { path = "." }
@@ -57,16 +58,9 @@ from dreamer4.dreamer4 import (
     VideoTokenizer
 )
 
+from env_ssl_wrapper import ImageObservationWrapper
+
 # env
-
-class ImageObservationWrapper(gym.ObservationWrapper):
-    def __init__(self, env):
-        super().__init__(env)
-
-    def observation(self, obs):
-        img_tensor = render_frame(self.env)
-        img_tensor = rearrange(img_tensor, '1 c h w -> c h w')
-        return dict(state = obs, image = img_tensor)
 
 def make_env(seed, use_image_input = False, vectorized = False, num_envs = 8, use_continuous_actions = False):
     env_kwargs = dict(render_mode = 'rgb_array') if use_image_input else dict()
@@ -89,14 +83,6 @@ def make_env(seed, use_image_input = False, vectorized = False, num_envs = 8, us
         env = ImageObservationWrapper(env)
 
     return env
-
-# helpers
-
-def render_frame(env):
-    img = env.render()
-    img = Image.fromarray(img).resize((64, 64), Image.BILINEAR)
-    img = torch.from_numpy(np.array(img)).permute(2, 0, 1).unsqueeze(0).float() / 255.0
-    return img
 
 # conv encoder
 
