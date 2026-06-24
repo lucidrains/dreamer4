@@ -8,14 +8,14 @@ from functools import wraps
 
 import torch
 import torch.nn.functional as F
-from torch import is_tensor, tensor
+from torch import is_tensor, tensor, stack
 from torch.nn import Module
 from torch.optim import AdamW
 from torch.utils.data import Dataset, DataLoader, TensorDataset
 
 import torchvision.transforms as T
 
-from einops import rearrange, repeat
+from einops import rearrange, repeat, reduce
 from torch_einops_utils import shape_with_replace
 
 from pathlib import Path
@@ -38,7 +38,11 @@ from dreamer4.dreamer4 import (
 from ema_pytorch import EMA
 
 import einx
-from torch_einops_utils import pack_with_inverse
+from torch_einops_utils import pack_with_inverse, pad_sequence
+
+import cv2
+import numpy as np
+from PIL import Image, ImageSequence
 
 # helpers
 
@@ -47,6 +51,9 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+def cast_tuple(val, length = 1):
+    return val if isinstance(val, tuple) else ((val,) * length)
 
 def divisible_by(num, den):
     return (num % den) == 0
@@ -127,6 +134,99 @@ def cycle(dl):
         for batch in dl:
             yield batch
 
+# video files dataset and dataloader
+
+def video_to_tensor(
+    path: str,
+    num_frames = -1,
+    channels = 3,
+    rgb_to_grayscale_weights = (0.2989, 0.5870, 0.1140)
+):
+    video = cv2.VideoCapture(str(path))
+    frames = []
+
+    while video.isOpened():
+        success, frame = video.read()
+        if not success:
+            break
+
+        frames.append(frame)
+        if len(frames) == num_frames:
+            break
+
+    video.release()
+
+    tensor = torch.from_numpy(np.stack(frames))
+    tensor = rearrange(tensor, 'f h w c -> c f h w')
+    tensor = tensor.flip(dims = (0,)).float() / 255.
+
+    if channels == 1:
+        weights = tensor.new_tensor(rgb_to_grayscale_weights)
+        weights = rearrange(weights, 'c -> c 1 1 1')
+        tensor = reduce(tensor * weights, 'c ... -> 1 ...', 'sum')
+
+    return tensor
+
+def seek_all_images(img, channels = 3, num_frames = -1):
+    mode = 'RGB' if channels == 3 else ('RGBA' if channels == 4 else 'L')
+    for i, frame in enumerate(ImageSequence.Iterator(img)):
+        if i == num_frames:
+            break
+        yield frame.convert(mode)
+
+def gif_to_tensor(path, channels = 3, num_frames = -1):
+    img = Image.open(str(path))
+    tensors = tuple(map(T.ToTensor(), seek_all_images(img, channels = channels, num_frames = num_frames)))
+    return stack(tensors, dim = 1)
+
+class VideoDataset(Dataset):
+    def __init__(
+        self,
+        folder,
+        image_size,
+        channels = 3,
+        horizontal_flip = False,
+        exts: list[str] = ['gif', 'mp4']
+    ):
+        super().__init__()
+        self.folder = folder
+        self.image_size = image_size
+        self.channels = channels
+
+        self.paths = [p for ext in exts for p in Path(f'{folder}').glob(f'**/*.{ext}')]
+        assert len(self.paths) > 0, f'no videos found in {folder}'
+
+        self.transform = T.Compose([
+            T.Resize(image_size),
+            T.RandomHorizontalFlip() if horizontal_flip else T.Lambda(lambda t: t),
+            T.CenterCrop(image_size)
+        ])
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, index):
+        path = self.paths[index]
+        ext = path.suffix.lower()
+
+        if ext == '.gif':
+            tensor = gif_to_tensor(path, channels = self.channels)
+        elif ext == '.mp4':
+            tensor = video_to_tensor(path, channels = self.channels)
+        else:
+            raise ValueError(f'unknown extension {ext}')
+
+        tensor = rearrange(tensor, 'c f h w -> f c h w')
+        tensor = self.transform(tensor)
+        return rearrange(tensor, 'f c h w -> c f h w')
+
+def video_tensor_collate_fn(data):
+    if not data:
+        return data
+
+    padded, time_lens = pad_sequence(data, dim = 1, return_lens = True)
+    return dict(video = padded, time_lens = time_lens)
+
 # trainers
 
 class VideoTokenizerTrainer(Module):
@@ -159,7 +259,8 @@ class VideoTokenizerTrainer(Module):
         checkpoint_every = 2500,
         checkpoint_folder = './checkpoints_tokenizer',
         custom_aug_fn = None,
-        aug_prob = 0.5
+        aug_prob = 0.5,
+        collate_fn = None
     ):
         super().__init__()
         batch_size = min(batch_size, len(dataset))
@@ -215,7 +316,7 @@ class VideoTokenizerTrainer(Module):
         self.custom_aug_fn = custom_aug_fn
 
         self.dataset = dataset
-        self.train_dataloader = DataLoader(dataset, batch_size = batch_size, drop_last = True, shuffle = True)
+        self.train_dataloader = DataLoader(dataset, batch_size = batch_size, drop_last = True, shuffle = True, collate_fn = collate_fn)
 
         optim_kwargs = dict(
             lr = learning_rate,

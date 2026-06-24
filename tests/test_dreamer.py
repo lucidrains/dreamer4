@@ -2127,3 +2127,33 @@ def test_memmap_replay(tmp_path):
 
     buffer.clear()
     assert len(buffer) == 0
+
+def test_video_tokenizer_trainer():
+    from dreamer4.dreamer4 import VideoTokenizer
+    from dreamer4.trainers import VideoDataset, VideoTokenizerTrainer, video_tensor_collate_fn
+
+    tokenizer = VideoTokenizer(
+        dim = 16,
+        patch_size = 8,
+        dim_latent = 32,
+        num_latent_tokens = 1,
+        image_height = 64,
+        image_width = 64,
+        lpips_loss_weight = 0.
+    )
+
+    dataset = VideoDataset(
+        folder = 'tests/mock_videos',
+        image_size = 64,
+        exts = ['mp4']
+    )
+
+    trainer = VideoTokenizerTrainer(
+        model = tokenizer,
+        dataset = dataset,
+        batch_size = 2,
+        num_train_steps = 1,
+        collate_fn = video_tensor_collate_fn
+    )
+
+    trainer()
