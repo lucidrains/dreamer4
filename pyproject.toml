@@ -1,6 +1,6 @@
 [project]
 name = "dreamer4"
-version = "0.15.6"
+version = "0.15.7"
 description = "Dreamer4 - PyTorch"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
