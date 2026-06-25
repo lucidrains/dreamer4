@@ -33,9 +33,13 @@ def train(
     learning_rate: float = 1e-4,
     use_ema: bool = True,
     ema_decay: float = 0.999,
+    use_lpips_loss: bool = False,
+    lpips_loss_weight: float = 0.2,
+    encoder_add_decorr_aux_loss: bool = False,
     # logging and saving
     name: str = 'default-tokenizer',
     use_wandb: bool = True,
+    log_video: bool = True,
     video_fps: int = 4,
     log_video_every: int = 100,
     checkpoint_every: int = 1000,
@@ -47,6 +51,9 @@ def train(
     data_path = Path(data)
     assert data_path.exists(), f"{data} does not exist"
     assert data_path.is_dir(), f"{data} must be a directory"
+
+    if not use_lpips_loss:
+        lpips_loss_weight = 0.
 
     dataset = VideoDataset(
         folder = str(data_path),
@@ -65,7 +72,9 @@ def train(
         encoder_depth = depth,
         decoder_depth = depth,
         decoder_flow_steps = flow_steps,
-        separate_flow_decoder = separate_flow_decoder
+        separate_flow_decoder = separate_flow_decoder,
+        lpips_loss_weight = lpips_loss_weight,
+        encoder_add_decorr_aux_loss = encoder_add_decorr_aux_loss
     )
 
     trainer = VideoTokenizerTrainer(
@@ -78,7 +87,7 @@ def train(
         num_train_steps = num_train_steps,
         use_wandb = use_wandb,
         log_dir = f"{log_dir}/{name}",
-        log_video = True,
+        log_video = log_video,
         video_fps = video_fps,
         log_video_every = log_video_every,
         use_ema = use_ema,
@@ -97,6 +106,10 @@ def train(
             rmtree(checkpoint_dir)
         if log_directory.exists():
             rmtree(log_directory)
+            log_directory.mkdir(parents = True, exist_ok = True)
+
+            if exists(trainer.results_folder):
+                trainer.results_folder.mkdir(parents = True, exist_ok = True)
 
     latest_checkpoint = checkpoint_dir / "tokenizer.pt"
     if latest_checkpoint.exists():
