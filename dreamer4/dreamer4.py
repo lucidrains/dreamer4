@@ -684,6 +684,7 @@ class LPIPSLoss(Module):
         self,
         pred,
         data,
+        time_lens = None
     ):
         batch, device, is_video = pred.shape[0], pred.device, pred.ndim == 5
 
@@ -693,21 +694,26 @@ class LPIPSLoss(Module):
         # take care of sampling random frames of the video
 
         if is_video:
-            pred, data = tuple(rearrange(t, 'b c t ... -> b t c ...') for t in (pred, data))
+            batch, channels, time = pred.shape[:3]
 
-            # batch randperm
+            pred, data = tuple(rearrange(t, 'b c t ... -> (b t) c ...') for t in (pred, data))
 
-            batch_randperm = randn(pred.shape[:2], device = pred.device).argsort(dim = -1)
-            rand_frames = batch_randperm[..., :self.sampled_frames]
+            # filter out padded frames
 
-            batch_arange = arange(batch, device = device)
-            batch_arange = rearrange(batch_arange, '... -> ... 1')
+            if exists(time_lens):
+                time_mask = lens_to_mask(time_lens, time)
+                time_mask = rearrange(time_mask, 'b t -> (b t)')
 
-            pred, data = tuple(t[batch_arange, rand_frames] for t in (pred, data))
+                pred, data = tuple(t[time_mask] for t in (pred, data))
 
-            # fold sampled frames into batch
+            # sample from active frames
 
-            pred, data = tuple(rearrange(t, 'b t c ... -> (b t) c ...') for t in (pred, data))
+            num_frames = pred.shape[0]
+            num_sampled = min(num_frames, batch * self.sampled_frames)
+
+            rand_indices = torch.randperm(num_frames, device = device)[:num_sampled]
+
+            pred, data = tuple(t[rand_indices] for t in (pred, data))
 
         pred_embed, embed = tuple(vgg(t) for t in (pred, data))
 
@@ -4446,7 +4452,7 @@ class VideoTokenizer(Module):
         lpips_loss = self.zero
 
         if self.has_lpips_loss:
-            lpips_loss = self.lpips(video, recon_video)
+            lpips_loss = self.lpips(video, recon_video, time_lens = time_lens)
 
         time_decorr_loss = space_decorr_loss = latent_ortho_loss = self.zero
 
