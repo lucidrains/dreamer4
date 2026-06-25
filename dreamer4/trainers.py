@@ -256,6 +256,7 @@ class VideoDatasetFromReplayBuffer(Dataset):
             video = rearrange(video, 'f c h w -> c f h w')
 
         video = self.transform(video)
+        video = video[:, :time_lens]
 
         return video
 
