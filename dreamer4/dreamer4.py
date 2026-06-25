@@ -415,11 +415,6 @@ def straight_through(src, tgt):
     return tgt + src - src.detach()
 
 def frac_gradient(t, frac = 1.):
-    assert 0. <= frac <= 1.
-
-    if frac == 1.:
-        return t
-
     return t.detach().lerp(t, frac)
 
 class FracGradient(Module):
@@ -3665,8 +3660,8 @@ class VideoDecoderNetwork(Module):
 
         return recon_video
 
+@save_load
 class VideoTokenizer(Module):
-
     def __init__(
         self,
         dim,

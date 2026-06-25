@@ -104,6 +104,35 @@ actor_loss, critic_loss = world_model.learn_from_experience(experience)
 (actor_loss + critic_loss).backward()
 ```
 
+## CLI
+
+You can easily train the video tokenizer using the command line interface:
+
+```bash
+dreamer4 train-video-tokenizer /path/to/videos \
+    --name experiment_name \
+    --image_size 64 \
+    --batch_size 4 \
+    --grad_accum_every 2 \
+    --num_train_steps 100000 \
+    --depth 4 \
+    --flow_steps 2 \
+    --separate_flow_decoder True
+```
+
+Once trained, you can load the resulting tokenizer in python with a single line using the saved checkpoint
+
+```python
+from dreamer4 import VideoTokenizer
+
+# instantiate and load
+tokenizer = VideoTokenizer.init_and_load('./checkpoints/experiment_name/tokenizer.pt')
+
+# loading the ema tokenizer
+ema_tokenizer = VideoTokenizer.init_and_load('./checkpoints/experiment_name/tokenizer-ema.pt')
+
+```
+
 ## Moving MNIST
 
 To train a simple tokenizer on Moving MNIST for 20000 steps and then use it to generate action-conditioned dynamics models

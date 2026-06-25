@@ -16,7 +16,7 @@ from torch.utils.data import Dataset, DataLoader, TensorDataset
 import torchvision.transforms as T
 
 from einops import rearrange, repeat, reduce
-from torch_einops_utils import shape_with_replace
+from torch_einops_utils import shape_with_replace, pad_right_at_dim, slice_at_dim
 
 from pathlib import Path
 
@@ -185,20 +185,20 @@ class VideoDataset(Dataset):
         folder,
         image_size,
         channels = 3,
-        horizontal_flip = False,
+        max_num_frames = None,
         exts: list[str] = ['gif', 'mp4']
     ):
         super().__init__()
         self.folder = folder
         self.image_size = image_size
         self.channels = channels
+        self.max_num_frames = max_num_frames
 
         self.paths = [p for ext in exts for p in Path(f'{folder}').glob(f'**/*.{ext}')]
         assert len(self.paths) > 0, f'no videos found in {folder}'
 
         self.transform = T.Compose([
             T.Resize(image_size),
-            T.RandomHorizontalFlip() if horizontal_flip else T.Lambda(lambda t: t),
             T.CenterCrop(image_size)
         ])
 
@@ -216,9 +216,25 @@ class VideoDataset(Dataset):
         else:
             raise ValueError(f'unknown extension {ext}')
 
+        frames = tensor.shape[1]
+        time_lens = min(frames, self.max_num_frames) if exists(self.max_num_frames) else frames
+
+        if exists(self.max_num_frames):
+            if frames > self.max_num_frames:
+                start = randint(0, frames - self.max_num_frames)
+                tensor = slice_at_dim(tensor, slice(start, start + self.max_num_frames), dim = 1)
+            elif frames < self.max_num_frames:
+                pad_len = self.max_num_frames - frames
+                tensor = pad_right_at_dim(tensor, pad_len, dim = 1)
+
         tensor = rearrange(tensor, 'c f h w -> f c h w')
         tensor = self.transform(tensor)
-        return rearrange(tensor, 'f c h w -> c f h w')
+        tensor = rearrange(tensor, 'f c h w -> c f h w')
+        
+        return dict(
+            video = tensor,
+            time_lens = time_lens
+        )
 
 class VideoDatasetFromReplayBuffer(Dataset):
     def __init__(
@@ -612,6 +628,9 @@ class VideoTokenizerTrainer(Module):
                     step = self.step.item()
                 )
                 torch.save(pkg, str(ckpt_path))
+                
+                import shutil
+                shutil.copy(str(ckpt_path), str(self.checkpoint_folder / 'tokenizer.pt'))
 
                 if self.use_ema:
                     ema_ckpt_path = self.checkpoint_folder / f'tokenizer-{self.step.item()}-ema.pt'
@@ -624,6 +643,7 @@ class VideoTokenizerTrainer(Module):
                         step = self.step.item()
                     )
                     torch.save(ema_pkg, str(ema_ckpt_path))
+                    shutil.copy(str(ema_ckpt_path), str(self.checkpoint_folder / 'tokenizer-ema.pt'))
 
                 self.print(f"checkpoint saved to {ckpt_path}")
 
