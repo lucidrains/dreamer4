@@ -16,7 +16,7 @@ from torch.utils.data import Dataset, DataLoader, TensorDataset
 import torchvision.transforms as T
 
 from einops import rearrange, repeat, reduce
-from torch_einops_utils import shape_with_replace, pad_right_at_dim, slice_at_dim
+from torch_einops_utils import shape_with_replace, pad_right_at_dim
 
 from pathlib import Path
 
@@ -222,7 +222,7 @@ class VideoDataset(Dataset):
         if exists(self.max_num_frames):
             if frames > self.max_num_frames:
                 start = randint(0, frames - self.max_num_frames)
-                tensor = slice_at_dim(tensor, slice(start, start + self.max_num_frames), dim = 1)
+                tensor = tensor.narrow(1, start, self.max_num_frames)
             elif frames < self.max_num_frames:
                 pad_len = self.max_num_frames - frames
                 tensor = pad_right_at_dim(tensor, pad_len, dim = 1)
@@ -231,10 +231,7 @@ class VideoDataset(Dataset):
         tensor = self.transform(tensor)
         tensor = rearrange(tensor, 'f c h w -> c f h w')
         
-        return dict(
-            video = tensor,
-            time_lens = time_lens
-        )
+        return tensor
 
 class VideoDatasetFromReplayBuffer(Dataset):
     def __init__(
@@ -260,10 +257,7 @@ class VideoDatasetFromReplayBuffer(Dataset):
 
         video = self.transform(video)
 
-        return dict(
-            video = video,
-            time_lens = time_lens
-        )
+        return video
 
 def video_tensor_collate_fn(data):
     if not data:

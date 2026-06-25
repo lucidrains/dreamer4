@@ -62,8 +62,6 @@ from torch_einops_utils import (
     repeat_interleave_to_match,
     safe_stack,
     safe_cat,
-    slice_right_at_dim,
-    slice_left_at_dim,
     tree_flatten_with_inverse,
     tree_map_tensor
 )

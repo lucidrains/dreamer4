@@ -77,9 +77,25 @@ def train(
         encoder_add_decorr_aux_loss = encoder_add_decorr_aux_loss
     )
 
+    checkpoint_dir = Path(checkpoint_folder) / name
+    log_directory = Path(log_dir) / name
+
+    if force_restart:
+        if checkpoint_dir.exists():
+            rmtree(checkpoint_dir)
+        if log_directory.exists():
+            rmtree(log_directory)
+
+    latest_checkpoint = checkpoint_dir / "tokenizer.pt"
+    checkpoint_path_str = str(latest_checkpoint) if latest_checkpoint.exists() else None
+
+    if exists(checkpoint_path_str):
+        print(f"loading checkpoint from {checkpoint_path_str}")
+
     trainer = VideoTokenizerTrainer(
         model = tokenizer,
         dataset = dataset,
+        checkpoint_path = checkpoint_path_str,
         optim_klass = MuonAdamAtan2,
         batch_size = batch_size,
         grad_accum_every = grad_accum_every,
@@ -97,24 +113,6 @@ def train(
         project_name = project_name,
         run_name = name,
     )
-
-    checkpoint_dir = Path(checkpoint_folder) / name
-    log_directory = Path(log_dir) / name
-
-    if force_restart:
-        if checkpoint_dir.exists():
-            rmtree(checkpoint_dir)
-        if log_directory.exists():
-            rmtree(log_directory)
-            log_directory.mkdir(parents = True, exist_ok = True)
-
-            if exists(trainer.results_folder):
-                trainer.results_folder.mkdir(parents = True, exist_ok = True)
-
-    latest_checkpoint = checkpoint_dir / "tokenizer.pt"
-    if latest_checkpoint.exists():
-        print(f"loading checkpoint from {latest_checkpoint}")
-        trainer.load(str(latest_checkpoint))
 
     trainer()
 
