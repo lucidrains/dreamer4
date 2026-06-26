@@ -133,6 +133,26 @@ ema_tokenizer = VideoTokenizer.init_and_load('./checkpoints/experiment_name/toke
 
 ```
 
+You can then train the dynamics world model using the trained tokenizer:
+
+```bash
+dreamer4 train-dynamics /path/to/videos \
+    --tokenizer_checkpoint ./checkpoints/experiment_name/tokenizer-ema.pt \
+    --name experiment_name \
+    --batch_size 2
+```
+
+If your dataset contains continuous or discrete actions saved as `.action.npy` files alongside your videos, you can train an action-conditioned model:
+
+```bash
+dreamer4 train-dynamics /path/to/videos \
+    --tokenizer_checkpoint ./checkpoints/experiment_name/tokenizer-ema.pt \
+    --name experiment_name \
+    --condition_on_actions True \
+    --num_continuous_actions 6 \
+    --batch_size 2
+```
+
 ## Moving MNIST
 
 To train a simple tokenizer on Moving MNIST for 20000 steps and then use it to generate action-conditioned dynamics models

@@ -13,6 +13,8 @@ from torch.nn import Module
 from torch.optim import AdamW
 from torch.utils.data import Dataset, DataLoader, TensorDataset
 
+import numpy as np
+
 import torchvision.transforms as T
 
 from einops import rearrange, repeat, reduce
@@ -57,6 +59,13 @@ def cast_tuple(val, length = 1):
 
 def divisible_by(num, den):
     return (num % den) == 0
+
+def check_import(module_name, err_msg):
+    import importlib
+    try:
+        importlib.import_module(module_name)
+    except ImportError:
+        raise ImportError(err_msg)
 
 # augmentation
 
@@ -179,6 +188,57 @@ def gif_to_tensor(path, channels = 3, num_frames = -1):
     tensors = tuple(map(T.ToTensor(), seek_all_images(img, channels = channels, num_frames = num_frames)))
     return stack(tensors, dim = 1)
 
+# datasets
+
+def sample_video_and_actions(
+    video,                  # (c, f, h, w)
+    actions = None,         # (f - 1, ...) or tuple of (f - 1, ...)
+    max_num_frames = None,
+    random_crop = True
+):
+    frames = video.shape[1]
+    start = 0
+
+    if exists(max_num_frames):
+        if frames > max_num_frames:
+            start = randint(0, frames - max_num_frames) if random_crop else 0
+            video = video.narrow(1, start, max_num_frames)
+        elif frames < max_num_frames:
+            pad_len = max_num_frames - frames
+            video = pad_right_at_dim(video, pad_len, dim = 1)
+
+    if not exists(actions):
+        return video, None, start, frames
+
+    num_action_frames = (max_num_frames - 1) if exists(max_num_frames) else (frames - 1)
+
+    is_tuple = isinstance(actions, tuple)
+    actions = cast_tuple(actions)
+
+    sliced_actions = []
+
+    for act in actions:
+        if not exists(act):
+            sliced_actions.append(None)
+            continue
+
+        action_len = act.shape[0]
+
+        if action_len > num_action_frames:
+            act = act[start:start + num_action_frames]
+        elif action_len < num_action_frames:
+            pad_len = num_action_frames - action_len
+
+            if torch.is_tensor(act):
+                act = pad_right_at_dim(act, pad_len, dim = 0)
+            else:
+                act = np.pad(act, ((0, pad_len), (0, 0)))
+
+        sliced_actions.append(act)
+
+    actions = tuple(sliced_actions) if is_tuple else sliced_actions[0]
+    return video, actions, start, frames
+
 class VideoDataset(Dataset):
     def __init__(
         self,
@@ -186,16 +246,21 @@ class VideoDataset(Dataset):
         image_size,
         channels = 3,
         max_num_frames = None,
-        exts: list[str] = ['gif', 'mp4']
+        exts: list[str] = ['gif', 'mp4'],
+        random_crop = True
     ):
         super().__init__()
+        if isinstance(folder, str):
+            folder = Path(folder)
+
         self.folder = folder
         self.image_size = image_size
         self.channels = channels
         self.max_num_frames = max_num_frames
+        self.random_crop = random_crop
 
-        self.paths = [p for ext in exts for p in Path(f'{folder}').glob(f'**/*.{ext}')]
-        assert len(self.paths) > 0, f'no videos found in {folder}'
+        self.paths = [p for ext in exts for p in self.folder.glob(f'**/*.{ext}')]
+        assert len(self.paths) > 0, f'no videos found in {self.folder}'
 
         self.transform = T.Compose([
             T.Resize(image_size),
@@ -205,7 +270,7 @@ class VideoDataset(Dataset):
     def __len__(self):
         return len(self.paths)
 
-    def __getitem__(self, index):
+    def _get_tensor(self, index):
         path = self.paths[index]
         ext = path.suffix.lower()
 
@@ -216,32 +281,76 @@ class VideoDataset(Dataset):
         else:
             raise ValueError(f'unknown extension {ext}')
 
-        frames = tensor.shape[1]
-        time_lens = min(frames, self.max_num_frames) if exists(self.max_num_frames) else frames
+        return tensor
 
-        if exists(self.max_num_frames):
-            if frames > self.max_num_frames:
-                start = randint(0, frames - self.max_num_frames)
-                tensor = tensor.narrow(1, start, self.max_num_frames)
-            elif frames < self.max_num_frames:
-                pad_len = self.max_num_frames - frames
-                tensor = pad_right_at_dim(tensor, pad_len, dim = 1)
+    def __getitem__(self, index):
+        tensor = self._get_tensor(index)
+
+        tensor, _, _, _ = sample_video_and_actions(
+            tensor, max_num_frames = self.max_num_frames, random_crop = self.random_crop
+        )
 
         tensor = rearrange(tensor, 'c f h w -> f c h w')
         tensor = self.transform(tensor)
         tensor = rearrange(tensor, 'f c h w -> c f h w')
-        
+
         return tensor
+
+class VideoDatasetWithActions(VideoDataset):
+    """
+    Loads videos and corresponding '.action.npy' files.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.paths = sorted(self.paths)
+
+    def __getitem__(self, index):
+        tensor = self._get_tensor(index)
+
+        action_path = self.paths[index].with_name(self.paths[index].stem + '.action.npy')
+
+        actions_np = np.load(action_path) if action_path.exists() else None
+
+        tensor, actions_np, _, _ = sample_video_and_actions(
+            tensor, actions_np, max_num_frames = self.max_num_frames, random_crop = self.random_crop
+        )
+
+        tensor = rearrange(tensor, 'c f h w -> f c h w')
+        tensor = self.transform(tensor)
+        tensor = rearrange(tensor, 'f c h w -> c f h w')
+
+        res = dict(video = tensor)
+
+        if not exists(actions_np):
+            return res
+
+        action_tensor = torch.from_numpy(actions_np)
+
+        if action_tensor.is_floating_point():
+            res['continuous_actions'] = action_tensor
+        else:
+            res['discrete_actions'] = action_tensor
+
+        return res
 
 class VideoDatasetFromReplayBuffer(Dataset):
     def __init__(
         self,
         replay_buffer,
-        transform = None
+        image_size,
+        max_num_frames = None,
+        random_crop = True
     ):
         super().__init__()
         self.dataset = replay_buffer.dataset()
-        self.transform = default(transform, T.Lambda(lambda t: t))
+
+        self.transform = T.Compose([
+            T.Resize(image_size),
+            T.CenterCrop(image_size)
+        ])
+
+        self.max_num_frames = max_num_frames
+        self.random_crop = random_crop
 
     def __len__(self):
         return len(self.dataset)
@@ -255,10 +364,31 @@ class VideoDatasetFromReplayBuffer(Dataset):
         if video.ndim == 4:
             video = rearrange(video, 'f c h w -> c f h w')
 
-        video = self.transform(video)
         video = video[:, :time_lens]
 
-        return video
+        cont_actions = data.get('continuous_actions')
+        disc_actions = data.get('discrete_actions')
+
+        if exists(cont_actions):
+            cont_actions = cont_actions[:time_lens - 1]
+        if exists(disc_actions):
+            disc_actions = disc_actions[:time_lens - 1]
+
+        video, (cont_actions, disc_actions), _, _ = sample_video_and_actions(
+            video, (cont_actions, disc_actions), max_num_frames=self.max_num_frames, random_crop=self.random_crop
+        )
+
+        video = self.transform(video)
+
+        res = dict(video = video)
+
+        if exists(cont_actions):
+            res['continuous_actions'] = cont_actions
+
+        if exists(disc_actions):
+            res['discrete_actions'] = disc_actions
+
+        return res
 
 def video_tensor_collate_fn(data):
     if not data:
@@ -341,6 +471,9 @@ class VideoTokenizerTrainer(Module):
 
             if use_tensorboard:
                 self.video_logger = self.accelerator.get_tracker("tensorboard").writer.add_video
+
+            if use_wandb:
+                check_import('moviepy', 'wandb video logging requires the moviepy package. Please install it using `pip install moviepy` or `pip install "wandb[media]"`')
 
         self.log_video_flag = log_video
         self.checkpoint_every = checkpoint_every
@@ -623,7 +756,7 @@ class VideoTokenizerTrainer(Module):
                     step = self.step.item()
                 )
                 torch.save(pkg, str(ckpt_path))
-                
+
                 import shutil
                 shutil.copy(str(ckpt_path), str(self.checkpoint_folder / 'tokenizer.pt'))
 
@@ -797,6 +930,9 @@ class BehaviorCloneTrainer(Module):
 
             if use_tensorboard:
                 self.video_logger = self.accelerator.get_tracker("tensorboard").writer.add_video
+
+            if use_wandb:
+                check_import('moviepy', 'wandb video logging requires the moviepy package. Please install it using `pip install moviepy` or `pip install "wandb[media]"`')
 
         self.log_video_flag = log_video
         self.sample_time_steps = sample_time_steps

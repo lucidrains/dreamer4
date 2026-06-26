@@ -631,7 +631,7 @@ def test_tokenizer_trainer_with_replay_buffer(tmp_path):
 
     exp.add_to_memmap_buffer(buffer)
 
-    dataset = VideoDatasetFromReplayBuffer(buffer)
+    dataset = VideoDatasetFromReplayBuffer(buffer, image_size = 64)
 
     tokenizer = VideoTokenizer(
         16,
@@ -2202,6 +2202,113 @@ def test_video_tokenizer_trainer():
         batch_size = 2,
         num_train_steps = 1,
         collate_fn = video_tensor_collate_fn
+    )
+
+    trainer()
+
+def test_dynamics_save_load(tmp_path):
+    import os
+    import torch
+    from pathlib import Path
+    from torch_einops_utils.nn import count_parameters
+    from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
+
+    tokenizer = VideoTokenizer(
+        dim = 128,
+        dim_latent = 16,
+        patch_size = 8,
+        image_height = 64,
+        image_width = 64,
+        encoder_depth = 2,
+        decoder_depth = 2,
+    )
+
+    model = DynamicsWorldModel(
+        video_tokenizer = tokenizer,
+        dim_latent = tokenizer.dim_latent,
+        dim = 256,
+        depth = 2,
+        attn_dim_head = 32,
+        attn_heads = 4,
+        num_continuous_actions = 0,
+        num_discrete_actions = 0,
+    )
+
+    assert model.video_tokenizer is not tokenizer, "Tokenizer was not deepcopied!"
+    for param in model.video_tokenizer.parameters():
+        assert not param.requires_grad, "Tokenizer parameters should not require gradients"
+    assert not model.video_tokenizer.training, "Tokenizer should be in eval mode"
+
+    save_path = tmp_path / 'test_dyn.pt'
+    model.save(save_path)
+
+    # Using init_and_load provided by @save_load from torch_einops_utils
+
+    reconstituted_model = DynamicsWorldModel.init_and_load(save_path, strict=True)
+
+    assert exists(reconstituted_model.video_tokenizer), "Tokenizer was not reconstituted!"
+    assert reconstituted_model.video_tokenizer.dim_latent == tokenizer.dim_latent, "Tokenizer config mismatch!"
+
+    # Assert parameters match
+    model_params = count_parameters(model)
+    recon_params = count_parameters(reconstituted_model)
+    assert model_params == recon_params, f"Weights mismatch: {model_params} != {recon_params}"
+
+def test_actions_e2e():
+    import torch
+    from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
+    from dreamer4.trainers import VideoDatasetWithActions, BehaviorCloneTrainer
+
+    data_folder = 'tests/mock_videos'
+
+    tokenizer = VideoTokenizer(
+        dim = 16,
+        patch_size = 8,
+        dim_latent = 32,
+        num_latent_tokens = 1,
+        image_height = 64,
+        image_width = 64
+    )
+    tokenizer.eval().requires_grad_(False)
+
+    dataset = VideoDatasetWithActions(
+        folder = data_folder,
+        image_size = 64,
+        channels = 3,
+        max_num_frames = 8,
+        exts = ['mp4']
+    )
+
+    assert len(dataset) > 0, "No datasets found!"
+
+    sample = dataset[0]
+    assert 'continuous_actions' in sample, "Actions were not loaded!"
+    num_cont_actions = sample['continuous_actions'].shape[-1]
+    assert num_cont_actions == 6, f"Expected 6 continuous actions, got {num_cont_actions}"
+
+    model = DynamicsWorldModel(
+        video_tokenizer = tokenizer,
+        dim_latent = tokenizer.dim_latent,
+        dim = 16,
+        depth = 1,
+        attn_dim_head = 8,
+        attn_heads = 2,
+        num_continuous_actions = num_cont_actions,
+        num_discrete_actions = 0
+    )
+
+    trainer = BehaviorCloneTrainer(
+        model = model,
+        dataset = dataset,
+        batch_size = 2,
+        learning_rate = 3e-4,
+        num_train_steps = 2,
+        checkpoint_every = 0,
+        log_video = False,
+        log_video_every = 0,
+        use_tensorboard = False,
+        use_wandb = False,
+        log_dir = './logs_test'
     )
 
     trainer()

@@ -4578,12 +4578,14 @@ class SelfFlow(Module):
 
 # dynamics model, axial space-time transformer
 
+@save_load
 class DynamicsWorldModel(Module):
     def __init__(
         self,
         dim,
         dim_latent,
         video_tokenizer: VideoTokenizer | None = None,
+        copy_video_tokenizer = True,
         aux_image_encoder: Module | None = None,
         freeze_aux_image_encoder = False,
         max_steps = 64,                # K_max in paper
@@ -4702,6 +4704,12 @@ class DynamicsWorldModel(Module):
         self.has_latent_ar = latent_ar
 
         # can accept raw video if tokenizer is passed in
+
+        if exists(video_tokenizer) and copy_video_tokenizer:
+            video_tokenizer = deepcopy(video_tokenizer)
+            video_tokenizer.requires_grad_(False)
+
+        video_tokenizer = video_tokenizer.eval()
 
         self.video_tokenizer = video_tokenizer
         self.aux_image_encoder = aux_image_encoder
