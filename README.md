@@ -153,6 +153,14 @@ dreamer4 train-dynamics /path/to/videos \
     --batch_size 2
 ```
 
+And similarly, you can load the trained dynamics world model:
+
+```python
+from dreamer4 import DynamicsWorldModel
+
+world_model = DynamicsWorldModel.init_and_load('./checkpoints/experiment_name/dynamics.pt')
+```
+
 ## Moving MNIST
 
 To train a simple tokenizer on Moving MNIST for 20000 steps and then use it to generate action-conditioned dynamics models
