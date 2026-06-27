@@ -2,6 +2,9 @@ from __future__ import annotations
 from typing import Literal
 
 import math
+import pickle
+import shutil
+
 from collections import OrderedDict, namedtuple
 from random import randint
 from functools import wraps
@@ -19,6 +22,7 @@ import torchvision.transforms as T
 
 from einops import rearrange, repeat, reduce
 from torch_einops_utils import shape_with_replace, pad_right_at_dim
+from torch_einops_utils.save_load import dehydrate_config
 
 from pathlib import Path
 
@@ -430,7 +434,8 @@ class VideoTokenizerTrainer(Module):
         checkpoint_folder = './checkpoints_tokenizer',
         custom_aug_fn = None,
         aug_prob = 0.5,
-        collate_fn = None
+        collate_fn = None,
+        apply_byol_every = 1
     ):
         super().__init__()
         batch_size = min(batch_size, len(dataset))
@@ -495,6 +500,13 @@ class VideoTokenizerTrainer(Module):
             lr = learning_rate,
             weight_decay = weight_decay
         )
+
+        self.apply_byol_every = apply_byol_every
+        self.has_byol = model.has_byol
+
+        if self.has_byol:
+            assert use_ema, 'EMA must be enabled for BYOL'
+            assert apply_byol_every > 0, 'apply_byol_every must be > 0'
 
         if optim_klass is MuonAdamAtan2:
             optim = MuonAdamAtan2(
@@ -630,13 +642,28 @@ class VideoTokenizerTrainer(Module):
                 if exists(self.custom_aug_fn):
                     video, aug_id = self.custom_aug_fn(video, prob = self.aug_prob)
 
-                loss, (losses, recon_video) = self.model(
+                byol_target_latents = None
+                is_byol_step = self.has_byol and divisible_by(self.step.item(), self.apply_byol_every)
+
+                if is_byol_step:
+                    byol_target_latents = self.ema_model(
+                        video,
+                        return_latents = True,
+                        mask_patches = False,
+                        aug_id = aug_id
+                    )
+
+                loss, intermediates = self.model(
                     video,
                     time_lens = time_lens,
                     update_loss_ema = True,
                     return_intermediates = True,
-                    aug_id = aug_id
+                    aug_id = aug_id,
+                    byol_target_latents = byol_target_latents
                 )
+
+                losses = intermediates.losses
+                recon_video = intermediates.recon
 
                 loss = loss / self.grad_accum_every
 
@@ -661,7 +688,8 @@ class VideoTokenizerTrainer(Module):
                 time_decorr_loss = losses.time_decorr.item(),
                 space_decorr_loss = losses.space_decorr.item(),
                 latent_ortho_loss = losses.latent_ortho.item(),
-                latent_ar_loss = losses.latent_ar.item()
+                latent_ar_loss = losses.latent_ar.item(),
+                byol_loss = losses.byol.item()
             )
 
             if self.log_video_flag and divisible_by(self.step.item(), self.log_video_every) and self.is_main_process:
@@ -682,7 +710,8 @@ class VideoTokenizerTrainer(Module):
                             return_recons_across_steps = True
                         )
                     else:
-                        _, (_, recon_video) = sample_model(video, return_intermediates = True)
+                        _, intermediates = sample_model(video, return_intermediates = True)
+                        recon_video = intermediates.recon
                         all_pred_videos = [recon_video]
 
                 recon_video = recon_video.clamp(0., 1.)
@@ -736,6 +765,10 @@ class VideoTokenizerTrainer(Module):
             if latent_consistency_loss > 0.:
                 postfix_kwargs['latent_consistency'] = f"{latent_consistency_loss:.4f}"
 
+            byol_loss = losses.byol.item()
+            if byol_loss > 0.:
+                postfix_kwargs['byol'] = f"{byol_loss:.4f}"
+
             pbar.set_postfix(**postfix_kwargs)
 
             self.step += 1
@@ -748,8 +781,6 @@ class VideoTokenizerTrainer(Module):
                 model = self.unwrap_model(self.model)
                 config = getattr(model, '_config', None)
 
-                import pickle
-                from torch_einops_utils.save_load import dehydrate_config
                 pkg = dict(
                     model = model.state_dict(),
                     config = pickle.dumps(dehydrate_config(config, '_config')) if config else None,
@@ -757,7 +788,6 @@ class VideoTokenizerTrainer(Module):
                 )
                 torch.save(pkg, str(ckpt_path))
 
-                import shutil
                 shutil.copy(str(ckpt_path), str(self.checkpoint_folder / 'tokenizer.pt'))
 
                 if self.use_ema:

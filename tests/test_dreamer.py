@@ -2312,3 +2312,46 @@ def test_actions_e2e():
     )
 
     trainer()
+
+@pytest.mark.parametrize('byol_use_sem', (False, True))
+def test_video_byol(byol_use_sem):
+    from dreamer4.trainers import VideoTokenizerTrainer
+    from dreamer4.dreamer4 import VideoTokenizer
+    from torch.utils.data import Dataset
+
+    class MockDataset(Dataset):
+        def __len__(self):
+            return 2
+
+        def __getitem__(self, idx):
+            return dict(
+                video = torch.randn(3, 2, 64, 64),
+                time_lens = 2
+            )
+
+    dataset = MockDataset()
+
+    tokenizer = VideoTokenizer(
+        16,
+        encoder_depth = 1,
+        decoder_depth = 1,
+        time_block_every = 1,
+        dim_latent = 16,
+        patch_size = 32,
+        attn_dim_head = 16,
+        num_latent_tokens = 4,
+        has_byol = True,
+        byol_use_sem = byol_use_sem
+    )
+
+    trainer = VideoTokenizerTrainer(
+        tokenizer,
+        dataset = dataset,
+        num_train_steps = 1,
+        batch_size = 1,
+        cpu = True,
+        max_grad_norm = 0.5,
+        use_ema = True
+    )
+
+    trainer()

@@ -113,7 +113,7 @@ LayerNormNoBias = partial(nn.LayerNorm, bias = False)
 
 VideoTokenizerIntermediates = namedtuple('VideoTokenizerIntermediates', ('losses', 'recon'))
 
-TokenizerLosses = namedtuple('TokenizerLosses', ('recon', 'flow_recon', 'lpips', 'time_decorr', 'space_decorr', 'latent_ortho', 'latent_ar', 'latent_ar_sigreg', 'latent_consistency', 'latent_sigreg', 'h_net'))
+TokenizerLosses = namedtuple('TokenizerLosses', ('recon', 'flow_recon', 'lpips', 'time_decorr', 'space_decorr', 'latent_ortho', 'latent_ar', 'latent_ar_sigreg', 'latent_consistency', 'latent_sigreg', 'h_net', 'byol'))
 
 WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'shortcut', 'rewards', 'terminals', 'discrete_actions', 'continuous_actions', 'state_pred', 'agent_state_pred', 'latent_ar', 'latent_ar_sigreg', 'lapo_action', 'lapo_fdm', 'lapo_raw_latent_fdm', 'tem', 'h_net'))
 
@@ -3737,7 +3737,12 @@ class VideoTokenizer(Module):
         aug_cfg_dropout_prob = 0.1,
         separate_flow_decoder = False,
         flow_decoder_train_prob = 0.5,
-        encode_temporal_diff = False
+        encode_temporal_diff = False,
+        has_byol = False,
+        byol_loss_weight = 1.,
+        byol_use_sem = False,
+        byol_sem_simplex_dim = 8,
+        byol_sem_temperature = 0.1
     ):
         super().__init__()
 
@@ -3748,6 +3753,21 @@ class VideoTokenizer(Module):
         self.dim_latent = dim_latent
         self.num_latent_tokens = num_latent_tokens
         self.latent_tokens = Parameter(randn(num_latent_tokens, dim) * 1e-2)
+
+        # byol - https://arxiv.org/abs/2006.07733
+
+        self.has_byol = has_byol
+        self.byol_loss_weight = byol_loss_weight
+        self.byol_predictor = None
+
+        if has_byol:
+            self.byol_predictor = create_mlp(dim_latent, depth = 3, dim_out = dim_latent)
+
+            if byol_use_sem:
+                self.byol_predictor = Sequential(
+                    SEM(dim_latent, temperature = byol_sem_temperature, dim_simplex = byol_sem_simplex_dim, pre_layernorm = True),
+                    self.byol_predictor
+                )
 
         # mae masking - Kaiming He paper from long ago
 
@@ -4174,7 +4194,8 @@ class VideoTokenizer(Module):
         return_time_cache = False,
         time_lens = None,
         aug_id = None,
-        cfg_dropout_aug = None
+        cfg_dropout_aug = None,
+        byol_target_latents = None
     ):
         mask_patches = default(mask_patches, self.training and not return_latents)
 
@@ -4466,6 +4487,11 @@ class VideoTokenizer(Module):
         if self.has_latent_ortho_loss and exists(latents):
             latent_ortho_loss = orthogonal_loss(latents)
 
+        byol_loss = self.zero
+        if self.has_byol and exists(byol_target_latents):
+            pred_latents = self.byol_predictor(latents)
+            byol_loss = F.smooth_l1_loss(pred_latents, byol_target_latents.detach())
+
         # losses
 
         if self.use_loss_normalization:
@@ -4493,8 +4519,6 @@ class VideoTokenizer(Module):
             if self.has_latent_sigreg_loss:
                 latent_sigreg_loss = self.latent_sigreg_loss_normalizer(latent_sigreg_loss, update_ema = update_loss_ema)
 
-        # losses
-
         total_loss = (
             recon_loss +
             flow_recon_loss +
@@ -4506,20 +4530,21 @@ class VideoTokenizer(Module):
             latent_ar_sigreg_loss * self.latent_ar_sigreg_loss_weight +
             latent_consistency_loss * self.latent_consistency_loss_weight +
             latent_sigreg_loss * self.latent_sigreg_loss_weight +
-            h_net_loss * self.h_net_loss_weight
+            h_net_loss * self.h_net_loss_weight +
+            byol_loss * self.byol_loss_weight
         )
 
         if not return_intermediates:
             return total_loss
 
-        losses = TokenizerLosses(recon_loss, flow_recon_loss, lpips_loss, time_decorr_loss, space_decorr_loss, latent_ortho_loss, latent_ar_loss, latent_ar_sigreg_loss, latent_consistency_loss, latent_sigreg_loss, h_net_loss)
+        losses = TokenizerLosses(recon_loss, flow_recon_loss, lpips_loss, time_decorr_loss, space_decorr_loss, latent_ortho_loss, latent_ar_loss, latent_ar_sigreg_loss, latent_consistency_loss, latent_sigreg_loss, h_net_loss, byol_loss)
 
         # handle returning of reconstructed, and image pretraining
 
         if is_image:
             recon_video = rearrange(recon_video, 'b c 1 h w -> b c h w')
 
-        out = (losses, recon_video)
+        out = VideoTokenizerIntermediates(losses, recon_video)
 
         return total_loss, out
 
