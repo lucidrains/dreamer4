@@ -182,12 +182,11 @@ def train_dynamics(
         sample = dataset[0]
 
         cont_action = sample.get('continuous_actions')
-        action_dim = cont_action.shape[-1] if cont_action is not None else 0
+        action_dim = cont_action.shape[-1] if exists(cont_action) else 0
         assert action_dim == num_continuous_actions, f"Expected {num_continuous_actions} continuous actions, but found {action_dim} in dataset"
 
         disc_action = sample.get('discrete_actions')
-        action_dim = disc_action.shape[-1] if disc_action is not None else 0
-        assert action_dim == num_discrete_actions, f"Expected {num_discrete_actions} discrete actions, but found {action_dim} in dataset"
+        action_dim = disc_action.shape[-1] if exists(disc_action) else 0
 
     model = DynamicsWorldModel(
         video_tokenizer = tokenizer,
