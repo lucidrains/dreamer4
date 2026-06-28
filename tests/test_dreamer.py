@@ -2254,12 +2254,50 @@ def test_dynamics_save_load(tmp_path):
     recon_params = count_parameters(reconstituted_model)
     assert model_params == recon_params, f"Weights mismatch: {model_params} != {recon_params}"
 
-def test_actions_e2e():
+@pytest.mark.parametrize('action_type', ['discrete', 'continuous', 'multi_discrete'])
+def test_actions_e2e(tmp_path, action_type):
     import torch
+    import gymnasium as gym
+    import numpy as np
     from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
-    from dreamer4.trainers import VideoDatasetWithActions, BehaviorCloneTrainer
+    from dreamer4.trainers import VideoTrajectoryDataset, BehaviorCloneTrainer
+    from dreamer4.env import RecordToFolderEnvWrapper
 
-    data_folder = 'tests/mock_videos'
+    data_folder = tmp_path / 'mock_videos'
+    data_folder.mkdir(exist_ok=True, parents=True)
+
+    class RenderObsWrapper(gym.ObservationWrapper):
+        def observation(self, obs):
+            img = self.env.render()
+            import cv2
+            return cv2.resize(img, (64, 64))
+
+    if action_type == 'discrete':
+        raw_env = RenderObsWrapper(gym.make('CartPole-v1', render_mode = 'rgb_array'))
+    elif action_type == 'continuous':
+        raw_env = RenderObsWrapper(gym.make('LunarLanderContinuous-v3', render_mode = 'rgb_array'))
+    elif action_type == 'multi_discrete':
+        class MockMultiDiscreteEnv(gym.Env):
+            def __init__(self):
+                self.action_space = gym.spaces.MultiDiscrete([3, 4])
+                self.observation_space = gym.spaces.Box(low=0, high=255, shape=(64, 64, 3), dtype=np.uint8)
+            def reset(self, **kwargs):
+                return self.observation_space.sample(), {}
+            def step(self, action):
+                return self.observation_space.sample(), 1.0, False, False, {}
+            def render(self):
+                return self.observation_space.sample()
+        raw_env = MockMultiDiscreteEnv()
+
+    env = RecordToFolderEnvWrapper(raw_env, folder = str(data_folder))
+    env.reset()
+    for _ in range(8):
+        if action_type == 'continuous':
+            action = np.random.uniform(0.0, 1.0, size=env.action_space.shape).astype(np.float32)
+            env.step(action)
+        else:
+            env.step(env.action_space.sample())
+    env.close()
 
     tokenizer = VideoTokenizer(
         dim = 16,
@@ -2271,8 +2309,8 @@ def test_actions_e2e():
     )
     tokenizer.eval().requires_grad_(False)
 
-    dataset = VideoDatasetWithActions(
-        folder = data_folder,
+    dataset = VideoTrajectoryDataset(
+        folder = str(data_folder),
         image_size = 64,
         channels = 3,
         max_num_frames = 8,
@@ -2280,11 +2318,17 @@ def test_actions_e2e():
     )
 
     assert len(dataset) > 0, "No datasets found!"
-
     sample = dataset[0]
-    assert 'continuous_actions' in sample, "Actions were not loaded!"
-    num_cont_actions = sample['continuous_actions'].shape[-1]
-    assert num_cont_actions == 6, f"Expected 6 continuous actions, got {num_cont_actions}"
+
+    num_discrete_actions = 0
+    num_continuous_actions = 0
+
+    if action_type == 'discrete':
+        num_discrete_actions = int(raw_env.action_space.n)
+    elif action_type == 'continuous':
+        num_continuous_actions = int(raw_env.action_space.shape[0])
+    elif action_type == 'multi_discrete':
+        num_discrete_actions = tuple(raw_env.action_space.nvec)
 
     model = DynamicsWorldModel(
         video_tokenizer = tokenizer,
@@ -2293,8 +2337,8 @@ def test_actions_e2e():
         depth = 1,
         attn_dim_head = 8,
         attn_heads = 2,
-        num_continuous_actions = num_cont_actions,
-        num_discrete_actions = 0
+        num_continuous_actions = num_continuous_actions,
+        num_discrete_actions = num_discrete_actions
     )
 
     trainer = BehaviorCloneTrainer(
@@ -2308,7 +2352,7 @@ def test_actions_e2e():
         log_video_every = 0,
         use_tensorboard = False,
         use_wandb = False,
-        log_dir = './logs_test'
+        log_dir = str(tmp_path / 'logs_test')
     )
 
     trainer()

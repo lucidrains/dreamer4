@@ -356,6 +356,7 @@ def main(
         use_attn_pool = use_attn_pool,
         use_continuous_actions = use_continuous_actions,
         continuous_dist_type = continuous_dist_type,
+        continuous_target_action_range = (-3.0, 3.0) if use_continuous_actions else None,
         depth = depth,
         actor_depth = actor_depth,
         critic_depth = critic_depth,
@@ -430,7 +431,7 @@ def main(
             max_timesteps = max_timesteps,
             env_is_vectorized = vectorized,
             store_agent_embed = False,
-            store_old_action_unembeds = True
+            store_old_action_unembeds = True,
         )
 
         # track returns

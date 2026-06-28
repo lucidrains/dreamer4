@@ -7,7 +7,7 @@ from shutil import rmtree
 from adam_atan2_pytorch import MuonAdamAtan2
 
 from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
-from dreamer4.trainers import VideoTokenizerTrainer, VideoDataset, BehaviorCloneTrainer
+from dreamer4.trainers import VideoTokenizerTrainer, VideoDataset, VideoTrajectoryDataset, BehaviorCloneTrainer
 
 def exists(val):
     return val is not None
@@ -158,8 +158,7 @@ def train_dynamics(
     run_name = f"{name}{suffix}"
 
     if condition_on_actions:
-        from dreamer4.trainers import VideoDatasetWithActions
-        dataset = VideoDatasetWithActions(
+        dataset = VideoTrajectoryDataset(
             folder = data_path,
             image_size = image_size,
             channels = channels,
@@ -176,7 +175,7 @@ def train_dynamics(
         )
 
     print(f"Loading tokenizer from: {tokenizer_path}")
-    tokenizer = VideoTokenizer.init_and_load(tokenizer_path, strict=False)
+    tokenizer = VideoTokenizer.init_and_load(tokenizer_path, strict = False)
 
     if condition_on_actions:
         sample = dataset[0]

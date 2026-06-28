@@ -1,9 +1,13 @@
+from pathlib import Path
 import shutil
 import pytest
 import numpy as np
-from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from memmap_replay_buffer import ReplayBuffer
+
+param = pytest.mark.parametrize
+
 from dreamer4.env import RecordToFolderEnvWrapper, RecordToReplayBufferEnvWrapper
 from dreamer4.dreamer4 import DynamicsWorldModel, VideoTokenizer
 
@@ -23,52 +27,58 @@ class MockEnv:
         self.num_steps = num_steps
         self.img_shape = img_shape
         self.steps = 0
-        
+
     def reset(self, **kwargs):
         self.steps = 0
-        return dict(image = np.random.rand(*self.img_shape).astype(np.float32))
-        
+        return dict(
+            image = np.random.rand(*self.img_shape).astype(np.float32),
+            audio = np.random.rand(2).astype(np.float32)
+        ), dict(internal_state = np.random.rand(1).astype(np.float32))
+
     def step(self, action):
         self.steps += 1
         img = np.random.rand(*self.img_shape).astype(np.float32)
-        
+
         done = self.steps >= self.num_steps
-        return dict(image = img), 1.0, done, False
+        return dict(
+            image = img,
+            audio = np.random.rand(2).astype(np.float32)
+        ), 1.0, done, False, dict(internal_state = np.random.rand(1).astype(np.float32))
 
 class VariedMockEnv(MockEnv):
     def __init__(self, mode):
         super().__init__(num_steps = 3)
         self.mode = mode
-        
+
     def step(self, action):
-        obs, reward, done, _ = super().step(action)
-        
+        obs, reward, done, _, info = super().step(action)
+
         if self.mode == 2:
             return obs, reward
-            
+
         if self.mode == 3:
             return obs, reward, done
-            
+
         if self.mode == 4:
-            return obs, reward, done, {}
-            
-        return obs, reward, False, done, {}
+            return obs, reward, done, info
+
+        return obs, reward, False, done, info
 
 # fixtures
 
 @pytest.fixture
 def temp_record_dir(tmp_path):
     d = tmp_path / "recordings"
-    
+
     yield d
-    
+
     if d.exists():
         shutil.rmtree(d)
 
 @pytest.fixture
 def real_replay_buffer(tmp_path):
     d = tmp_path / "replay_buffer"
-    
+
     buffer = ReplayBuffer(
         folder = str(d),
         max_episodes = 2,
@@ -76,12 +86,17 @@ def real_replay_buffer(tmp_path):
         fields = dict(
             video = ('uint8', (3, 64, 64)),
             discrete_actions = 'int',
-            continuous_actions = 'float'
+            continuous_actions = 'float',
+            rewards = 'float',
+            truncated = 'bool',
+            terminated = 'bool',
+            audio = ('float', (2,)),
+            internal_state = ('float', (1,))
         )
     )
-    
+
     yield buffer
-    
+
     if d.exists():
         shutil.rmtree(d)
 
@@ -89,27 +104,27 @@ def real_replay_buffer(tmp_path):
 
 def test_record_env_wrapper(temp_record_dir):
     env = MockEnv()
-    
+
     wrapped = RecordToFolderEnvWrapper(
         env,
         folder = str(temp_record_dir)
     )
-    
+
     wrapped.reset()
-    
+
     for _ in range(5):
         wrapped.step(np.array(0))
-        
+
     assert (temp_record_dir / "episode_0.mp4").exists()
 
 def test_interact_with_env(temp_record_dir):
     env = MockEnv()
-    
+
     wrapped = RecordToFolderEnvWrapper(
         env,
         folder = str(temp_record_dir)
     )
-    
+
     tokenizer = VideoTokenizer(
         dim = 16,
         dim_latent = 16,
@@ -120,7 +135,7 @@ def test_interact_with_env(temp_record_dir):
         decoder_depth = 1,
         decoder_flow_steps = 1
     )
-    
+
     world_model = DynamicsWorldModel(
         video_tokenizer = tokenizer,
         dim_latent = 16,
@@ -132,79 +147,113 @@ def test_interact_with_env(temp_record_dir):
         num_discrete_actions = 4,
         max_steps = 8
     )
-    
+
     exp = world_model.interact_with_env(
         wrapped,
         num_steps = 4,
         max_timesteps = 4
     )
-    
+
     assert exists(exp)
-    
+
     wrapped.reset() # trigger save
-    
+
     assert (temp_record_dir / "episode_0.mp4").exists()
 
 def test_step_variations(temp_record_dir):
     for mode in [2, 3, 4, 5]:
         env = VariedMockEnv(mode)
-        
+
         wrapped = RecordToFolderEnvWrapper(
             env,
             folder = str(temp_record_dir),
             clear_on_start = False
         )
-        
+
         wrapped.reset()
-        
+
         for _ in range(3):
             wrapped.step(np.array([1]))
-            
+
         if mode == 2:
             wrapped.reset()
-            
+
         vid_path = temp_record_dir / "episode_0.mp4"
-        
+
         assert vid_path.exists()
         vid_path.unlink()
 
-def test_stacked_wrappers(temp_record_dir, real_replay_buffer):
-    
-    # order 1: env -> replay -> folder
-    
-    buffer1 = real_replay_buffer
-    
-    env1 = RecordToFolderEnvWrapper(
-        RecordToReplayBufferEnvWrapper(MockEnv(), replay_buffer = buffer1),
-        folder = str(temp_record_dir / "order1")
+@param('rewards', [False, True])
+@param('terminated', [False, True])
+def test_stacked_wrappers(temp_record_dir, real_replay_buffer, rewards, terminated):
+
+    kwargs = dict(
+        rewards = rewards,
+        terminated = terminated,
+        dotpaths = dict(
+            audio = 'obs.audio',
+            internal_state = 'info.internal_state'
+        )
     )
-    
+
+    # order 1: env -> replay -> folder
+
+    buffer1 = real_replay_buffer
+
+    env1 = RecordToFolderEnvWrapper(
+        RecordToReplayBufferEnvWrapper(MockEnv(), replay_buffer = buffer1, **kwargs),
+        folder = str(temp_record_dir / "order1"),
+        **kwargs
+    )
+
     env1.reset()
     for _ in range(3):
         env1.step(np.array(0))
     env1.reset()
-    
+
     actions_buf1 = np.asarray(buffer1.dataset(slice_by_episode_len = True)[0]['discrete_actions'])
     actions_fol1 = np.load(temp_record_dir / "order1" / "episode_0.discrete_actions.npy")
-    
+
     assert np.allclose(actions_buf1[:-1], actions_fol1)
 
+    keys = [k for k, v in kwargs.items() if v and k != 'dotpaths']
+    for key in keys:
+        sig_buf1 = np.asarray(buffer1.dataset(slice_by_episode_len = True)[0][key])
+        sig_fol1 = np.load(temp_record_dir / "order1" / f"episode_0.{key}.npy")
+        assert np.allclose(sig_buf1[:-1], sig_fol1)
+
+    for sig_key in kwargs['dotpaths'].keys():
+        sig_buf1 = np.asarray(buffer1.dataset(slice_by_episode_len = True)[0][sig_key])
+        sig_fol1 = np.load(temp_record_dir / "order1" / f"episode_0.{sig_key}.npy")
+        assert np.allclose(sig_buf1, sig_fol1)
+
     # order 2: env -> folder -> replay
-    
+
     buffer2 = buffer1
     buffer2.clear()
-    
+
     env2 = RecordToReplayBufferEnvWrapper(
-        RecordToFolderEnvWrapper(MockEnv(), folder = str(temp_record_dir / "order2")),
-        replay_buffer = buffer2
+        RecordToFolderEnvWrapper(MockEnv(), folder = str(temp_record_dir / "order2"), **kwargs),
+        replay_buffer = buffer2,
+        **kwargs
     )
-    
+
     env2.reset()
     for _ in range(3):
         env2.step(np.array(1))
     env2.reset()
-    
+
     actions_buf2 = np.asarray(buffer2.dataset(slice_by_episode_len = True)[0]['discrete_actions'])
     actions_fol2 = np.load(temp_record_dir / "order2" / "episode_0.discrete_actions.npy")
-    
+
     assert np.allclose(actions_buf2[:-1], actions_fol2)
+
+    for key in keys:
+        sig_buf2 = np.asarray(buffer2.dataset(slice_by_episode_len = True)[0][key])
+        sig_fol2 = np.load(temp_record_dir / "order2" / f"episode_0.{key}.npy")
+        assert np.allclose(sig_buf2[:-1], sig_fol2)
+
+    for sig_key in kwargs['dotpaths'].keys():
+        sig_buf2 = np.asarray(buffer2.dataset(slice_by_episode_len = True)[0][sig_key])
+        sig_fol2 = np.load(temp_record_dir / "order2" / f"episode_0.{sig_key}.npy")
+        assert np.allclose(sig_buf2, sig_fol2)

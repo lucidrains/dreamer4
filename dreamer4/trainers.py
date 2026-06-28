@@ -21,7 +21,7 @@ import numpy as np
 import torchvision.transforms as T
 
 from einops import rearrange, repeat, reduce
-from torch_einops_utils import shape_with_replace, pad_right_at_dim
+from torch_einops_utils import shape_with_replace, pad_right_at_dim, pad_left_at_dim
 from torch_einops_utils.save_load import dehydrate_config
 
 from pathlib import Path
@@ -214,7 +214,8 @@ def sample_video_and_actions(
     if not exists(actions):
         return video, None, start, frames
 
-    num_action_frames = (max_num_frames - 1) if exists(max_num_frames) else (frames - 1)
+    target_action_frames = (max_num_frames - 1) if exists(max_num_frames) else (frames - 1)
+    target_obs_frames = max_num_frames if exists(max_num_frames) else frames
 
     is_tuple = isinstance(actions, tuple)
     actions = cast_tuple(actions)
@@ -226,17 +227,19 @@ def sample_video_and_actions(
             sliced_actions.append(None)
             continue
 
-        action_len = act.shape[0]
+        original_len = act.shape[0]
+        is_frame_aligned = (original_len == frames)
+        target_len = target_obs_frames if is_frame_aligned else target_action_frames
 
-        if action_len > num_action_frames:
-            act = act[start:start + num_action_frames]
-        elif action_len < num_action_frames:
-            pad_len = num_action_frames - action_len
+        if original_len > target_len:
+            act = act[start:start + target_len]
+        elif original_len < target_len:
+            pad_len = target_len - original_len
 
             if torch.is_tensor(act):
                 act = pad_right_at_dim(act, pad_len, dim = 0)
             else:
-                act = np.pad(act, ((0, pad_len), (0, 0)))
+                act = np.pad(act, ((0, pad_len), *([(0, 0)] * (act.ndim - 1))))
 
         sliced_actions.append(act)
 
@@ -300,9 +303,9 @@ class VideoDataset(Dataset):
 
         return tensor
 
-class VideoDatasetWithActions(VideoDataset):
+class VideoTrajectoryDataset(VideoDataset):
     """
-    Loads videos and corresponding '.action.npy' files.
+    Loads videos and corresponding '.npy' files (actions, rewards, termination signals, etc.).
     """
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -310,32 +313,34 @@ class VideoDatasetWithActions(VideoDataset):
 
     def __getitem__(self, index):
         tensor = self._get_tensor(index)
+        video_path = self.paths[index]
 
-        action_path = self.paths[index].with_name(self.paths[index].stem + '.action.npy')
+        numpy_files = list(video_path.parent.glob(f"{video_path.stem}.*.npy"))
 
-        actions_np = np.load(action_path) if action_path.exists() else None
+        data_dict = {
+            p.name.split('.')[-2]: np.load(p)
+            for p in numpy_files
+        }
 
-        tensor, actions_np, _, _ = sample_video_and_actions(
-            tensor, actions_np, max_num_frames = self.max_num_frames, random_crop = self.random_crop
+        keys = tuple(data_dict.keys())
+        arrays = tuple(data_dict.values())
+
+        tensor, sampled_arrays, _, _ = sample_video_and_actions(
+            tensor, arrays if arrays else None, max_num_frames = self.max_num_frames, random_crop = self.random_crop
         )
 
         tensor = rearrange(tensor, 'c f h w -> f c h w')
         tensor = self.transform(tensor)
         tensor = rearrange(tensor, 'f c h w -> c f h w')
 
-        res = dict(video = tensor)
+        sampled_arrays = cast_tuple(sampled_arrays) if exists(sampled_arrays) else tuple()
+        sampled_arrays = tuple(map(torch.from_numpy, sampled_arrays))
+        sampled_arrays = tuple(map(lambda t: t.float() if t.dtype == torch.float64 else t, sampled_arrays))
 
-        if not exists(actions_np):
-            return res
-
-        action_tensor = torch.from_numpy(actions_np)
-
-        if action_tensor.is_floating_point():
-            res['continuous_actions'] = action_tensor
-        else:
-            res['discrete_actions'] = action_tensor
-
-        return res
+        return dict(
+            video = tensor,
+            **dict(zip(keys, sampled_arrays))
+        )
 
 class VideoDatasetFromReplayBuffer(Dataset):
     def __init__(
@@ -346,7 +351,7 @@ class VideoDatasetFromReplayBuffer(Dataset):
         random_crop = True
     ):
         super().__init__()
-        self.dataset = replay_buffer.dataset()
+        self.dataset = replay_buffer.dataset(slice_by_episode_len = True)
 
         self.transform = T.Compose([
             T.Resize(image_size),
@@ -362,37 +367,27 @@ class VideoDatasetFromReplayBuffer(Dataset):
     def __getitem__(self, index):
         data = self.dataset[index]
 
-        video = data['video']
-        time_lens = data['lens']
+        video = data.pop('video')
+        data.pop('lens', None)
 
         if video.ndim == 4:
             video = rearrange(video, 'f c h w -> c f h w')
 
-        video = video[:, :time_lens]
+        keys = tuple(data.keys())
+        arrays = tuple(data.values())
 
-        cont_actions = data.get('continuous_actions')
-        disc_actions = data.get('discrete_actions')
-
-        if exists(cont_actions):
-            cont_actions = cont_actions[:time_lens - 1]
-        if exists(disc_actions):
-            disc_actions = disc_actions[:time_lens - 1]
-
-        video, (cont_actions, disc_actions), _, _ = sample_video_and_actions(
-            video, (cont_actions, disc_actions), max_num_frames=self.max_num_frames, random_crop=self.random_crop
+        video, sampled_arrays, _, _ = sample_video_and_actions(
+            video, arrays if arrays else None, max_num_frames = self.max_num_frames, random_crop = self.random_crop
         )
 
         video = self.transform(video)
 
-        res = dict(video = video)
+        sampled_arrays = cast_tuple(sampled_arrays) if exists(sampled_arrays) else tuple()
 
-        if exists(cont_actions):
-            res['continuous_actions'] = cont_actions
-
-        if exists(disc_actions):
-            res['discrete_actions'] = disc_actions
-
-        return res
+        return dict(
+            video = video,
+            **dict(zip(keys, sampled_arrays))
+        )
 
 def video_tensor_collate_fn(data):
     if not data:
@@ -1212,6 +1207,11 @@ class BehaviorCloneTrainer(Module):
 
                 if self.self_flow:
                     batch_data['seed'] = randint(0, int(1e7))
+
+                if 'terminated' in batch_data:
+                    batch_data['terminals'] = batch_data.pop('terminated')
+
+                time = batch_data['video'].shape[2]
 
                 loss, losses, intermediates = self.model(**batch_data, return_all_losses = True)
 

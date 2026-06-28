@@ -4730,13 +4730,15 @@ class DynamicsWorldModel(Module):
 
         # can accept raw video if tokenizer is passed in
 
-        if exists(video_tokenizer) and copy_video_tokenizer:
-            video_tokenizer = deepcopy(video_tokenizer)
-            video_tokenizer.requires_grad_(False)
+        if exists(video_tokenizer):
+            if copy_video_tokenizer:
+                video_tokenizer = deepcopy(video_tokenizer)
+                video_tokenizer.requires_grad_(False)
 
-        video_tokenizer = video_tokenizer.eval()
+            video_tokenizer = video_tokenizer.eval()
 
         self.video_tokenizer = video_tokenizer
+
         self.aux_image_encoder = aux_image_encoder
         self.has_aux_image_encoder = exists(aux_image_encoder)
         self.freeze_aux_image_encoder = freeze_aux_image_encoder
@@ -5525,6 +5527,13 @@ class DynamicsWorldModel(Module):
 
             sampled_discrete_actions, sampled_continuous_actions = self.action_embedder.sample(policy_embed, pred_head_index = 0, squeeze = True)
 
+            # format actions for the environment, rescaling bounded distributions to target range
+
+            env_continuous_actions = sampled_continuous_actions
+
+            if exists(env_continuous_actions) and exists(self.action_embedder.continuous_target_action_range):
+                env_continuous_actions = self.action_embedder.rescale_for_env(env_continuous_actions)
+
             discrete_actions = safe_cat((discrete_actions, sampled_discrete_actions), dim = 1)
             continuous_actions = safe_cat((continuous_actions, sampled_continuous_actions), dim = 1)
 
@@ -5532,18 +5541,11 @@ class DynamicsWorldModel(Module):
                 policy_embed,
                 pred_head_index = 0,
                 discrete_targets = sampled_discrete_actions,
-                continuous_targets = sampled_continuous_actions,
+                continuous_targets = sampled_continuous_actions
             )
 
             discrete_log_probs = safe_cat((discrete_log_probs, one_discrete_log_probs), dim = 1)
             continuous_log_probs = safe_cat((continuous_log_probs, one_continuous_log_probs), dim = 1)
-
-            # format actions for the environment, rescaling bounded distributions to target range
-
-            env_continuous_actions = sampled_continuous_actions
-
-            if exists(env_continuous_actions) and exists(self.action_embedder.continuous_target_action_range):
-                env_continuous_actions = self.action_embedder.rescale_for_env(env_continuous_actions)
 
             if not exists(env_continuous_actions):
                 action_out = sampled_discrete_actions
@@ -6504,7 +6506,7 @@ class DynamicsWorldModel(Module):
                         policy_embed,
                         pred_head_index = 0,
                         discrete_targets = sampled_discrete_actions,
-                        continuous_targets = sampled_continuous_actions,
+                        continuous_targets = sampled_continuous_actions
                     )
 
                     decoded_discrete_log_probs = safe_cat((decoded_discrete_log_probs, discrete_log_probs), dim = 1)
@@ -6720,11 +6722,21 @@ class DynamicsWorldModel(Module):
         # variables
 
         batch, time, device = *latents.shape[:2], latents.device
+        time_minus_one = time - 1
+
+        # left pad rewards and terminals to perfectly align with states
+        # first timestep (reset state) will have reward 0 and terminal False
 
         if exists(rewards):
-            rewards_len = rewards.shape[1]
-            assert rewards_len in {time, time - 1}, f'rewards must have time length of either {time} or {time - 1}, but got {rewards_len}'
-            assert return_pred_only or rewards_len == time, f'during training, rewards must perfectly align with video length {time}, got {rewards_len}'
+            if rewards.shape[1] == time_minus_one:
+                rewards = pad_left_at_dim(rewards, 1, dim = 1, value = 0.)
+            assert return_pred_only or rewards.shape[1] == time, f'during training, rewards must perfectly align with video length {time}, got {rewards.shape[1]}'
+
+        if exists(terminals) and terminals.shape[1] == time_minus_one:
+            terminals = pad_left_at_dim(terminals, 1, dim = 1, value = False)
+
+        if exists(discrete_actions) and discrete_actions.ndim == 2:
+            discrete_actions = rearrange(discrete_actions, 'b t -> b t 1')
 
         # signal and step size related input conforming
 
@@ -7269,7 +7281,7 @@ class DynamicsWorldModel(Module):
 
             reward_pred = rearrange(reward_pred, 'mtp b t l -> b l t mtp')
 
-            reward_targets, reward_loss_mask = create_multi_token_prediction_targets(two_hot_encoding[:, :-1], self.multi_token_pred_len)
+            reward_targets, reward_loss_mask = create_multi_token_prediction_targets(two_hot_encoding[:, 1:], self.multi_token_pred_len)
 
             reward_targets = rearrange(reward_targets, 'b t mtp l -> b l t mtp')
 

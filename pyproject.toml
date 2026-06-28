@@ -1,6 +1,6 @@
 [project]
 name = "dreamer4"
-version = "0.15.14"
+version = "0.15.15"
 description = "Dreamer4 - PyTorch"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -61,6 +61,8 @@ dreamer4 = "dreamer4.cli:main"
 [project.optional-dependencies]
 examples = []
 test = [
+    "gymnasium",
+    "pygame",
     "pytest",
     "pytest-shard"
 ]
