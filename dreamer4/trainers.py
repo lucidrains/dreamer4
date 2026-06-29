@@ -223,8 +223,8 @@ def sample_video_and_actions(
     sliced_actions = []
 
     for act in actions:
-        if not exists(act):
-            sliced_actions.append(None)
+        if not exists(act) or (torch.is_tensor(act) and act.ndim == 0):
+            sliced_actions.append(act)
             continue
 
         original_len = act.shape[0]
@@ -334,8 +334,8 @@ class VideoTrajectoryDataset(VideoDataset):
         tensor = rearrange(tensor, 'f c h w -> c f h w')
 
         sampled_arrays = cast_tuple(sampled_arrays) if exists(sampled_arrays) else tuple()
-        sampled_arrays = tuple(map(torch.from_numpy, sampled_arrays))
-        sampled_arrays = tuple(map(lambda t: t.float() if t.dtype == torch.float64 else t, sampled_arrays))
+        sampled_arrays = tuple(torch.from_numpy(t) for t in sampled_arrays)
+        sampled_arrays = tuple(t.float() if t.dtype == torch.float64 else t for t in sampled_arrays)
 
         return dict(
             video = tensor,
@@ -351,7 +351,10 @@ class VideoDatasetFromReplayBuffer(Dataset):
         random_crop = True
     ):
         super().__init__()
-        self.dataset = replay_buffer.dataset(slice_by_episode_len = True)
+        self.dataset = replay_buffer.dataset(
+            slice_by_episode_len = True,
+            return_episode_lens = False
+        )
 
         self.transform = T.Compose([
             T.Resize(image_size),
@@ -368,7 +371,6 @@ class VideoDatasetFromReplayBuffer(Dataset):
         data = self.dataset[index]
 
         video = data.pop('video')
-        data.pop('lens', None)
 
         if video.ndim == 4:
             video = rearrange(video, 'f c h w -> c f h w')
@@ -381,6 +383,9 @@ class VideoDatasetFromReplayBuffer(Dataset):
         )
 
         video = self.transform(video)
+
+        if not video.is_floating_point():
+            video = video.float() / 255.
 
         sampled_arrays = cast_tuple(sampled_arrays) if exists(sampled_arrays) else tuple()
 

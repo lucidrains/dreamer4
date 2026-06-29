@@ -1168,8 +1168,10 @@ class ActionEmbedder(Module):
         # only bounded distributions (beta, squashed_gaussian) can be rescaled to a target action range
 
         is_bounded = continuous_dist_type in ('beta', 'squashed_gaussian')
+
         if is_bounded and not exists(continuous_target_action_range):
             continuous_target_action_range = (-1., 1.)
+
         self.continuous_target_action_range = continuous_target_action_range if is_bounded else None
 
         readout_squashed = continuous_dist_type == 'squashed_gaussian'
@@ -1243,6 +1245,10 @@ class ActionEmbedder(Module):
     @property
     def has_discrete_actions(self):
         return self.num_discrete_action_types > 0
+
+    @property
+    def has_continuous_actions(self):
+        return self.num_continuous_action_types > 0
 
     @property
     def device(self):
@@ -1461,7 +1467,7 @@ class ActionEmbedder(Module):
             src_dist = MultiCategorical(src_logits, use_parallel_multi_discrete = True)
             tgt_dist = MultiCategorical(tgt_logits, use_parallel_multi_discrete = True)
 
-            discrete_kl = src_dist.kl_div(tgt_dist)
+            discrete_kl = src_dist.kl_div(tgt_dist, keep_num_actions_dim = True)
 
             if reduce_across_num_actions:
                 discrete_kl = discrete_kl.sum(dim = -1)
@@ -5373,8 +5379,27 @@ class DynamicsWorldModel(Module):
     ):
         device = self.device
 
-        reset_kwargs = dict(seed = seed) if exists(seed) else dict()
-        init_obs = env.reset(**reset_kwargs)
+        if self.action_embedder.has_continuous_actions and exists(self.action_embedder.continuous_target_action_range):
+            def transform_fn(action):
+                is_tuple = isinstance(action, tuple)
+                discrete, continuous = action if is_tuple else (None, action)
+
+                continuous_tensor = cast_to_tensor(continuous, device)
+                scaled_continuous = self.action_embedder.rescale_for_env(continuous_tensor)
+                scaled_continuous = scaled_continuous.cpu().numpy()
+
+                return (discrete, scaled_continuous) if is_tuple else scaled_continuous
+
+            if hasattr(env, 'wrap_innermost'):
+                from dreamer4.env import ActionTransformWrapper
+
+                env.wrap_innermost(
+                    ActionTransformWrapper,
+                    transform_fn = transform_fn,
+                    clip = self.action_embedder.continuous_target_action_range
+                )
+
+        init_obs = env.reset(seed = seed)
 
         if isinstance(init_obs, tuple):
             init_obs = init_obs[0]
@@ -5530,9 +5555,6 @@ class DynamicsWorldModel(Module):
             # format actions for the environment, rescaling bounded distributions to target range
 
             env_continuous_actions = sampled_continuous_actions
-
-            if exists(env_continuous_actions) and exists(self.action_embedder.continuous_target_action_range):
-                env_continuous_actions = self.action_embedder.rescale_for_env(env_continuous_actions)
 
             discrete_actions = safe_cat((discrete_actions, sampled_discrete_actions), dim = 1)
             continuous_actions = safe_cat((continuous_actions, sampled_continuous_actions), dim = 1)
@@ -5897,6 +5919,14 @@ class DynamicsWorldModel(Module):
         # but only do so if fine tuning the entire world model for RL
 
         discrete_actions, continuous_actions = actions
+
+        # handle discrete or continuous only having 1 action, squeezed out
+
+        if exists(discrete_actions) and discrete_actions.ndim == 2:
+            discrete_actions = rearrange(discrete_actions, 'b t -> b t 1')
+
+        if exists(continuous_actions) and continuous_actions.ndim == 2:
+            continuous_actions = rearrange(continuous_actions, 'b t -> b t 1')
 
         if (
             not only_learn_policy_value_heads or

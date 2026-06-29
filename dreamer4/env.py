@@ -3,6 +3,7 @@ import numpy as np
 import imageio
 from pathlib import Path
 from functools import reduce
+from typing import Callable
 
 from torch import is_tensor, tensor
 from einops import rearrange, repeat
@@ -119,9 +120,35 @@ class BaseRecordEnvWrapper:
         if hasattr(self.env, 'close'):
             self.env.close()
 
-    def reset(self, **kwargs):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+    def __del__(self):
+        self.flush()
+
+    def flush(self):
         self._save_episode()
         self._clear_records()
+
+    def wrap_innermost(self, wrapper_cls, *args, **kwargs):
+        curr = self
+
+        while True:
+            if isinstance(curr, wrapper_cls) or isinstance(curr.env, wrapper_cls):
+                return
+
+            if not hasattr(curr.env, 'env'):
+                break
+
+            curr = curr.env
+
+        curr.env = wrapper_cls(curr.env, *args, **kwargs)
+
+    def reset(self, **kwargs):
+        self.flush()
 
         obs = self.env.reset(**kwargs)
         obs_val = obs[0] if isinstance(obs, tuple) else obs
@@ -278,3 +305,40 @@ class RecordToReplayBufferEnvWrapper(BaseRecordEnvWrapper):
                 self.replay_buffer.store(**kwargs)
 
         self.current_episode += 1
+
+class ActionTransformWrapper:
+    def __init__(
+        self,
+        env,
+        transform_fn: Callable,
+        clip = None,
+        action_info_key = 'env_received_action'
+    ):
+        self.env = env
+        self.transform_fn = transform_fn
+        self.clip = clip
+        self.action_info_key = action_info_key
+
+    def __getattr__(self, name):
+        if name.startswith('_'):
+            raise AttributeError(f"attempted to get missing private attribute '{name}'")
+        return getattr(self.env, name)
+
+    def step(self, action):
+        scaled_action = self.transform_fn(action)
+
+        if exists(self.clip):
+            min_val, max_val = self.clip
+            scaled_action = np.clip(scaled_action, min_val, max_val)
+
+        out = self.env.step(scaled_action)
+        out = list(out) if isinstance(out, tuple) else [out, 0., False, False, dict()]
+
+        while len(out) < 4:
+            out.append(dict() if len(out) == 3 else False if len(out) == 2 else 0.)
+
+        info = default(out[-1], dict())
+        info[self.action_info_key] = scaled_action
+        out[-1] = info
+
+        return tuple(out)
