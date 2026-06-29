@@ -11,3 +11,5 @@ from dreamer4.trainers import (
     BehaviorCloneTrainer,
     DreamTrainer
 )
+
+from dreamer4.env import DynamicsWorldModelWrapper

@@ -120,6 +120,19 @@ def test_e2e(is_continuous):
 
     bc_trainer()
 
+    # 3.5 test world model wrapper
+
+    from dreamer4.env import DynamicsWorldModelWrapper
+    world_env = DynamicsWorldModelWrapper(world_model, num_generation_steps = 2)
+
+    obs, info = world_env.reset(batch_size = 2)
+    assert obs.shape == (2, 3, 64, 64)
+
+    action = torch.zeros((2, 4), dtype = torch.float32) if is_continuous else torch.zeros((2,), dtype = torch.long)
+    obs, reward, terminated, truncated, info = world_env.step(action)
+
+    assert obs.shape == (2, 3, 64, 64)
+
     # 4. rl rollouts inside the world model
 
     dream_trainer = DreamTrainer(
