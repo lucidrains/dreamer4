@@ -33,9 +33,13 @@ class ToyEnv:
         done = self.steps >= self.num_steps
         return obs, reward, done, False, {}
 
+@pytest.mark.parametrize('env_type', ['toy', 'snake'])
 @pytest.mark.parametrize('is_continuous', [False, True])
-def test_e2e(is_continuous):
-    test_dir = f'./test_e2e_buf_{is_continuous}'
+def test_e2e(env_type, is_continuous):
+    if env_type == 'snake' and is_continuous:
+        pytest.skip("Snake environment only supports discrete actions")
+
+    test_dir = f'./test_e2e_buf_{env_type}_{is_continuous}'
     shutil.rmtree(test_dir, ignore_errors = True)
 
     action_field = dict(continuous_actions=('float', (4,))) if is_continuous else dict(discrete_actions='int')
@@ -54,7 +58,12 @@ def test_e2e(is_continuous):
         fields = fields
     )
 
-    env = ToyEnv(num_steps = 4)
+    if env_type == 'toy':
+        env = ToyEnv(num_steps = 4)
+    elif env_type == 'snake':
+        from dreamer4.web_env import SnakeEnv
+        env = SnakeEnv(grid_size = 8, max_steps = 4)
+
     wrapped_env = RecordToReplayBufferEnvWrapper(
         env,
         replay_buffer = buffer,
@@ -128,7 +137,7 @@ def test_e2e(is_continuous):
     obs, info = world_env.reset(batch_size = 2)
     assert obs.shape == (2, 3, 64, 64)
 
-    action = torch.zeros((2, 4), dtype = torch.float32) if is_continuous else torch.zeros((2,), dtype = torch.long)
+    action = torch.full((2, 4), 0.5, dtype = torch.float32) if is_continuous else torch.zeros((2,), dtype = torch.long)
     obs, reward, terminated, truncated, info = world_env.step(action)
 
     assert obs.shape == (2, 3, 64, 64)

@@ -1127,12 +1127,15 @@ class ActionEmbedder(Module):
         continuous_dist_type: Literal['gaussian', 'squashed_gaussian', 'beta'] = 'beta',
         continuous_dist_kwargs: dict = dict(),
         continuous_target_action_range: tuple[float, float] | None = None,
+        beta_log_prob_eps = 1e-5,
         can_unembed = False,
         unembed_dim = None,
         num_unembed_preds = 1,
-        squeeze_unembed_preds = True # will auto-squeeze if prediction is just 1
+        squeeze_unembed_preds = True, # will auto-squeeze if prediction is just 1
     ):
         super().__init__()
+
+        self.beta_log_prob_eps = beta_log_prob_eps
 
         self.register_buffer('dummy', tensor(0), persistent = False)
 
@@ -1390,7 +1393,8 @@ class ActionEmbedder(Module):
         continuous_action_types = None,  # (na)
         pred_head_index: int | Tensor | None = None,
         parallel_discrete_calc = None,
-        return_entropies = False
+        return_entropies = False,
+        soft_validate_range = False
     ):
         discrete_action_logits, continuous_action_mean_log_var = self.unembed(
             embeds,
@@ -1427,6 +1431,9 @@ class ActionEmbedder(Module):
                 # if multiple heads and no index, broadcast targets to mtp dim
                 if continuous_targets.ndim == (continuous_action_mean_log_var.ndim - 2):
                     continuous_targets = rearrange(continuous_targets, '... -> 1 ...')
+
+            if soft_validate_range and self.continuous_dist_type == 'beta':
+                continuous_targets = continuous_targets.clamp(self.beta_log_prob_eps, 1. - self.beta_log_prob_eps)
 
             continuous_log_probs = self.continuous_readout.log_prob_continuous(
                 continuous_action_mean_log_var,
@@ -7433,7 +7440,8 @@ class DynamicsWorldModel(Module):
             discrete_log_probs, continuous_log_probs = self.action_embedder.log_probs(
                 policy_embed,
                 discrete_targets = discrete_action_targets,
-                continuous_targets = continuous_action_targets
+                continuous_targets = continuous_action_targets,
+                soft_validate_range = True
             )
 
             if is_var_len:

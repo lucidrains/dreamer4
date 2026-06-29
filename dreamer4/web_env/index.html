@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dreamer4 Web Env</title>
+    <style>
+        body {
+            background-color: #121212;
+            color: #ffffff;
+            font-family: 'Inter', -apple-system, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            margin: 0;
+            overflow: hidden;
+        }
+
+        h1 {
+            margin-bottom: 0.5rem;
+            font-weight: 600;
+            letter-spacing: 0.5px;
+        }
+
+        .game-container {
+            background: #1e1e1e;
+            padding: 20px;
+            border-radius: 12px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        img#env-view {
+            width: 512px;
+            height: 512px;
+            image-rendering: pixelated;
+            background-color: #000;
+            border: 2px solid #333;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+
+        .status-panel {
+            display: flex;
+            justify-content: space-between;
+            width: 100%;
+            max-width: 512px;
+            font-size: 0.95rem;
+            color: #aaa;
+            background: #2a2a2a;
+            padding: 12px 20px;
+            border-radius: 8px;
+            box-sizing: border-box;
+        }
+
+        .status-panel .col {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        .status-panel .col.right {
+            text-align: right;
+        }
+
+        .status-panel span {
+            color: #fff;
+            font-weight: 600;
+            font-family: monospace;
+            font-size: 1.05rem;
+            margin-left: 5px;
+        }
+
+        button {
+            padding: 10px 20px;
+            background: #3a3a3a;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 1rem;
+            transition: background 0.2s;
+        }
+
+        button:hover {
+            background: #505050;
+        }
+
+        button:active {
+            background: #2a2a2a;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="game-container">
+        <div id="game-over-banner"
+            style="display: none; margin-bottom: 15px; background: #000; color: #fff; padding: 8px 16px; border-radius: 6px; font-size: 1.25rem; font-weight: bold; letter-spacing: 1px;">
+            GAME OVER
+        </div>
+        <div style="position: relative; margin-bottom: 20px;">
+            <img id="env-view" src="" alt="Environment View" style="margin-bottom: 0;" />
+
+            <div id="loading-overlay"
+                style="display: none; position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: rgba(128, 128, 128, 0.5); border-radius: 8px; z-index: 10;">
+            </div>
+        </div>
+        <div class="status-panel">
+            <div class="col left">
+                <div>Step Reward:<span id="step-reward">0</span></div>
+                <div>Terminated:<span id="terminated">False</span></div>
+                <div>Steps Left:<span id="steps-left">N/A</span></div>
+            </div>
+            <div class="col right">
+                <div>Total Reward:<span id="total-reward">0</span></div>
+                <div>Done:<span id="done">False</span></div>
+            </div>
+        </div>
+        <div style="margin-top: 15px;">
+            <button onclick="resetEnv()">Reset Environment</button>
+        </div>
+        <div style="margin-top: 10px; color: #777; font-size: 0.9rem;">
+            Use Arrow Keys or WASD to play.
+        </div>
+    </div>
+
+    <script>
+        const imgEl = document.getElementById('env-view');
+        const totalRewardEl = document.getElementById('total-reward');
+        const stepRewardEl = document.getElementById('step-reward');
+        const doneEl = document.getElementById('done');
+        const stepsLeftEl = document.getElementById('steps-left');
+        const terminatedEl = document.getElementById('terminated');
+        const loadingEl = document.getElementById('loading-overlay');
+        const gameOverEl = document.getElementById('game-over-banner');
+        let totalReward = 0;
+        let isDone = false;
+        let isWaiting = false;
+
+        function formatFloat(val) {
+            if (typeof val === 'number' && !Number.isInteger(val)) {
+                return Number(val.toPrecision(3));
+            }
+            return val;
+        }
+
+        function updateState(data) {
+            imgEl.src = 'data:image/png;base64,' + data.image;
+            if (data.steps_left !== undefined && data.steps_left !== null) {
+                stepsLeftEl.innerText = data.steps_left;
+            }
+            if (data.reward !== undefined) {
+                stepRewardEl.innerText = formatFloat(data.reward);
+            }
+            if (data.terminated !== undefined) {
+                terminatedEl.innerText = data.terminated ? 'True' : 'False';
+            }
+        }
+
+        async function resetEnv() {
+            if (isWaiting) return;
+            isWaiting = true;
+            loadingEl.style.display = 'block';
+            try {
+                const res = await fetch('/reset', { method: 'POST' });
+                const data = await res.json();
+                totalReward = 0;
+                isDone = false;
+                gameOverEl.style.display = 'none';
+                totalRewardEl.innerText = formatFloat(totalReward);
+                stepRewardEl.innerText = 0;
+                terminatedEl.innerText = 'False';
+                doneEl.innerText = 'False';
+                updateState(data);
+            } catch (e) {
+                console.error("Failed to reset:", e);
+            } finally {
+                isWaiting = false;
+                loadingEl.style.display = 'none';
+            }
+        }
+
+        async function stepEnv(action) {
+            if (isDone || isWaiting) return;
+            isWaiting = true;
+            loadingEl.style.display = 'block';
+            try {
+                const res = await fetch('/step', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ action })
+                });
+                const data = await res.json();
+                totalReward += data.reward;
+                totalRewardEl.innerText = formatFloat(totalReward);
+                isDone = data.done;
+                doneEl.innerText = isDone ? 'True' : 'False';
+                gameOverEl.style.display = isDone ? 'block' : 'none';
+                updateState(data);
+            } catch (e) {
+                console.error("Failed to step:", e);
+            } finally {
+                isWaiting = false;
+                loadingEl.style.display = 'none';
+            }
+        }
+
+        document.addEventListener('keydown', (e) => {
+            if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "].indexOf(e.code) > -1) {
+                e.preventDefault();
+            }
+            if (isDone || isWaiting) return;
+
+            let action = -1;
+            if (e.key === 'ArrowUp' || e.key === 'w' || e.key === 'W') action = 0;
+            else if (e.key === 'ArrowRight' || e.key === 'd' || e.key === 'D') action = 1;
+            else if (e.key === 'ArrowDown' || e.key === 's' || e.key === 'S') action = 2;
+            else if (e.key === 'ArrowLeft' || e.key === 'a' || e.key === 'A') action = 3;
+
+            if (action !== -1) {
+                stepEnv(action);
+            }
+        });
+
+        // initial reset
+        resetEnv();
+    </script>
+</body>
+
+</html>

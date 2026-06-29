@@ -8,6 +8,11 @@ from adam_atan2_pytorch import MuonAdamAtan2
 
 from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
 from dreamer4.trainers import VideoTokenizerTrainer, VideoDataset, VideoTrajectoryDataset, BehaviorCloneTrainer
+from dreamer4.env import DynamicsWorldModelWrapper
+from dreamer4.web_env.server import WebEnvServer
+from dreamer4.web_env import SnakeEnv
+
+import webbrowser
 
 def exists(val):
     return val is not None
@@ -218,10 +223,42 @@ def train_dynamics(
 
     trainer()
 
+def serve_world_model(
+    model_path: str | None = None,
+    env_name: str = 'snake',
+    port: int = 8000,
+    num_generation_steps: int = 4
+):
+    ENVS = {
+        'snake': lambda: SnakeEnv()
+    }
+
+    if not exists(model_path):
+        assert env_name in ENVS, f"env {env_name} not found"
+
+        print(f"serving ground truth {env_name} env")
+        env = ENVS[env_name]()
+    else:
+        model_file = Path(model_path).resolve()
+        assert model_file.exists(), f"World model not found at {model_file}"
+
+        print(f"Loading world model from: {model_file}")
+        world_model = DynamicsWorldModel.init_and_load(model_path, strict = False)
+        env = DynamicsWorldModelWrapper(world_model, num_generation_steps = num_generation_steps)
+
+    server = WebEnvServer(env, port=port)
+
+    url = f"http://localhost:{port}"
+    print(f"Opening browser to {url} ...")
+    webbrowser.open(url)
+
+    server.serve()
+
 def main():
     fire.Fire({
         'train-video-tokenizer': train_tokenizer,
-        'train-dynamics': train_dynamics
+        'train-dynamics': train_dynamics,
+        'serve-world-model': serve_world_model
     })
 
 if __name__ == '__main__':
