@@ -9,6 +9,7 @@ from functools import wraps, partial
 from contextlib import nullcontext, contextmanager
 from collections import namedtuple
 from dataclasses import dataclass, asdict, fields
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -5224,6 +5225,60 @@ class DynamicsWorldModel(Module):
         assert self.continuous_action_loss_weight.numel() in {1, multi_token_pred_len}
 
         self.register_buffer('zero', tensor(0.), persistent = False)
+
+    @property
+    def replay_buffer_fields(self):
+        fields = dict(
+            rewards = 'float',
+            terminated = 'bool'
+        )
+
+        tokenizer = self.video_tokenizer
+
+        if exists(tokenizer):
+            assert exists(tokenizer.image_height) and exists(tokenizer.image_width), 'tokenizer image_height and image_width must be defined'
+            fields['video'] = ('uint8', (tokenizer.channels, tokenizer.image_height, tokenizer.image_width))
+
+        if self.action_embedder.num_continuous_action_types > 0:
+            fields['continuous_actions'] = ('float', (self.action_embedder.num_continuous_action_types,))
+
+        num_discrete = self.action_embedder.num_discrete_actions.tolist()
+
+        if len(num_discrete) == 1:
+            fields['discrete_actions'] = 'int'
+        elif len(num_discrete) > 1:
+            fields['discrete_actions'] = ('int', (len(num_discrete),))
+
+        if self.has_proprio:
+            fields['proprio'] = ('float', (self.dim_proprio,))
+
+        return fields
+
+    def create_replay_buffer(
+        self,
+        folder: str | Path,
+        max_episodes: int,
+        max_timesteps: int,
+        video_dtype: Literal['uint8', 'float'] = 'uint8',
+        **kwargs
+    ):
+        assert video_dtype in {'uint8', 'float'}, 'video_dtype must be either uint8 or float'
+
+        fields = self.replay_buffer_fields
+
+        if 'video' in fields:
+            fields['video'] = (video_dtype, fields['video'][1])
+
+        custom_fields = kwargs.pop('fields', dict())
+        fields.update(custom_fields)
+
+        return ReplayBuffer(
+            folder = folder,
+            max_episodes = max_episodes,
+            max_timesteps = max_timesteps,
+            fields = fields,
+            **kwargs
+        )
 
     @property
     def device(self):

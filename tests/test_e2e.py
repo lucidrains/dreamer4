@@ -42,35 +42,6 @@ def test_e2e(env_type, is_continuous):
     test_dir = f'./test_e2e_buf_{env_type}_{is_continuous}'
     shutil.rmtree(test_dir, ignore_errors = True)
 
-    action_field = dict(continuous_actions=('float', (4,))) if is_continuous else dict(discrete_actions='int')
-
-    fields = dict(
-        video=('uint8', (3, 64, 64)),
-        rewards='float',
-        terminated='bool'
-    )
-    fields.update(action_field)
-
-    buffer = ReplayBuffer(
-        folder = test_dir,
-        max_episodes = 10,
-        max_timesteps = 10,
-        fields = fields
-    )
-
-    if env_type == 'toy':
-        env = ToyEnv(num_steps = 4)
-    elif env_type == 'snake':
-        from dreamer4.web_env import SnakeEnv
-        env = SnakeEnv(grid_size = 8, max_steps = 4)
-
-    wrapped_env = RecordToReplayBufferEnvWrapper(
-        env,
-        replay_buffer = buffer,
-        rewards = True,
-        terminated = True
-    )
-
     tokenizer = VideoTokenizer(
         dim = 16,
         dim_latent = 16,
@@ -92,6 +63,25 @@ def test_e2e(env_type, is_continuous):
         num_continuous_actions=4 if is_continuous else 0,
         num_discrete_actions=0 if is_continuous else 4,
         max_steps = 4
+    )
+
+    buffer = world_model.create_replay_buffer(
+        folder = test_dir,
+        max_episodes = 10,
+        max_timesteps = 10
+    )
+
+    if env_type == 'toy':
+        env = ToyEnv(num_steps = 4)
+    elif env_type == 'snake':
+        from dreamer4.web_env import SnakeEnv
+        env = SnakeEnv(grid_size = 8, max_steps = 4)
+
+    wrapped_env = RecordToReplayBufferEnvWrapper(
+        env,
+        replay_buffer = buffer,
+        rewards = True,
+        terminated = True
     )
 
     # 1. gather initial data from environment
