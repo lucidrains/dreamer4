@@ -176,8 +176,8 @@ class CustomCnnExtractor(BaseFeaturesExtractor):
 
 def main(
     project_name: str = "snake-ppo-agent",
-    buffer_folder: str = "./snake_buffer_ppo",
-    video_folder: str = "./snake_videos_ppo",
+    buffer_folder: str | None = None,
+    video_folder: str | None = None,
     inspect_replay_buffer: bool = True,
     grid_size: int = 8,
     max_steps: int = 40,
@@ -196,6 +196,9 @@ def main(
     log_every: int = 50,
 ):
     wandb.init(project = project_name)
+
+    buffer_folder = buffer_folder or f"./snake_buffer_ppo_{grid_size}x{grid_size}_{max_steps}steps"
+    video_folder = video_folder or f"./snake_videos_ppo_{grid_size}x{grid_size}_{max_steps}steps"
 
     test_dir = Path(buffer_folder)
     video_dir = Path(video_folder)

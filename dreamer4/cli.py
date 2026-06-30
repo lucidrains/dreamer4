@@ -254,10 +254,12 @@ def serve_world_model(
     model_path: str | None = None,
     env_name: str = 'snake',
     port: int = 8000,
-    num_generation_steps: int = 4
+    num_generation_steps: int = 4,
+    grid_size: int = 8,
+    max_steps: int = 40,
 ):
     ENVS = {
-        'snake': lambda: SnakeEnv()
+        'snake': lambda: SnakeEnv(grid_size=grid_size, max_steps=max_steps)
     }
 
     if not exists(model_path):
