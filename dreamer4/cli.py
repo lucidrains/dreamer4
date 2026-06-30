@@ -33,6 +33,7 @@ def train_tokenizer(
     depth: int = 4,
     time_block_every: int = 4,
     num_latent_tokens: int = 64,
+    attn_heads: int = 8,
     flow_steps: int = 1,
     separate_flow_decoder: bool = False,
     # training params
@@ -94,7 +95,8 @@ def train_tokenizer(
         lpips_loss_weight = lpips_loss_weight,
         encoder_add_decorr_aux_loss = encoder_add_decorr_aux_loss,
         time_block_every = time_block_every,
-        num_latent_tokens = num_latent_tokens
+        num_latent_tokens = num_latent_tokens,
+        attn_heads = attn_heads,
     )
 
     checkpoint_dir = Path(checkpoint_folder) / name
