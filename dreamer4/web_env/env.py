@@ -5,11 +5,18 @@ class SnakeEnv:
         self,
         *,
         grid_size = 8,
-        max_steps = 40
+        max_steps = 40,
+        collision_penalty = -10.0,
+        apple_reward = 5.0,
+        aliveness_penalty = -0.01,
+        render_cell_size = 2,
     ):
         self.grid_size = grid_size
         self.max_steps = max_steps
-        self.cell_size = 64 // grid_size
+        self.collision_penalty = collision_penalty
+        self.apple_reward = apple_reward
+        self.aliveness_penalty = aliveness_penalty
+        self.render_cell_size = render_cell_size
         self.action_space = 4
         self.reset()
 
@@ -58,35 +65,37 @@ class SnakeEnv:
             new_head in self.snake
         ):
             terminated = True
-            reward = -1.0
+            reward = self.collision_penalty
         else:
             self.snake.insert(0, new_head)
             if new_head == self.food:
-                reward = 1.0
+                reward = self.apple_reward
                 self.food = self._place_food()
             else:
                 self.snake.pop()
+                reward = self.aliveness_penalty
 
         self.done = terminated or truncated
         return dict(image = self._render()), reward, terminated, truncated, {}
 
     def _render(self):
-        img = np.zeros((3, 64, 64), dtype = np.float32)
-        c = self.cell_size
+        c = self.render_cell_size
+        img = np.zeros((self.grid_size * c, self.grid_size * c, 3), dtype = np.uint8)
 
         fx, fy = self.food
-        img[0, fy*c:(fy+1)*c, fx*c:(fx+1)*c] = 1.0
+        img[fy*c:(fy+1)*c, fx*c:(fx+1)*c, 0] = 255
 
         for i, (sx, sy) in enumerate(self.snake):
             y1, y2, x1, x2 = sy*c, (sy+1)*c, sx*c, (sx+1)*c
-            img[1, y1:y2, x1:x2] = 1.0 if i == 0 else 0.8
+            img[y1:y2, x1:x2, 1] = 255 if i == 0 else 200
 
             if i == 0:
-                if   self.direction == 0: slice_y, slice_x = slice(y1, y1+1), slice(x1, x2)
-                elif self.direction == 1: slice_y, slice_x = slice(y1, y2), slice(x2-1, x2)
-                elif self.direction == 2: slice_y, slice_x = slice(y2-1, y2), slice(x1, x2)
-                elif self.direction == 3: slice_y, slice_x = slice(y1, y2), slice(x1, x1+1)
+                half_c = max(1, c // 2)
+                if   self.direction == 0: slice_y, slice_x = slice(y1, y1+half_c), slice(x1, x2)
+                elif self.direction == 1: slice_y, slice_x = slice(y1, y2), slice(x2-half_c, x2)
+                elif self.direction == 2: slice_y, slice_x = slice(y2-half_c, y2), slice(x1, x2)
+                elif self.direction == 3: slice_y, slice_x = slice(y1, y2), slice(x1, x1+half_c)
 
-                img[:, slice_y, slice_x] = 1.0
+                img[slice_y, slice_x, :] = 255
 
         return img

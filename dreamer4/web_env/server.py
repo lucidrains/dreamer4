@@ -7,34 +7,28 @@ import torch
 import numpy as np
 
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from PIL import Image
+from einops import repeat, rearrange
+import imageio.v3 as iio
 
 def _tensor_or_array_to_b64_png(obs):
-    if isinstance(obs, dict):
-        img_data = obs['image']
-    else:
-        img_data = obs
+    img_data = obs['image'] if isinstance(obs, dict) else obs
 
     if torch.is_tensor(img_data):
         img_data = img_data.detach().cpu().numpy()
 
-    # Handle batch dimension if present
     if img_data.ndim == 4:
         img_data = img_data[0]
 
-    # Scale float to uint8
     if img_data.dtype in (np.float32, np.float64):
         img_data = (np.clip(img_data, 0.0, 1.0) * 255).astype(np.uint8)
 
-    # Change format from C,H,W to H,W,C for PIL
     if img_data.shape[0] == 3:
-        img_data = np.transpose(img_data, (1, 2, 0))
+        img_data = rearrange(img_data, 'c h w -> h w c')
 
-    img = Image.fromarray(img_data)
-    buffered = io.BytesIO()
-    img.save(buffered, format="PNG")
-    return base64.b64encode(buffered.getvalue()).decode("utf-8")
+    img_data = repeat(img_data, 'h w c -> (h p1) (w p2) c', p1 = 16, p2 = 16)
 
+    img_bytes = iio.imwrite('<bytes>', img_data, extension = '.png')
+    return base64.b64encode(img_bytes).decode("utf-8")
 
 class WebEnvServer:
     def __init__(self, env, port=8000):

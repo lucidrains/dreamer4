@@ -2,17 +2,19 @@ from __future__ import annotations
 
 import os
 import fire
+import webbrowser
 from pathlib import Path
 from shutil import rmtree
 from adam_atan2_pytorch import MuonAdamAtan2
 
+from memmap_replay_buffer import ReplayBuffer
+
 from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
-from dreamer4.trainers import VideoTokenizerTrainer, VideoDataset, VideoTrajectoryDataset, BehaviorCloneTrainer
+from dreamer4.trainers import VideoTokenizerTrainer, VideoDataset, VideoTrajectoryDataset, BehaviorCloneTrainer, VideoDatasetFromReplayBuffer
 from dreamer4.env import DynamicsWorldModelWrapper
 from dreamer4.web_env.server import WebEnvServer
+from dreamer4.web_env.inspect_server import InspectReplayBufferServer
 from dreamer4.web_env import SnakeEnv
-
-import webbrowser
 
 def exists(val):
     return val is not None
@@ -29,6 +31,8 @@ def train_tokenizer(
     dim_latent: int = 64,
     patch_size: int = 8,
     depth: int = 4,
+    time_block_every: int = 4,
+    num_latent_tokens: int = 64,
     flow_steps: int = 1,
     separate_flow_decoder: bool = False,
     # training params
@@ -60,13 +64,22 @@ def train_tokenizer(
     if not use_lpips_loss:
         lpips_loss_weight = 0.
 
-    dataset = VideoDataset(
-        folder = str(data_path),
-        image_size = image_size,
-        channels = channels,
-        max_num_frames = max_num_frames,
-        exts = exts
-    )
+    is_replay_buffer = (data_path / 'metadata.pkl').exists()
+
+    if is_replay_buffer:
+        dataset = VideoDatasetFromReplayBuffer(
+            replay_buffer = ReplayBuffer.from_folder(str(data_path)),
+            image_size = image_size,
+            max_num_frames = max_num_frames,
+        )
+    else:
+        dataset = VideoDataset(
+            folder = str(data_path),
+            image_size = image_size,
+            channels = channels,
+            max_num_frames = max_num_frames,
+            exts = exts
+        )
 
     tokenizer = VideoTokenizer(
         dim = dim,
@@ -79,7 +92,9 @@ def train_tokenizer(
         decoder_flow_steps = flow_steps,
         separate_flow_decoder = separate_flow_decoder,
         lpips_loss_weight = lpips_loss_weight,
-        encoder_add_decorr_aux_loss = encoder_add_decorr_aux_loss
+        encoder_add_decorr_aux_loss = encoder_add_decorr_aux_loss,
+        time_block_every = time_block_every,
+        num_latent_tokens = num_latent_tokens
     )
 
     checkpoint_dir = Path(checkpoint_folder) / name
@@ -132,6 +147,7 @@ def train_dynamics(
     # architecture params
     dim: int = 512,
     depth: int = 6,
+    time_block_every: int = 4,
     attn_dim_head: int = 64,
     attn_heads: int = 8,
     condition_on_actions: bool = False,
@@ -162,7 +178,15 @@ def train_dynamics(
     suffix = '-action-conditioned-dynamics' if condition_on_actions else '-dynamics-only'
     run_name = f"{name}{suffix}"
 
-    if condition_on_actions:
+    is_replay_buffer = (data_path / 'metadata.pkl').exists()
+
+    if is_replay_buffer:
+        dataset = VideoDatasetFromReplayBuffer(
+            replay_buffer = ReplayBuffer.from_folder(str(data_path)),
+            image_size = image_size,
+            max_num_frames = max_num_frames,
+        )
+    elif condition_on_actions:
         dataset = VideoTrajectoryDataset(
             folder = data_path,
             image_size = image_size,
@@ -197,6 +221,7 @@ def train_dynamics(
         dim_latent = tokenizer.dim_latent,
         dim = dim,
         depth = depth,
+        time_block_every = time_block_every,
         attn_dim_head = attn_dim_head,
         attn_heads = attn_heads,
         num_continuous_actions = num_continuous_actions if condition_on_actions else 0,
@@ -254,11 +279,16 @@ def serve_world_model(
 
     server.serve()
 
+def inspect_replay_buffer(path: str, port: int = 8081):
+    server = InspectReplayBufferServer(buffer_path=path, port=port)
+    server.serve()
+
 def main():
     fire.Fire({
         'train-video-tokenizer': train_tokenizer,
         'train-dynamics': train_dynamics,
-        'serve-world-model': serve_world_model
+        'serve-world-model': serve_world_model,
+        'inspect-replay-buffer': inspect_replay_buffer
     })
 
 if __name__ == '__main__':

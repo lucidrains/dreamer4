@@ -160,7 +160,7 @@ class BaseRecordEnvWrapper:
         info_val = obs[1] if isinstance(obs, tuple) and len(obs) == 2 else dict()
 
         self.frames.append(self._extract_image(obs_val))
-        self._append_records(obs=obs_val, info=info_val)
+        self._append_records(obs=obs_val, info=info_val, reward=0., terminated=False)
 
         return obs
 
