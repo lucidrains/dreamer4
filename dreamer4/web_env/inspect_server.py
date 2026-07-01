@@ -8,7 +8,7 @@ import numpy as np
 import imageio.v3 as iio
 from einops import rearrange, repeat
 
-from memmap_replay_buffer import ReplayBuffer
+from memmap_replay_buffer import ReplayBuffer, ConcatReplayBuffer
 
 def exists(val):
     return val is not None
@@ -127,7 +127,10 @@ class InspectReplayBufferServer:
         self.port = port
         self.html_path = Path(__file__).parent / 'inspect_index.html'
 
-        self.replay_buffer = ReplayBuffer.from_folder(buffer_path)
+        if isinstance(buffer_path, (list, tuple)):
+            self.replay_buffer = ConcatReplayBuffer(buffer_path)
+        else:
+            self.replay_buffer = ReplayBuffer.from_folder(buffer_path)
         self.dataset = self.replay_buffer.dataset(slice_by_episode_len = True)
         self.num_episodes = len(self.dataset)
 

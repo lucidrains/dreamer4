@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import fire
 import webbrowser
+import glob
 from pathlib import Path
 from shutil import rmtree
 from adam_atan2_pytorch import MuonAdamAtan2
@@ -58,29 +59,44 @@ def train_tokenizer(
     project_name: str = 'dreamer4',
     force_restart: bool = False
 ):
-    data_path = Path(data)
-    assert data_path.exists(), f"{data} does not exist"
-    assert data_path.is_dir(), f"{data} must be a directory"
+    if '*' in data:
+        resolved_data = sorted(glob.glob(data))
+        assert len(resolved_data) > 0, f"No matching folders found for glob: {data}"
+        if len(resolved_data) == 1:
+            resolved_data = resolved_data[0]
+    else:
+        resolved_data = data
 
     if not use_lpips_loss:
         lpips_loss_weight = 0.
 
-    is_replay_buffer = (data_path / 'metadata.pkl').exists()
-
-    if is_replay_buffer:
+    if isinstance(resolved_data, list):
         dataset = VideoDatasetFromReplayBuffer(
-            replay_buffer = ReplayBuffer.from_folder(str(data_path)),
+            replay_buffer = resolved_data,
             image_size = image_size,
             max_num_frames = max_num_frames,
         )
     else:
-        dataset = VideoDataset(
-            folder = str(data_path),
-            image_size = image_size,
-            channels = channels,
-            max_num_frames = max_num_frames,
-            exts = exts
-        )
+        data_path = Path(resolved_data)
+        assert data_path.exists(), f"{resolved_data} does not exist"
+        assert data_path.is_dir(), f"{resolved_data} must be a directory"
+
+        is_replay_buffer = (data_path / 'metadata.pkl').exists()
+
+        if is_replay_buffer:
+            dataset = VideoDatasetFromReplayBuffer(
+                replay_buffer = resolved_data,
+                image_size = image_size,
+                max_num_frames = max_num_frames,
+            )
+        else:
+            dataset = VideoDataset(
+                folder = str(data_path),
+                image_size = image_size,
+                channels = channels,
+                max_num_frames = max_num_frames,
+                exts = exts
+            )
 
     tokenizer = VideoTokenizer(
         dim = dim,
@@ -171,8 +187,13 @@ def train_dynamics(
     log_dir: str = './logs',
     project_name: str = 'dreamer4',
 ):
-    data_path = Path(data)
-    assert data_path.exists() and data_path.is_dir(), f"{data} must be an existing directory"
+    if '*' in data:
+        resolved_data = sorted(glob.glob(data))
+        assert len(resolved_data) > 0, f"No matching folders found for glob: {data}"
+        if len(resolved_data) == 1:
+            resolved_data = resolved_data[0]
+    else:
+        resolved_data = data
 
     tokenizer_path = Path(tokenizer_checkpoint)
     assert tokenizer_path.exists(), f"Tokenizer checkpoint missing at {tokenizer_path}"
@@ -180,30 +201,40 @@ def train_dynamics(
     suffix = '-action-conditioned-dynamics' if condition_on_actions else '-dynamics-only'
     run_name = f"{name}{suffix}"
 
-    is_replay_buffer = (data_path / 'metadata.pkl').exists()
-
-    if is_replay_buffer:
+    if isinstance(resolved_data, list):
         dataset = VideoDatasetFromReplayBuffer(
-            replay_buffer = ReplayBuffer.from_folder(str(data_path)),
+            replay_buffer = resolved_data,
             image_size = image_size,
             max_num_frames = max_num_frames,
-        )
-    elif condition_on_actions:
-        dataset = VideoTrajectoryDataset(
-            folder = data_path,
-            image_size = image_size,
-            channels = channels,
-            max_num_frames = max_num_frames,
-            exts = exts
         )
     else:
-        dataset = VideoDataset(
-            folder = data_path,
-            image_size = image_size,
-            channels = channels,
-            max_num_frames = max_num_frames,
-            exts = exts
-        )
+        data_path = Path(resolved_data)
+        assert data_path.exists() and data_path.is_dir(), f"{resolved_data} must be an existing directory"
+
+        is_replay_buffer = (data_path / 'metadata.pkl').exists()
+
+        if is_replay_buffer:
+            dataset = VideoDatasetFromReplayBuffer(
+                replay_buffer = resolved_data,
+                image_size = image_size,
+                max_num_frames = max_num_frames,
+            )
+        elif condition_on_actions:
+            dataset = VideoTrajectoryDataset(
+                folder = data_path,
+                image_size = image_size,
+                channels = channels,
+                max_num_frames = max_num_frames,
+                exts = exts
+            )
+        else:
+            dataset = VideoDataset(
+                folder = data_path,
+                image_size = image_size,
+                channels = channels,
+                max_num_frames = max_num_frames,
+                exts = exts
+            )
 
     print(f"Loading tokenizer from: {tokenizer_path}")
     tokenizer = VideoTokenizer.init_and_load(tokenizer_path, strict = False)
@@ -284,7 +315,15 @@ def serve_world_model(
     server.serve()
 
 def inspect_replay_buffer(path: str, port: int = 8081):
-    server = InspectReplayBufferServer(buffer_path=path, port=port)
+    if '*' in path:
+        resolved_path = sorted(glob.glob(path))
+        assert len(resolved_path) > 0, f"No matching folders found for glob: {path}"
+        if len(resolved_path) == 1:
+            resolved_path = resolved_path[0]
+    else:
+        resolved_path = path
+
+    server = InspectReplayBufferServer(buffer_path=resolved_path, port=port)
     server.serve()
 
 def main():

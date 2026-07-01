@@ -3,7 +3,8 @@
 #   "gymnasium",
 #   "stable-baselines3",
 #   "wandb",
-#   "dreamer4"
+#   "dreamer4",
+#   "joblib"
 # ]
 # [tool.uv.sources]
 # dreamer4 = { path = "." }
@@ -15,7 +16,7 @@ from pathlib import Path
 import torch
 import numpy as np
 from einops import rearrange
-import imageio
+from joblib import Parallel, delayed
 
 import gymnasium as gym
 from gymnasium import spaces
@@ -174,6 +175,87 @@ class CustomCnnExtractor(BaseFeaturesExtractor):
 
 # main
 
+def collect_episodes(
+    collector_id: int,
+    num_episodes: int,
+    folder: str,
+    max_timesteps: int,
+    grid_size: int,
+    max_steps: int,
+    collision_penalty: float,
+    apple_reward: float,
+    aliveness_penalty: float,
+    model,
+    log_every: int
+):
+    print(f"[Collector {collector_id}] Starting collection of {num_episodes} episodes into {folder}")
+
+    test_dir = Path(folder)
+    shutil.rmtree(test_dir, ignore_errors = True)
+    test_dir.mkdir(exist_ok = True, parents = True)
+
+    buffer = ReplayBuffer(
+        folder = str(test_dir),
+        max_episodes = num_episodes,
+        max_timesteps = max_timesteps,
+        fields = dict(
+            rewards = 'float',
+            terminated = 'bool',
+            video = ('uint8', (3, grid_size * 2, grid_size * 2)),
+            discrete_actions = 'int'
+        ),
+        meta_fields = dict(
+            cum_reward = 'float',
+            total_apples = 'float'
+        )
+    )
+
+    env = SnakeEnv(
+        grid_size = grid_size,
+        max_steps = max_steps,
+        collision_penalty = collision_penalty,
+        apple_reward = apple_reward,
+        aliveness_penalty = aliveness_penalty
+    )
+
+    env_with_buffer = RecordToReplayBufferEnvWrapper(
+        env,
+        replay_buffer = buffer,
+        rewards = True,
+        terminated = True
+    )
+
+    gym_env_collect = GymWrapper(env_with_buffer)
+
+    episodes_collected = 0
+    cum_reward = 0.
+    total_apples = 0.
+
+    obs, _ = gym_env_collect.reset()
+
+    while episodes_collected < num_episodes:
+        action, _ = model.predict(obs, deterministic = False)
+        obs, reward, terminated, truncated, _ = gym_env_collect.step(action)
+
+        cum_reward += float(reward)
+        if reward > 0.0:
+            total_apples += 1.
+
+        if terminated or truncated:
+            buffer.store_meta_datapoint(episodes_collected, 'cum_reward', cum_reward)
+            buffer.store_meta_datapoint(episodes_collected, 'total_apples', total_apples)
+
+            episodes_collected += 1
+            if episodes_collected % log_every == 0:
+                print(f"[Collector {collector_id}] Collected {episodes_collected} / {num_episodes} episodes")
+
+            if episodes_collected < num_episodes:
+                obs, _ = gym_env_collect.reset()
+                cum_reward = 0.
+                total_apples = 0.
+
+    print(f"[Collector {collector_id}] Collection complete.")
+
 def main(
     project_name: str = "snake-ppo-agent",
     buffer_folder: str | None = None,
@@ -194,19 +276,16 @@ def main(
     batch_size: int = 64,
     n_epochs: int = 4,
     log_every: int = 50,
+    num_trajectory_collectors: int = 4,
 ):
     wandb.init(project = project_name)
 
     buffer_folder = buffer_folder or f"./snake_buffer_ppo_{grid_size}x{grid_size}_{max_steps}steps"
     video_folder = video_folder or f"./snake_videos_ppo_{grid_size}x{grid_size}_{max_steps}steps"
 
-    test_dir = Path(buffer_folder)
     video_dir = Path(video_folder)
 
-    print(f"Training policy until {target_apples} apples, then populating replay buffer at {test_dir} with {replay_buffer_size} trajectories")
-
-    shutil.rmtree(test_dir, ignore_errors = True)
-    test_dir.mkdir(exist_ok = True, parents = True)
+    print(f"Training policy until {target_apples} apples, then populating replay buffers with prefix {buffer_folder} with {replay_buffer_size} trajectories")
 
     shutil.rmtree(video_dir, ignore_errors = True)
     video_dir.mkdir(exist_ok = True, parents = True)
@@ -258,65 +337,34 @@ def main(
     total_ppo_timesteps = ppo_updates_before_collect * n_steps * vec_env.num_envs
     model.learn(total_timesteps = total_ppo_timesteps, callback = callback)
 
-    print(f"\nPhase 2: Collecting {replay_buffer_size} episodes...")
+    print(f"\nPhase 2: Collecting {replay_buffer_size} episodes with {num_trajectory_collectors} collectors...")
 
-    buffer = ReplayBuffer(
-        folder = str(test_dir),
-        max_episodes = replay_buffer_size,
-        max_timesteps = max_timesteps,
-        fields = dict(
-            rewards = 'float',
-            terminated = 'bool',
-            video = ('uint8', (3, grid_size * 2, grid_size * 2)),
-            discrete_actions = 'int'
-        ),
-        meta_fields = dict(
-            cum_reward = 'float',
-            total_apples = 'float'
+    quotient, remainder = divmod(replay_buffer_size, num_trajectory_collectors)
+    episodes_per_collector = [quotient + int(i < remainder) for i in range(num_trajectory_collectors)]
+
+    Parallel(n_jobs = num_trajectory_collectors)(
+        delayed(collect_episodes)(
+            collector_id = i,
+            num_episodes = eps,
+            folder = f"{buffer_folder}.{i}",
+            max_timesteps = max_timesteps,
+            grid_size = grid_size,
+            max_steps = max_steps,
+            collision_penalty = collision_penalty,
+            apple_reward = apple_reward,
+            aliveness_penalty = aliveness_penalty,
+            model = model,
+            log_every = log_every
         )
+        for i, eps in enumerate(episodes_per_collector) if eps > 0
     )
-
-    env_with_buffer = RecordToReplayBufferEnvWrapper(
-        env,
-        replay_buffer = buffer,
-        rewards = True,
-        terminated = True
-    )
-
-    gym_env_collect = GymWrapper(env_with_buffer)
-
-    episodes_collected = 0
-    cum_reward = 0.
-    total_apples = 0.
-
-    obs, _ = gym_env_collect.reset()
-
-    while episodes_collected < replay_buffer_size:
-        action, _ = model.predict(obs, deterministic = False)
-        obs, reward, terminated, truncated, _ = gym_env_collect.step(action)
-
-        cum_reward += float(reward)
-        if reward > 0.0:
-            total_apples += 1.
-
-        if terminated or truncated:
-            buffer.store_meta_datapoint(episodes_collected, 'cum_reward', cum_reward)
-            buffer.store_meta_datapoint(episodes_collected, 'total_apples', total_apples)
-
-            episodes_collected += 1
-            if episodes_collected % log_every == 0:
-                print(f"Collected {episodes_collected} / {replay_buffer_size} episodes")
-
-            obs, _ = gym_env_collect.reset()
-            cum_reward = 0.
-            total_apples = 0.
 
     print("Collection complete.")
 
     if inspect_replay_buffer:
         print("\nStarting replay buffer visualizer...")
         from dreamer4.cli import inspect_replay_buffer as start_visualizer
-        start_visualizer(buffer_folder, port = 8081)
+        start_visualizer(f"{buffer_folder}.*", port = 9000)
 
 if __name__ == "__main__":
     fire.Fire(main)

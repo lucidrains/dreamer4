@@ -50,6 +50,8 @@ import cv2
 import numpy as np
 from PIL import Image, ImageSequence
 
+from memmap_replay_buffer import ReplayBuffer, ConcatReplayBuffer
+
 # helpers
 
 def exists(v):
@@ -351,6 +353,13 @@ class VideoDatasetFromReplayBuffer(Dataset):
         random_crop = True
     ):
         super().__init__()
+
+        if isinstance(replay_buffer, (str, Path)):
+            replay_buffer = ReplayBuffer.from_folder(replay_buffer, read_only = True)
+
+        elif isinstance(replay_buffer, (list, tuple)):
+            replay_buffer = ConcatReplayBuffer(list(replay_buffer))
+
         self.dataset = replay_buffer.dataset(
             slice_by_episode_len = True,
             return_episode_lens = False

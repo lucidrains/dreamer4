@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -53,8 +54,14 @@
             z-index: 10;
         }
 
-        #lhs { border-left: none; }
-        #rhs { border-right: none; width: 320px; }
+        #lhs {
+            border-left: none;
+        }
+
+        #rhs {
+            border-right: none;
+            width: 320px;
+        }
 
         .panel-header {
             padding: 24px;
@@ -62,7 +69,8 @@
             flex-shrink: 0;
         }
 
-        .panel-header h1, .panel-header h2 {
+        .panel-header h1,
+        .panel-header h2 {
             font-size: 1.1rem;
             margin: 0 0 8px 0;
             font-weight: 600;
@@ -82,10 +90,22 @@
         }
 
         /* Scrollbar styles */
-        ::-webkit-scrollbar { width: 6px; }
-        ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 3px; }
-        ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.2); }
+        ::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 3px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: rgba(255, 255, 255, 0.2);
+        }
 
         /* Episode List */
         .episode-item {
@@ -209,7 +229,7 @@
             border-radius: 8px;
             margin: 0 auto 30px auto;
             display: block;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.6);
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.6);
             image-rendering: pixelated;
         }
 
@@ -218,16 +238,16 @@
             align-items: center;
             gap: 20px;
             margin-bottom: 40px;
-            background: rgba(0,0,0,0.2);
+            background: rgba(0, 0, 0, 0.2);
             padding: 16px 24px;
             border-radius: 12px;
-            border: 1px solid rgba(255,255,255,0.05);
+            border: 1px solid rgba(255, 255, 255, 0.05);
         }
 
         input[type=range] {
             flex-grow: 1;
             -webkit-appearance: none;
-            background: rgba(255,255,255,0.1);
+            background: rgba(255, 255, 255, 0.1);
             height: 4px;
             border-radius: 2px;
             outline: none;
@@ -301,9 +321,17 @@
             font-variant-numeric: tabular-nums;
         }
 
-        .field-value.bool-true { color: var(--success); }
-        .field-value.bool-false { color: var(--danger); }
-        .field-value.highlight { color: #f3f4f6; }
+        .field-value.bool-true {
+            color: var(--success);
+        }
+
+        .field-value.bool-false {
+            color: var(--danger);
+        }
+
+        .field-value.highlight {
+            color: #f3f4f6;
+        }
 
         #loading-overlay {
             position: absolute;
@@ -319,16 +347,20 @@
         .spinner {
             width: 40px;
             height: 40px;
-            border: 3px solid rgba(255,255,255,0.1);
+            border: 3px solid rgba(255, 255, 255, 0.1);
             border-left-color: var(--accent);
             border-radius: 50%;
             animation: spin 1s linear infinite;
         }
 
-        @keyframes spin { to { transform: rotate(360deg); } }
-
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
     </style>
 </head>
+
 <body>
     <div id="layout">
 
@@ -343,7 +375,9 @@
 
         <!-- Middle: Stage -->
         <div id="main-stage">
-            <div id="loading-overlay"><div class="spinner"></div></div>
+            <div id="loading-overlay">
+                <div class="spinner"></div>
+            </div>
 
             <div class="stage-empty" id="empty-state">
                 <h2 style="font-weight:400">Select an episode</h2>
@@ -407,8 +441,8 @@
 
                 // Render Schema
                 schemaList.innerHTML = '';
-                if(data.schema) {
-                    for(const [field, info] of Object.entries(data.schema)) {
+                if (data.schema) {
+                    for (const [field, info] of Object.entries(data.schema)) {
                         const item = document.createElement('div');
                         item.className = 'schema-item';
                         const shapeStr = info.is_meta
@@ -429,7 +463,7 @@
                 }
 
                 fetchEpisodes();
-            } catch(e) {
+            } catch (e) {
                 statsDesc.innerHTML = `<span style="color:var(--danger)">Failed to load stats</span>`;
             }
         }
@@ -454,7 +488,7 @@
 
                     el.innerHTML = `
                         <div style="display:flex; flex-direction:column; gap:6px;">
-                            <span>Episode ${ep.id}</span>
+                            <span>Episode ${ep.id + 1}</span>
                             <div style="display:flex; align-items: center; flex-wrap: wrap;">
                                 ${metaHtml}
                             </div>
@@ -464,14 +498,14 @@
                     el.onclick = () => loadEpisode(ep.id, el);
                     epList.appendChild(el);
                 });
-            } catch(e) {
+            } catch (e) {
                 console.error("Failed to load episodes", e);
             }
         }
 
         async function loadEpisode(id, el) {
             document.querySelectorAll('.episode-item').forEach(e => e.classList.remove('active'));
-            if(el) el.classList.add('active');
+            if (el) el.classList.add('active');
 
             overlay.style.display = 'flex';
             stopPlayback();
@@ -489,11 +523,11 @@
                 emptyState.style.display = 'none';
                 viewerContainer.style.display = 'block';
 
-                epTitleId.textContent = id;
+                epTitleId.textContent = Number(id) + 1;
                 scrubber.max = currentEpisodeData.frames.length - 1;
 
                 renderFrame(0);
-            } catch(e) {
+            } catch (e) {
                 alert(`Failed to load episode data:\n\n${e.message}`);
             } finally {
                 overlay.style.display = 'none';
@@ -569,4 +603,5 @@
         init();
     </script>
 </body>
+
 </html>
