@@ -2426,7 +2426,8 @@ def test_state_entropy_bonus_e2e():
     experience = world_model.interact_with_env(mock_env, max_timesteps = 2, env_is_vectorized = False)
     assert exists(experience)
 
-def test_hallucination_metric():
+@param('clip_decoded', (True, False))
+def test_hallucination_metric(clip_decoded):
     import torch
     from dreamer4.dreamer4 import DynamicsWorldModel, VideoTokenizer
 
@@ -2465,7 +2466,8 @@ def test_hallucination_metric():
     metric = dynamics(
         video = video,
         continuous_actions = actions,
-        return_latent_disagreement = True
+        return_latent_disagreement = True,
+        return_latent_disagreement_clip_decoded = clip_decoded
     )
 
     assert metric.shape == (batch, time)

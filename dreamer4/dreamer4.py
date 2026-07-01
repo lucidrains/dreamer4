@@ -4117,12 +4117,17 @@ class VideoTokenizer(Module):
         self,
         latents,
         height = None,
-        width = None
+        width = None,
+        clip_decoded_video: bool = False
     ):
         self.eval()
         height = default(height, self.image_height)
         width = default(width, self.image_width)
         recon_video = self.decode_step(latents, height = height, width = width)
+
+        if clip_decoded_video:
+            recon_video = recon_video.clamp(0., 1.)
+
         recon_latents = self.forward(recon_video, return_latents = True, mask_patches = False)
 
         loss = F.mse_loss(recon_latents, latents, reduction = 'none')
@@ -6817,7 +6822,8 @@ class DynamicsWorldModel(Module):
         agent_token_cond = None,         # (b t d) optional conditioning to be summed to agent tokens
         time_modifier_fn: Callable | None = None,
         return_tem_preds = False,
-        return_latent_disagreement: bool = False
+        return_latent_disagreement: bool = False,
+        return_latent_disagreement_clip_decoded: bool = False
     ):
         # handle video or latents
 
@@ -6868,7 +6874,12 @@ class DynamicsWorldModel(Module):
                 latents_for_residual = latents[..., :-self.num_aux_image_tokens, :]
 
             latents_packed = rearrange(latents_for_residual, 'b t v n d -> (b v) t n d')
-            residual = self.video_tokenizer.latent_disagreement(latents_packed)
+
+            residual = self.video_tokenizer.latent_disagreement(
+                latents_packed,
+                clip_decoded_video = return_latent_disagreement_clip_decoded
+            )
+
             residual = rearrange(residual, '(b v) t -> b v t', v = self.num_video_views)
 
             # average over multiple views if present, otherwise squeeze
