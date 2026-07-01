@@ -312,8 +312,10 @@ def combine_experiences(
 def exists(v):
     return v is not None
 
-def default(v, d):
-    return v if exists(v) else d
+def default(*args):
+    for arg in args:
+        if exists(arg):
+            return arg
 
 def identity(t, *args, **kwargs):
     return t
@@ -5182,6 +5184,8 @@ class DynamicsWorldModel(Module):
         self.agent_policy_gradient_frac = agent_policy_gradient_frac
         self.agent_value_gradient_frac = agent_value_gradient_frac
 
+        self.normalize_advantages = normalize_advantages
+
         # pmpo related
 
         self.pmpo_pos_to_neg_weight = pmpo_pos_to_neg_weight
@@ -5966,7 +5970,7 @@ class DynamicsWorldModel(Module):
 
         # if using pmpo, do not normalize advantages, but can be overridden
 
-        normalize_advantages = default(normalize_advantages, objective != 'pmpo')
+        normalize_advantages = default(normalize_advantages, self.normalize_advantages, objective != 'pmpo')
 
         if normalize_advantages:
             advantage = z_score(advantage, mask = mask, eps = eps)
