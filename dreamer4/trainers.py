@@ -488,6 +488,7 @@ class VideoTokenizerTrainer(Module):
                 self.results_folder.mkdir(parents = True, exist_ok = True)
 
             if use_tensorboard:
+                check_import('tensorboard', 'tensorboard is not installed. Please install it using `pip install tensorboard`')
                 self.video_logger = self.accelerator.get_tracker("tensorboard").writer.add_video
 
             if use_wandb:
@@ -974,6 +975,7 @@ class BehaviorCloneTrainer(Module):
                 self.results_folder.mkdir(parents = True, exist_ok = True)
 
             if use_tensorboard:
+                check_import('tensorboard', 'tensorboard is not installed. Please install it using `pip install tensorboard`')
                 self.video_logger = self.accelerator.get_tracker("tensorboard").writer.add_video
 
             if use_wandb:

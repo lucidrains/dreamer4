@@ -161,6 +161,44 @@ from dreamer4 import DynamicsWorldModel
 world_model = DynamicsWorldModel.init_and_load('./checkpoints/experiment_name/dynamics.pt')
 ```
 
+## Toy Snake World Model
+
+You can play the ground truth Toy Snake environment in the browser with:
+
+```bash
+$ dreamer4 serve-world-model
+```
+
+To learn a world model of this environment, first generate an initial replay buffer dataset by training a PPO agent for a bit:
+
+```bash
+$ uv run train_snake_ppo.py --grid_size 4
+```
+
+Then train the video tokenizer on the collected buffer (default path `./snake_buffer_ppo_4x4_20steps.*`):
+
+```bash
+$ dreamer4 train-video-tokenizer "./snake_buffer_ppo_4x4_20steps.*" \
+    --name snake_tokenizer \
+    --image_size 8
+```
+
+Next, train the action-conditioned dynamics world model using the trained tokenizer:
+
+```bash
+$ dreamer4 train-dynamics "./snake_buffer_ppo_4x4_20steps.*" \
+    --tokenizer_checkpoint ./checkpoints/snake_tokenizer \
+    --name snake_dynamics \
+    --condition_on_actions True \
+    --num_discrete_actions 4
+```
+
+Finally, serve the world model in the browser and interact with it (it will automatically look for the latest EMA checkpoint in the folder):
+
+```bash
+$ dreamer4 serve-world-model ./checkpoints/snake_dynamics-action-conditioned-dynamics
+```
+
 ## Moving MNIST
 
 To train a simple tokenizer on Moving MNIST for 20000 steps and then use it to generate action-conditioned dynamics models

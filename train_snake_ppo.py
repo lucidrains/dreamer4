@@ -254,6 +254,7 @@ def collect_episodes(
                 cum_reward = 0.
                 total_apples = 0.
 
+    buffer.flush()
     print(f"[Collector {collector_id}] Collection complete.")
 
 def main(
@@ -261,8 +262,8 @@ def main(
     buffer_folder: str | None = None,
     video_folder: str | None = None,
     inspect_replay_buffer: bool = True,
-    grid_size: int = 8,
-    max_steps: int = 40,
+    grid_size: int = 4,
+    max_steps: int = 20,
     collision_penalty: float = -10.0,
     apple_reward: float = 5.0,
     aliveness_penalty: float = -0.01,

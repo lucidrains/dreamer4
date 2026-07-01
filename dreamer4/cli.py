@@ -51,6 +51,7 @@ def train_tokenizer(
     # logging and saving
     name: str = 'default-tokenizer',
     use_wandb: bool = True,
+    use_tensorboard: bool = False,
     log_video: bool = True,
     video_fps: int = 4,
     log_video_every: int = 100,
@@ -142,6 +143,7 @@ def train_tokenizer(
         learning_rate = learning_rate,
         num_train_steps = num_train_steps,
         use_wandb = use_wandb,
+        use_tensorboard = use_tensorboard,
         log_dir = f"{log_dir}/{name}",
         log_video = log_video,
         video_fps = video_fps,
@@ -171,8 +173,8 @@ def train_dynamics(
     attn_dim_head: int = 64,
     attn_heads: int = 8,
     condition_on_actions: bool = False,
-    num_continuous_actions: int = 6,
     num_discrete_actions: int = 0,
+    num_continuous_actions: int = 0,
     # training params
     batch_size: int = 8,
     grad_accum_every: int = 1,
@@ -182,6 +184,7 @@ def train_dynamics(
     # logging and saving
     name: str = 'default',
     use_wandb: bool = True,
+    use_tensorboard: bool = False,
     log_video: bool = True,
     video_fps: int = 4,
     log_video_every: int = 100,
@@ -198,7 +201,15 @@ def train_dynamics(
     else:
         resolved_data = data
 
-    tokenizer_path = Path(tokenizer_checkpoint)
+    tokenizer_path = Path(tokenizer_checkpoint).resolve()
+
+    if tokenizer_path.is_dir():
+        ckpt_paths = sorted(tokenizer_path.glob('tokenizer-*.pt'), key = os.path.getmtime, reverse = True)
+        assert len(ckpt_paths) > 0, f"no tokenizer checkpoints found in {tokenizer_path}"
+
+        ema_ckpts = [p for p in ckpt_paths if '-ema' in p.name]
+        tokenizer_path = ema_ckpts[0] if len(ema_ckpts) > 0 else ckpt_paths[0]
+
     assert tokenizer_path.exists(), f"Tokenizer checkpoint missing at {tokenizer_path}"
 
     suffix = '-action-conditioned-dynamics' if condition_on_actions else '-dynamics-only'
@@ -271,7 +282,7 @@ def train_dynamics(
         batch_size = batch_size,
         learning_rate = learning_rate,
         num_train_steps = num_train_steps,
-        use_tensorboard = not use_wandb,
+        use_tensorboard = use_tensorboard,
         use_wandb = use_wandb,
         project_name = project_name,
         run_name = run_name,
@@ -290,8 +301,8 @@ def serve_world_model(
     env_name: str = 'snake',
     port: int = 8000,
     num_generation_steps: int = 4,
-    grid_size: int = 8,
-    max_steps: int = 40,
+    grid_size: int = 4,
+    max_steps: int = 20,
 ):
     ENVS = {
         'snake': lambda: SnakeEnv(grid_size = grid_size, max_steps = max_steps)
@@ -304,10 +315,18 @@ def serve_world_model(
         env = ENVS[env_name]()
     else:
         model_file = Path(model_path).resolve()
+
+        if model_file.is_dir():
+            ckpt_paths = sorted(model_file.glob('dynamics-*.pt'), key = os.path.getmtime, reverse = True)
+            assert len(ckpt_paths) > 0, f"no dynamics checkpoints found in {model_file}"
+
+            ema_ckpts = [p for p in ckpt_paths if '-ema' in p.name]
+            model_file = ema_ckpts[0] if len(ema_ckpts) > 0 else ckpt_paths[0]
+
         assert model_file.exists(), f"World model not found at {model_file}"
 
         print(f"Loading world model from: {model_file}")
-        world_model = DynamicsWorldModel.init_and_load(model_path, strict = False)
+        world_model = DynamicsWorldModel.init_and_load(model_file, strict = False)
         env = DynamicsWorldModelWrapper(world_model, num_generation_steps = num_generation_steps)
 
     server = WebEnvServer(env, port=port)
