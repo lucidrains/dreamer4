@@ -4664,7 +4664,7 @@ class DynamicsWorldModel(Module):
         add_reward_embed_dropout = 0.1,
         add_state_pred_head = False,
         state_pred_loss_weight = 0.1,
-        state_entropy_bonus_weight = 0.05,
+        state_entropy_bonus_weight = 0.,
         agent_predicts_state = False,
         agent_predicts_state_frac_gradient = 0.,
         agent_state_pred_loss_weight = 0.1,
@@ -5575,7 +5575,7 @@ class DynamicsWorldModel(Module):
             past_proprio = accumulated_proprio[:, -1:] if exists(accumulated_proprio) else None
             past_rewards = rewards[:, -1:] if exists(rewards) else None
 
-            _, (embeds, next_time_cache) = self.forward(
+            pred, (embeds, next_time_cache) = self.forward(
                 latents = latents,
                 signal_levels = self.max_steps - 1,
                 step_sizes = step_size,
@@ -5691,6 +5691,16 @@ class DynamicsWorldModel(Module):
             done_flag |= (is_terminated | is_truncated)
 
             reward = rearrange(reward, 'b -> b 1') if env_is_vectorized else rearrange(reward, ' -> 1 1')
+
+            # maybe state entropy bonus
+
+            if self.add_state_entropy_bonus and exists(pred.state):
+                one_state_pred = pred.state[:, -1:]
+                dist = self.state_beta_dist.dist(one_state_pred)
+
+                state_entropy = reduce(dist.entropy(), 'b 1 v n d -> b 1', 'mean')
+                reward = reward + state_entropy * self.state_entropy_bonus_weight
+
             rewards = safe_cat((rewards, reward), dim = 1)
 
             acc_agent_embed = safe_cat((acc_agent_embed, one_agent_embed), dim = 1)

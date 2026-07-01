@@ -2399,3 +2399,29 @@ def test_video_byol(byol_use_sem):
     )
 
     trainer()
+
+def test_state_entropy_bonus_e2e():
+    import torch
+    from dreamer4.dreamer4 import DynamicsWorldModel, VideoTokenizer
+    from dreamer4.mocks import MockEnv
+
+    tokenizer = VideoTokenizer(
+        dim = 16, dim_latent = 16, patch_size = 32, image_height = 64, image_width = 64,
+        num_latent_tokens = 2, encoder_depth = 1, decoder_depth = 1,
+        time_block_every = 1, attn_heads = 1, attn_dim_head = 8
+    )
+
+    world_model = DynamicsWorldModel(
+        dim = 16, dim_latent = 16,
+        num_latent_tokens = 2, num_spatial_tokens = 2,
+        video_tokenizer = tokenizer,
+        num_discrete_actions = 2,
+        depth = 1, time_block_every = 1, attn_heads = 1, attn_dim_head = 8,
+        add_state_pred_head = True,
+        state_entropy_bonus_weight = 0.05
+    )
+
+    mock_env = MockEnv((64, 64), vectorized = False, num_envs = 1, terminate_after_step = 2)
+
+    experience = world_model.interact_with_env(mock_env, max_timesteps = 2, env_is_vectorized = False)
+    assert exists(experience)
