@@ -5034,6 +5034,7 @@ class DynamicsWorldModel(Module):
         self.ppo_eps_clip = ppo_eps_clip
         self.value_clip = value_clip
         self.clip_values = clip_values
+        self.normalize_advantages = normalize_advantages
         self.policy_entropy_weight = policy_entropy_weight
 
         self.agent_policy_gradient_frac = agent_policy_gradient_frac
@@ -5765,6 +5766,7 @@ class DynamicsWorldModel(Module):
 
         # if using pmpo, do not normalize advantages, but can be overridden
 
+        normalize_advantages = default(normalize_advantages, self.normalize_advantages)
         normalize_advantages = default(normalize_advantages, objective != 'pmpo')
 
         if normalize_advantages:

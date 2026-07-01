@@ -320,6 +320,53 @@ def test_action_with_world_model():
     actor_loss.backward(retain_graph = True)
     critic_loss.backward()
 
+@param('constructor_normalize_advantages, call_normalize_advantages, expected_z_score_calls', (
+    (None, None, 0),
+    (True, None, 1),
+    (True, False, 0),
+    (False, True, 1),
+))
+def test_pmpo_advantage_normalization_override_precedence(monkeypatch, constructor_normalize_advantages, call_normalize_advantages, expected_z_score_calls):
+    import dreamer4.dreamer4 as dreamer_module
+    from dreamer4.dreamer4 import DynamicsWorldModel
+
+    dynamics = DynamicsWorldModel(
+        dim = 16,
+        dim_latent = 8,
+        max_steps = 8,
+        num_latent_tokens = 1,
+        num_spatial_tokens = 1,
+        depth = 1,
+        time_block_every = 1,
+        attn_heads = 1,
+        attn_dim_head = 8,
+        num_discrete_actions = 2,
+        pmpo_kl_div_loss_weight = 0.,
+        normalize_advantages = constructor_normalize_advantages
+    )
+
+    dream = dynamics.generate(
+        4,
+        num_steps = 2,
+        batch_size = 2,
+        return_for_policy_optimization = True,
+        return_terminals = False
+    )
+
+    z_score_calls = 0
+    original_z_score = dreamer_module.z_score
+
+    def counting_z_score(*args, **kwargs):
+        nonlocal z_score_calls
+        z_score_calls += 1
+        return original_z_score(*args, **kwargs)
+
+    monkeypatch.setattr(dreamer_module, 'z_score', counting_z_score)
+
+    dynamics.learn_from_experience(dream, objective = 'pmpo', normalize_advantages = call_normalize_advantages)
+
+    assert z_score_calls == expected_z_score_calls
+
 def test_action_conditioned_prompt_rewards_from_post_transition_tokens():
     from dreamer4.dreamer4 import DynamicsWorldModel
 
