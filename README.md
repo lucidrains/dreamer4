@@ -480,4 +480,16 @@ Passing `--condition_on_actions True` lets you explicitly prompt with velocity a
 }
 ```
 
+```bibtex
+@misc{hansen2026hallucinationworldmodelspredictable,
+    title   = {Hallucination in World Models is Predictable and Preventable},
+    author  = {Nicklas Hansen and Xiaolong Wang},
+    year    = {2026},
+    eprint  = {2606.27326},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2606.27326},
+}
+```
+
 *the conquest of nature is to be achieved through number and measure - angels to Descartes in a dream*

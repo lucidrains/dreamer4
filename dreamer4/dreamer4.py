@@ -3689,6 +3689,7 @@ class VideoTokenizer(Module):
         dim_latent,
         patch_size,
         latent_init_patch_size = None,
+        image_size = None,
         image_height = None,
         image_width = None,
         num_latent_tokens = 64,
@@ -3768,6 +3769,11 @@ class VideoTokenizer(Module):
         self.encode_temporal_diff = encode_temporal_diff
         self.dim = dim
         self.dim_latent = dim_latent
+
+        assert exists(image_size) or (exists(image_height) and exists(image_width)), 'either image_size or both image_height and image_width must be provided'
+
+        image_height = default(image_height, image_size)
+        image_width = default(image_width, image_size)
 
         # latents
 
@@ -4105,6 +4111,23 @@ class VideoTokenizer(Module):
     ):
         self.eval()
         return self.forward(video, return_latents = True)
+
+    @torch.no_grad()
+    def latent_disagreement(
+        self,
+        latents,
+        height = None,
+        width = None
+    ):
+        self.eval()
+        height = default(height, self.image_height)
+        width = default(width, self.image_width)
+        recon_video = self.decode_step(latents, height = height, width = width)
+        recon_latents = self.forward(recon_video, return_latents = True, mask_patches = False)
+
+        loss = F.mse_loss(recon_latents, latents, reduction = 'none')
+        loss = reduce(loss, 'b t ... -> b t', 'mean')
+        return loss
 
     def decode_step(
         self,
@@ -6793,7 +6816,8 @@ class DynamicsWorldModel(Module):
         seed = None,
         agent_token_cond = None,         # (b t d) optional conditioning to be summed to agent tokens
         time_modifier_fn: Callable | None = None,
-        return_tem_preds = False
+        return_tem_preds = False,
+        return_latent_disagreement: bool = False
     ):
         # handle video or latents
 
@@ -6834,6 +6858,24 @@ class DynamicsWorldModel(Module):
 
         assert latents.shape[-2:] == self.latent_shape, f'latents must have shape {self.latent_shape}, got {latents.shape[-2:]}'
         assert latents.shape[2] == self.num_video_views, f'latents must have {self.num_video_views} views, got {latents.shape[2]}'
+
+        if return_latent_disagreement:
+            # Hansen et al. https://arxiv.org/abs/2606.27326
+
+            latents_for_residual = latents
+
+            if self.has_aux_image_encoder:
+                latents_for_residual = latents[..., :-self.num_aux_image_tokens, :]
+
+            latents_packed = rearrange(latents_for_residual, 'b t v n d -> (b v) t n d')
+            residual = self.video_tokenizer.latent_disagreement(latents_packed)
+            residual = rearrange(residual, '(b v) t -> b v t', v = self.num_video_views)
+
+            # average over multiple views if present, otherwise squeeze
+
+            residual = reduce(residual, 'b v t -> b t', 'mean')
+
+            return residual
 
         # variables
 
