@@ -4,8 +4,8 @@ class SnakeEnv:
     def __init__(
         self,
         *,
-        grid_size = 8,
-        max_steps = 40,
+        grid_size = 4,
+        max_steps = 20,
         collision_penalty = -10.0,
         apple_reward = 5.0,
         aliveness_penalty = -0.01,

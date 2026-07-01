@@ -46,6 +46,7 @@ def train_tokenizer(
     ema_decay: float = 0.999,
     use_lpips_loss: bool = False,
     lpips_loss_weight: float = 0.2,
+    use_loss_normalization: bool = False,
     encoder_add_decorr_aux_loss: bool = False,
     # logging and saving
     name: str = 'default-tokenizer',
@@ -113,6 +114,7 @@ def train_tokenizer(
         time_block_every = time_block_every,
         num_latent_tokens = num_latent_tokens,
         attn_heads = attn_heads,
+        use_loss_normalization = use_loss_normalization,
     )
 
     checkpoint_dir = Path(checkpoint_folder) / name
@@ -176,6 +178,7 @@ def train_dynamics(
     grad_accum_every: int = 1,
     num_train_steps: int = 100000,
     learning_rate: float = 3e-4,
+    use_loss_normalization: bool = False,
     # logging and saving
     name: str = 'default',
     use_wandb: bool = True,
@@ -259,6 +262,7 @@ def train_dynamics(
         attn_heads = attn_heads,
         num_continuous_actions = num_continuous_actions if condition_on_actions else 0,
         num_discrete_actions = num_discrete_actions if condition_on_actions else 0,
+        use_loss_normalization = use_loss_normalization,
     )
 
     trainer = BehaviorCloneTrainer(
@@ -290,7 +294,7 @@ def serve_world_model(
     max_steps: int = 40,
 ):
     ENVS = {
-        'snake': lambda: SnakeEnv(grid_size=grid_size, max_steps=max_steps)
+        'snake': lambda: SnakeEnv(grid_size = grid_size, max_steps = max_steps)
     }
 
     if not exists(model_path):

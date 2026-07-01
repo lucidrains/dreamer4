@@ -8,6 +8,7 @@ import shutil
 from collections import OrderedDict, namedtuple
 from random import randint
 from functools import wraps
+import inspect
 
 import torch
 import torch.nn.functional as F
@@ -59,6 +60,9 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+def filter_by_keys(d, keys):
+    return {k: v for k, v in d.items() if k in keys}
 
 def cast_tuple(val, length = 1):
     return val if isinstance(val, tuple) else ((val,) * length)
@@ -861,12 +865,14 @@ class BehaviorCloneTrainer(Module):
         collate_fn = None,
         custom_sample_fn = None,
         custom_aug_fn = None,
-        aug_prob = 0.5
+        aug_prob = 0.5,
+        valid_model_kwargs: set | None = None
     ):
         super().__init__()
 
         self.aug_prob = aug_prob
         self.custom_aug_fn = custom_aug_fn
+        self.valid_model_kwargs = default(valid_model_kwargs, set(inspect.signature(model.forward).parameters.keys()))
 
         batch_size = min(batch_size, len(dataset))
 
@@ -1201,6 +1207,7 @@ class BehaviorCloneTrainer(Module):
             total_flow_loss = 0.
             total_shortcut_loss = 0.
             total_reward_loss = 0.
+            total_terminal_loss = 0.
             total_discrete_action_loss = 0.
             total_continuous_action_loss = 0.
             total_self_flow_loss = 0.
@@ -1227,6 +1234,7 @@ class BehaviorCloneTrainer(Module):
 
                 time = batch_data['video'].shape[2]
 
+                batch_data = filter_by_keys(batch_data, self.valid_model_kwargs)
                 loss, losses, intermediates = self.model(**batch_data, return_all_losses = True)
 
                 loss = loss / self.grad_accum_every
@@ -1246,6 +1254,7 @@ class BehaviorCloneTrainer(Module):
                 total_flow_loss += (losses.flow.item() / self.grad_accum_every)
                 total_shortcut_loss += (losses.shortcut.item() / self.grad_accum_every)
                 total_reward_loss += (losses.rewards.sum().item() / self.grad_accum_every)
+                total_terminal_loss += (losses.terminals.sum().item() / self.grad_accum_every)
                 total_discrete_action_loss += (losses.discrete_actions.sum().item() / self.grad_accum_every)
                 total_continuous_action_loss += (losses.continuous_actions.sum().item() / self.grad_accum_every)
 
@@ -1263,6 +1272,7 @@ class BehaviorCloneTrainer(Module):
                 flow_loss = total_flow_loss,
                 shortcut_loss = total_shortcut_loss,
                 reward_loss = total_reward_loss,
+                terminal_loss = total_terminal_loss,
                 discrete_action_loss = total_discrete_action_loss,
                 continuous_action_loss = total_continuous_action_loss,
             )
@@ -1288,6 +1298,9 @@ class BehaviorCloneTrainer(Module):
 
             if total_reward_loss > 0.:
                 postfix['reward'] = f"{total_reward_loss:.4f}"
+
+            if total_terminal_loss > 0.:
+                postfix['terminal'] = f"{total_terminal_loss:.4f}"
 
             if total_discrete_action_loss > 0.:
                 postfix['disc_act'] = f"{total_discrete_action_loss:.4f}"

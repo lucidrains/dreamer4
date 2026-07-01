@@ -136,7 +136,7 @@ class PrintReturnsCallback(BaseCallback):
                 if len(videos) > 0:
                     latest_video = max(videos, key=lambda p: p.stat().st_mtime)
                     try:
-                        log_dict["train/video"] = wandb.Video(str(latest_video), fps=4, format="mp4")
+                        log_dict["train/video"] = wandb.Video(str(latest_video), format="mp4")
                     except Exception:
                         pass
 
@@ -269,7 +269,6 @@ def main(
     ppo_updates_before_collect: int = 500,
     replay_buffer_size: int = 1000,
     target_apples: float = 5.0,
-    max_timesteps: int = 41,
     learning_rate: float = 1e-3,
     ent_coef: float = 0.01,
     n_steps: int = 256,
@@ -279,6 +278,8 @@ def main(
     num_trajectory_collectors: int = 4,
 ):
     wandb.init(project = project_name)
+
+    max_timesteps = max_steps + 1
 
     buffer_folder = buffer_folder or f"./snake_buffer_ppo_{grid_size}x{grid_size}_{max_steps}steps"
     video_folder = video_folder or f"./snake_videos_ppo_{grid_size}x{grid_size}_{max_steps}steps"

@@ -4,6 +4,7 @@ from typing import Callable, Iterable, NamedTuple, Tuple, Literal
 from math import ceil, log2
 from random import random
 import numpy as np
+from loguru import logger
 from copy import deepcopy
 from functools import wraps, partial
 from contextlib import nullcontext, contextmanager
@@ -3767,6 +3768,15 @@ class VideoTokenizer(Module):
         self.encode_temporal_diff = encode_temporal_diff
         self.dim = dim
         self.dim_latent = dim_latent
+
+        # latents
+
+        if exists(image_height) and exists(image_width) and exists(patch_size):
+            num_spatial_tokens = (image_height // patch_size) * (image_width // patch_size)
+
+            if num_latent_tokens > num_spatial_tokens:
+                logger.warning(f'number of latent tokens ({num_latent_tokens}) exceeds total spatial tokens ({num_spatial_tokens})')
+
         self.num_latent_tokens = num_latent_tokens
         self.latent_tokens = Parameter(randn(num_latent_tokens, dim) * 1e-2)
 
