@@ -2009,6 +2009,101 @@ def test_actor_spr_wrapper():
     assert kl_loss.item() >= 0
     assert sigreg_loss.item() >= 0
 
+def test_dynamic_rollout_loss_weights():
+    from dreamer4.dreamer4 import dynamic_rollout_loss_weights
+
+    # step losses of shape (r, b, n)
+    # 3 rollout steps, batch 2, seq 4
+    r, b, n = 3, 2, 4
+    step_losses = torch.tensor([
+        [[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8]],
+        [[0.2, 0.3, 0.4, 0.5], [0.6, 0.7, 0.8, 0.9]],
+        [[0.3, 0.4, 0.5, 0.6], [0.7, 0.8, 0.9, 1.0]],
+    ])
+
+    decay = 1.5
+    weights = dynamic_rollout_loss_weights(step_losses, decay = decay)
+
+    assert weights.shape == (r, b, n)
+    # first rollout step (step 0) must have weight 1.0 because cumulative loss of preceding steps is 0
+    assert torch.allclose(weights[0], torch.ones(b, n))
+    # second rollout step (step 1) has weight exp(-decay * step_losses[0])
+    assert torch.allclose(weights[1], (-decay * step_losses[0]).exp())
+    # third rollout step (step 2) has weight exp(-decay * (step_losses[0] + step_losses[1]))
+    assert torch.allclose(weights[2], (-decay * (step_losses[0] + step_losses[1])).exp())
+
+def test_actor_spr_wrapper_dynamic_rollout():
+    from dreamer4.dreamer4 import ActionEmbedder, ActorSPRWrapper, ActorNextLatentWrapper
+
+    assert ActorNextLatentWrapper is ActorSPRWrapper
+
+    batch_size = 2
+    seq_len = 8
+    dim = 32
+    num_discrete_actions = 3
+    num_continuous_actions = 1
+
+    action_embedder = ActionEmbedder(
+        dim = dim,
+        num_discrete_actions = num_discrete_actions,
+        num_continuous_actions = num_continuous_actions,
+        can_unembed = True,
+        unembed_dim = dim * 4,
+        num_unembed_preds = 1
+    )
+
+    # test with dynamic_rollout_loss_weight = True (default) and num_rollouts = 3
+    wrapper = ActorSPRWrapper(
+        action_embedder = action_embedder,
+        dim = dim * 4,
+        num_rollouts = 3,
+        spr_loss_weight = 1.0,
+        kl_loss_weight = 1.0,
+        sigreg_loss_weight = 0.05,
+        dynamic_rollout_loss_weight = True,
+        dynamic_loss_decay = 2.0
+    )
+
+    policy_embed = torch.randn(batch_size, seq_len, dim * 4, requires_grad = True)
+    discrete_actions = torch.randint(0, num_discrete_actions, (batch_size, seq_len, 1))
+    continuous_actions = torch.randn(batch_size, seq_len, num_continuous_actions)
+    mask = torch.ones(batch_size, seq_len, dtype = torch.bool)
+
+    total_loss, (spr_loss, kl_loss, sigreg_loss) = wrapper(
+        policy_embed = policy_embed,
+        discrete_actions = discrete_actions,
+        continuous_actions = continuous_actions,
+        mask = mask
+    )
+
+    assert total_loss.ndim == 0
+    assert total_loss.item() > 0
+    assert spr_loss.item() > 0
+
+    total_loss.backward()
+    assert policy_embed.grad is not None
+
+    # test with num_rollouts = 1 (no rollout, dynamic weight not applied)
+    wrapper_1_step = ActorSPRWrapper(
+        action_embedder = action_embedder,
+        dim = dim * 4,
+        num_rollouts = 1,
+        spr_loss_weight = 1.0,
+        kl_loss_weight = 1.0,
+        sigreg_loss_weight = 0.05,
+        dynamic_rollout_loss_weight = True
+    )
+
+    policy_embed_1 = torch.randn(batch_size, seq_len, dim * 4)
+    total_loss_1, _ = wrapper_1_step(
+        policy_embed = policy_embed_1,
+        discrete_actions = discrete_actions,
+        continuous_actions = continuous_actions,
+        mask = mask
+    )
+    assert total_loss_1.ndim == 0
+    assert total_loss_1.item() > 0
+
 @param('encode_temporal_diff', (False, True))
 def test_temporal_diff(encode_temporal_diff):
     from dreamer4.dreamer4 import VideoTokenizer
@@ -2593,7 +2688,8 @@ def test_experience_combine_and_unbind():
 
 @param('has_views', [False, True])
 @param('use_time_rnn', [False, True])
-def test_dynamics_model_state_sequential_parallel_cache(has_views, use_time_rnn):
+@param('time_attention_use_pope', [False, True])
+def test_dynamics_model_state_sequential_parallel_cache(has_views, use_time_rnn, time_attention_use_pope):
     from dreamer4.dreamer4 import StateTokenizer, DynamicsWorldModel, pack_one
     from einops import rearrange
 
@@ -2605,7 +2701,8 @@ def test_dynamics_model_state_sequential_parallel_cache(has_views, use_time_rnn)
         depth = 1,
         attn_every = 1,
         attn_heads = 1,
-        attn_dim_head = 8
+        attn_dim_head = 8,
+        time_attention_use_pope = time_attention_use_pope
     )
 
     model = DynamicsWorldModel(
@@ -2620,7 +2717,8 @@ def test_dynamics_model_state_sequential_parallel_cache(has_views, use_time_rnn)
         attn_heads = 2,
         attn_dim_head = 16,
         use_time_rnn = use_time_rnn,
-        num_video_views = 2 if has_views else 1
+        num_video_views = 2 if has_views else 1,
+        time_attention_use_pope = time_attention_use_pope
     )
     model.eval()
 
@@ -3085,3 +3183,64 @@ def test_combine_experiences_with_different_lens():
 
     with pytest.raises(AssertionError):
         combine_experiences([make_exp(4), make_exp(4, rewards = None)])
+
+def test_self_flow():
+    from copy import deepcopy
+    from dreamer4.dreamer4 import DynamicsWorldModel, SelfFlow
+
+    model = DynamicsWorldModel(dim = 16, dim_latent = 8, num_latent_tokens = 2, num_spatial_tokens = 2, depth = 2, attn_heads = 2, attn_dim_head = 8, num_discrete_actions = 2)
+    teacher = deepcopy(model)
+    self_flow = SelfFlow(model, student_layer = 0, teacher_layer = 1)
+
+    batch = dict(latents = torch.randn(2, 5, 2, 8), discrete_actions = torch.randint(0, 2, (2, 5, 1)))
+    loss, intermediates = model(**batch, return_intermediates = True)
+
+    sf_loss = self_flow(teacher, intermediates, batch, lens = torch.tensor([3, 5]))
+    (loss + sf_loss).backward()
+
+    assert any(exists(p.grad) for p in self_flow.student_predict_head.parameters())
+    assert all(not exists(p.grad) for p in teacher.parameters())
+
+def test_actor_spr_and_tokenizer_parameters():
+    from dreamer4.dreamer4 import DynamicsWorldModel, StateTokenizer
+
+    state_tokenizer = StateTokenizer(dim_state = 8, num_latent_tokens = 2, dim_latent = 8, dim = 16, depth = 1, attn_heads = 1, attn_dim_head = 8)
+    model = DynamicsWorldModel(dim = 16, dim_latent = 8, state_tokenizer = state_tokenizer, copy_state_tokenizer = False, num_latent_tokens = 2, num_spatial_tokens = 2, depth = 1, attn_heads = 2, attn_dim_head = 8, num_discrete_actions = 4, actor_spr = True)
+
+    policy_params, agent_params, wm_params = model.policy_head_parameters(), model.agent_parameters(), model.world_model_parameters()
+
+    assert len(policy_params) == len(set(policy_params))
+    assert len(agent_params) == len(set(agent_params))
+
+    embed_params = set(model.action_embedder.embed_parameters())
+    assert embed_params.isdisjoint(policy_params) and embed_params.issubset(wm_params)
+    assert set(state_tokenizer.parameters()).isdisjoint(model.parameters())
+
+def test_latent_disagreement_with_aux_image_encoder():
+    from torch import nn
+    from einops.layers.torch import Rearrange
+    from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
+
+    video_tokenizer = VideoTokenizer(dim = 16, dim_latent = 8, patch_size = 8, image_size = 16, num_latent_tokens = 4, encoder_depth = 1, decoder_depth = 1, attn_heads = 1, attn_dim_head = 8)
+    aux_encoder = nn.Sequential(Rearrange('b c t (n p) w -> b t n (c p w)', n = 2), nn.Linear(3 * 8 * 16, 8))
+    model = DynamicsWorldModel(dim = 16, dim_latent = 8, video_tokenizer = video_tokenizer, aux_image_encoder = aux_encoder, num_latent_tokens = 6, num_spatial_tokens = 2, depth = 1, attn_heads = 2, attn_dim_head = 8, num_continuous_actions = 2)
+
+    disagreement = model(video = torch.randn(2, 3, 3, 16, 16), continuous_actions = torch.randn(2, 3, 2), return_latent_disagreement = True)
+    assert disagreement.shape == (2, 3)
+
+@param('use_pope', (False, True))
+@param('step', (1, 2))
+def test_transformer_sequential_parallel_cache(use_pope, step):
+    from dreamer4.dreamer4 import Transformer
+
+    if use_pope and step > 1:
+        pytest.skip('non-fused flash_attn_with_pope masks chunked decoding top-left aligned (upstream PoPE_pytorch)')
+
+    transformer = Transformer(dim = 16, depth = 1, heads = 2, dim_head = 8, attn_every = 1, use_pope = use_pope, use_rotary = not use_pope).eval()
+    x = torch.randn(2, 4, 16)
+
+    cache, seq_outs = None, []
+    for i in range(0, x.shape[1], step):
+        out_t, cache = transformer(x[:, i:(i + step)], time_cache = cache, return_time_cache = True)
+        seq_outs.append(out_t)
+    assert torch.allclose(transformer(x), torch.cat(seq_outs, dim = 1), atol = 1e-5)

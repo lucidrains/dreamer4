@@ -19,6 +19,7 @@ from torch.distributions import Normal, Beta, kl
 from torch.nn import Module, ModuleList, ModuleDict, Embedding, Parameter, Linear, RMSNorm
 from torch import nn, cat, stack, tensor, Tensor, is_tensor, zeros, ones, randint, rand, randn, randn_like, empty, full, linspace, arange, rand_like, ones_like, zeros_like
 from torch.utils._pytree import tree_map, tree_flatten, tree_unflatten
+from torch.nn.attention.bias import causal_lower_right
 
 from torch_einops_utils.nn import Identity, Sequential
 
@@ -67,11 +68,13 @@ from torch_einops_utils import (
     safe_stack,
     safe_cat,
     tree_flatten_with_inverse,
-    tree_map_tensor
+    tree_map_tensor,
+    exclusive_cumsum
 )
 
 from torch_einops_utils.device import move_inputs_to_module_device
 from torch_einops_utils.save_load import save_load
+from torch_einops_utils.shape import size
 
 # ein related
 
@@ -1769,7 +1772,14 @@ def naive_attend(
             k = repeat(k, '... h n d -> ... (h g) n d', g = groups)
             v = repeat(v, '... h n d -> ... (h g) n d', g = groups)
 
-        return F.scaled_dot_product_attention(q, k, v, is_causal = causal, scale = scale)
+        i, j = q.shape[-2], k.shape[-2]
+
+        # sdpa is_causal is top-left aligned, so it is only correct when query and key lengths match
+        # causal_lower_right extends it to kv cache reads, where the query is a suffix of the keys
+
+        attn_bias = causal_lower_right(i, j) if causal else None
+
+        return F.scaled_dot_product_attention(q, k, v, attn_mask = attn_bias, scale = scale)
 
     if not exists(scale):
         scale = q.shape[-1] ** -0.5
@@ -2288,6 +2298,16 @@ class LearnedQueriesAttentionPool(Module):
 
 # self predictive representation (next latent prediction methods) for actor
 
+# dynamic rollout loss weighting
+# weight each rollout step by exp(-decay * cumulative loss of preceding steps), as errors compound through the dynamics model
+
+def dynamic_rollout_loss_weights(
+    step_losses, # (r b n)
+    decay = 1.
+):
+    cum_step_losses = exclusive_cumsum(step_losses, dim = 0)
+    return (-decay * cum_step_losses).exp()
+
 class ActorSPRWrapper(Module):
     def __init__(
         self,
@@ -2301,7 +2321,10 @@ class ActorSPRWrapper(Module):
         dynamics_num_layers = 3,
         sigreg_loss_weight = 0.,
         sigreg_loss_kwargs: dict = dict(),
-        dynamics_mlp_activation: Activation = 'silu'
+        dynamics_mlp_activation: Activation = 'silu',
+        rollout_weights: tuple[float, ...] | None = None,
+        dynamic_rollout_loss_weight = True,
+        dynamic_loss_decay = 1.0
     ):
         super().__init__()
         self.action_embedder = action_embedder
@@ -2320,7 +2343,14 @@ class ActorSPRWrapper(Module):
         self.has_kl_loss = kl_loss_weight > 0.
         self.has_sigreg = sigreg_loss_weight > 0.
 
-        rollout_weights = tensor([1.] * num_rollouts)
+        self.dynamic_rollout_loss_weight = dynamic_rollout_loss_weight
+        self.dynamic_loss_decay = dynamic_loss_decay
+
+        if not exists(rollout_weights):
+            rollout_weights = (1.,) * num_rollouts
+
+        assert len(rollout_weights) == num_rollouts
+        rollout_weights = tensor(rollout_weights)
         self.register_buffer('rollout_loss_weights', rollout_weights / rollout_weights.sum(), persistent = False)
 
         dynamics_hidden_dim = default(dynamics_hidden_dim, dim)
@@ -2330,12 +2360,16 @@ class ActorSPRWrapper(Module):
             dynamics_hidden_dim,
             dynamics_num_layers,
             dim_in = dim + action_embed_dim,
-            dim_out = dim
+            dim_out = dim,
+            activation = get_activation(dynamics_mlp_activation)
         )
 
         self.dynamics_norm = RMSNorm(dim + action_embed_dim)
 
         self.register_buffer('zero', tensor(0.), persistent = False)
+
+    def parameters(self, *args, **kwargs):
+        return list(set(super().parameters(*args, **kwargs)) - set(self.action_embedder.parameters()))
 
     def forward(
         self,
@@ -2397,9 +2431,22 @@ class ActorSPRWrapper(Module):
         spr_loss = kl_loss = sigreg_loss = self.zero
         weights = self.rollout_loss_weights[:num_rollouts]
 
+        step_smooth_l1 = F.smooth_l1_loss(pred_loss_inputs, step_targets.detach(), reduction = 'none')
+
+        # dynamic rollout loss weight
+
+        dynamic_weights = 1.
+
+        if self.dynamic_rollout_loss_weight:
+            step_latent_loss = reduce(step_smooth_l1.detach(), 'r b n d -> r b n', 'mean')
+            dynamic_weights = dynamic_rollout_loss_weights(step_latent_loss, self.dynamic_loss_decay)
+
         if self.has_spr_loss:
-            step_smooth_l1 = F.smooth_l1_loss(pred_loss_inputs, step_targets.detach(), reduction = 'none')
             step_smooth_l1 = einx.multiply('r b n d, r -> r b n d', step_smooth_l1, weights)
+
+            if self.dynamic_rollout_loss_weight:
+                step_smooth_l1 = einx.multiply('r b n d, r b n -> r b n d', step_smooth_l1, dynamic_weights)
+
             spr_loss = masked_mean(step_smooth_l1, rearrange(step_masks, '... -> ... 1'), dim = (1, 2, 3)).sum()
 
         # kl loss
@@ -2436,6 +2483,10 @@ class ActorSPRWrapper(Module):
                 step_kl = step_kl + cont_kl
 
             step_kl = einx.multiply('r b n, r -> r b n', step_kl, weights)
+
+            if self.dynamic_rollout_loss_weight:
+                step_kl = step_kl * dynamic_weights
+
             kl_loss = masked_mean(step_kl, step_masks, dim = (1, 2)).sum()
 
         if self.has_sigreg:
@@ -2448,6 +2499,8 @@ class ActorSPRWrapper(Module):
         )
 
         return total_loss, (spr_loss, kl_loss, sigreg_loss)
+
+ActorNextLatentWrapper = ActorSPRWrapper
 
 # Dominik Schmidt https://arxiv.org/abs/2312.10812
 
@@ -3081,8 +3134,9 @@ class AxialSpaceTimeTransformer(Module):
         next_h_net_cache = None
 
         # positional embs
+        # freqs span the cached keys, as pope rotates the whole key sequence (rotary right-aligns to the query)
 
-        time_pos_emb = self.time_rotary(time, offset = token_count)
+        time_pos_emb = self.time_rotary(token_count + time)
 
         space_pos_emb = None
         space_pope_pos_emb_indices = None
@@ -3798,7 +3852,7 @@ class Transformer(Module):
         time_cache = None,
         return_time_cache = False
     ):
-        seq_len, device = x.shape[-2], x.device
+        seq_len = size(x, 'b [n] d')
 
         past_len = 0
 
@@ -3810,15 +3864,14 @@ class Transformer(Module):
 
         rotary_pos_emb = None
         pope_pos_emb = None
-        pope_pos_emb_indices = None
 
         if exists(self.pos_emb):
-            seq_positions = torch.arange(seq_len, device = device) + past_len
-            pos_emb = self.pos_emb(seq_positions)
+            # freqs span the cached keys, as pope rotates the whole key sequence (rotary right-aligns to the query)
+
+            pos_emb = self.pos_emb(past_len + seq_len)
 
             if self.use_pope:
                 pope_pos_emb = pos_emb
-                pope_pos_emb_indices = seq_positions
             else:
                 rotary_pos_emb = pos_emb
 
@@ -3832,7 +3885,6 @@ class Transformer(Module):
                     kv_cache = attn_cache,
                     rotary_pos_emb = rotary_pos_emb,
                     pope_pos_emb = pope_pos_emb,
-                    pope_pos_emb_indices = pope_pos_emb_indices,
                     return_intermediates = True
                 )
 
@@ -5133,18 +5185,19 @@ class SelfFlow(Module):
         lens = None,
         mask = None
     ):
-        teacher_batch_kwargs = dict(**batch_kwargs)
+        teacher_batch_kwargs = dict(**batch_kwargs, return_intermediates = True)
 
         if exists(self.teacher_time_modifier_fn):
             teacher_batch_kwargs['time_modifier_fn'] = self.teacher_time_modifier_fn
 
-        *_, teacher_intermediates = ema_teacher_model(**teacher_batch_kwargs)
+        with torch.no_grad():
+            *_, teacher_intermediates = ema_teacher_model(**teacher_batch_kwargs)
 
         student_hidden = student_intermediates.main.layer_hiddens[self.student_layer]
         teacher_hidden = teacher_intermediates.main.layer_hiddens[self.teacher_layer]
 
         if exists(lens) and not exists(mask):
-            mask = lens_to_mask(lens, student_hidden.shape[-2])
+            mask = lens_to_mask(lens, size(student_hidden, 'b [t] ...'))
 
         pred = self.student_predict_head(student_hidden)
         return cosine_distance(pred, teacher_hidden, mask = mask)
@@ -5953,12 +6006,13 @@ class DynamicsWorldModel(Module):
         return params
 
     def parameters(self, *args, **kwargs):
-        params = super().parameters(*args, **kwargs)
+        params = set(super().parameters(*args, **kwargs))
 
-        if not exists(self.video_tokenizer):
-            return params
+        for tokenizer in (self.video_tokenizer, self.state_tokenizer, self.audio_tokenizer):
+            if exists(tokenizer):
+                params -= set(tokenizer.parameters())
 
-        return list(set(params) - set(self.video_tokenizer.parameters()))
+        return list(params)
 
     # aux encoders
 
@@ -6407,10 +6461,14 @@ class DynamicsWorldModel(Module):
                         bootstrap_latents = cat((bootstrap_latents, aux_image_tokens), dim = -2) if exists(bootstrap_latents) else aux_image_tokens
 
                 elif exists(curr_state):
+                    curr_state, unpack_views = pack_one(curr_state, '* d')
+
                     if exists(self.state_tokenizer):
-                        bootstrap_latents = self.state_tokenizer(curr_state, return_latents = True)
+                        bootstrap_latents, _ = self.state_tokenizer(curr_state, return_latents = True, time_cache = tokenizer_time_cache, return_time_cache = True)
                     else:
                         bootstrap_latents = self.state_to_latents(curr_state)
+
+                    bootstrap_latents = unpack_views(bootstrap_latents, '* n d')
 
                 if bootstrap_latents.ndim == 3:
                     bootstrap_latents = rearrange(bootstrap_latents, 'b n d -> b 1 1 n d')
@@ -6427,6 +6485,7 @@ class DynamicsWorldModel(Module):
                     proprio = accumulated_proprio[:, -1:] if exists(accumulated_proprio) else None,
                     time_cache = time_cache,
                     latent_is_noised = True,
+                    latent_has_view_dim = True,
                     return_pred_only = True,
                     return_intermediates = True
                 )
@@ -7601,10 +7660,7 @@ class DynamicsWorldModel(Module):
         if return_latent_disagreement:
             # Hansen et al. https://arxiv.org/abs/2606.27326
 
-            latents_for_residual = latents
-
-            if self.has_aux_image_encoder:
-                latents_for_residual = latents[..., :-self.num_aux_image_tokens, :]
+            latents_for_residual = latents[..., :self.video_tokenizer.num_latent_tokens, :]
 
             latents_packed = rearrange(latents_for_residual, 'b t v n d -> (b v) t n d')
 

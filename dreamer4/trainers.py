@@ -1242,8 +1242,7 @@ class BehaviorCloneTrainer(Module):
                 loss = loss / self.grad_accum_every
 
                 if self.self_flow:
-                    with torch.no_grad():
-                        self_flow_loss = self.self_flow_module(self.ema_model.ema_model, intermediates, batch_data)
+                    self_flow_loss = self.self_flow_module(self.ema_model.ema_model, intermediates, batch_data)
 
                     self_flow_loss = self_flow_loss / self.grad_accum_every
 
