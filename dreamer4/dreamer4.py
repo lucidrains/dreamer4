@@ -5283,6 +5283,7 @@ class DynamicsWorldModel(Module):
         gae_lambda = 0.95,
         ppo_eps_clip = 0.2,
         pmpo_pos_to_neg_weight = 0.5, # pos and neg equal weight
+        pmpo_use_magnitude_weighted_global_mean = True, # false for paper eq (11)
         pmpo_reverse_kl = True,
         pmpo_kl_div_loss_weight = .3,
         use_delight_gating = True,
@@ -5846,6 +5847,7 @@ class DynamicsWorldModel(Module):
         # pmpo related
 
         self.pmpo_pos_to_neg_weight = pmpo_pos_to_neg_weight
+        self.pmpo_use_magnitude_weighted_global_mean = pmpo_use_magnitude_weighted_global_mean
         self.pmpo_kl_div_loss_weight = pmpo_kl_div_loss_weight
         self.pmpo_reverse_kl = pmpo_reverse_kl
 
@@ -6578,10 +6580,12 @@ class DynamicsWorldModel(Module):
         use_delight_gating = None,
         delight_temperature = None,
         normalize_advantages = None,
+        pmpo_use_magnitude_weighted_global_mean = None,
         eps = 1e-6
     ):
         use_delight_gating = default(use_delight_gating, self.use_delight_gating)
         delight_temperature = default(delight_temperature, self.delight_temperature)
+        pmpo_use_magnitude_weighted_global_mean = default(pmpo_use_magnitude_weighted_global_mean, self.pmpo_use_magnitude_weighted_global_mean)
 
         assert isinstance(experience, Experience)
 
@@ -6827,20 +6831,29 @@ class DynamicsWorldModel(Module):
                 pos = pos & mask
                 neg = neg & mask
 
-            scaled_action_log_probs = maybe_gated_log_prob * advantage.tanh().abs()
-
-            pos_loss, neg_loss = 0., 0.
-
-            if pos.any():
-                pos_loss = scaled_action_log_probs[pos].sum()
-
-            if neg.any():
-                neg_loss = scaled_action_log_probs[neg].sum()
-
-            num_advantages = max(1., mask.sum().item() if exists(mask) else advantage.numel())
-
             α = self.pmpo_pos_to_neg_weight
-            policy_loss = -α * (pos_loss - neg_loss) / num_advantages
+
+            if pmpo_use_magnitude_weighted_global_mean:
+                scaled_action_log_probs = maybe_gated_log_prob * advantage.tanh().abs()
+
+                pos_loss, neg_loss = 0., 0.
+
+                if pos.any():
+                    pos_loss = scaled_action_log_probs[pos].sum()
+
+                if neg.any():
+                    neg_loss = scaled_action_log_probs[neg].sum()
+
+                num_advantages = max(1., mask.sum().item() if exists(mask) else advantage.numel())
+
+                policy_loss = -α * (pos_loss - neg_loss) / num_advantages
+            else:
+                # paper eq (11)
+
+                policy_loss = (
+                    -α * masked_mean(maybe_gated_log_prob, pos)
+                    + (1. - α) * masked_mean(maybe_gated_log_prob, neg)
+                )
 
             # take care of kl
 

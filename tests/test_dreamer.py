@@ -791,7 +791,12 @@ def test_cache_generate():
     generated, time_cache = dynamics.generate(1, time_cache = time_cache, return_time_cache = True)
 
 @param('vectorized', (False, True))
-@param('objective', ('ppo', 'pmpo', 'spo'))
+@param('objective, pmpo_use_magnitude_weighted_global_mean', (
+    ('ppo', True),
+    ('pmpo', True),
+    ('pmpo', False),
+    ('spo', True)
+))
 @param('env_can_terminate', (False, True))
 @param('env_can_truncate', (False, True))
 @param('store_agent_embed', (False, True))
@@ -800,6 +805,7 @@ def test_cache_generate():
 def test_online_rl(
     vectorized,
     objective,
+    pmpo_use_magnitude_weighted_global_mean,
     env_can_terminate,
     env_can_truncate,
     store_agent_embed,
@@ -868,7 +874,7 @@ def test_online_rl(
     if store_agent_embed:
         assert exists(combined_experience.agent_embed)
 
-    actor_loss, critic_loss = world_model_and_policy.learn_from_experience(combined_experience, objective = objective)
+    actor_loss, critic_loss = world_model_and_policy.learn_from_experience(combined_experience, objective = objective, pmpo_use_magnitude_weighted_global_mean = pmpo_use_magnitude_weighted_global_mean)
 
     actor_loss.backward()
     critic_loss.backward()
