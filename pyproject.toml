@@ -1,6 +1,6 @@
 [project]
 name = "dreamer4"
-version = "0.20.1"
+version = "0.20.2"
 description = "Dreamer4 - PyTorch"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -40,7 +40,7 @@ dependencies = [
     "imageio",
     "imageio-ffmpeg",
     "loguru",
-    "mean-conc-beta>=0.2.6",
+    "mean-conc-beta>=0.2.9",
     "memmap-replay-buffer>=0.1.10",
     "opencv-python",
     "Pillow",
