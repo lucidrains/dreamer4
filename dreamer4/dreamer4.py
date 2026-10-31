@@ -478,7 +478,7 @@ def flags_to_sequence(flags, positions, seq_len):
     return logical_and('b t, b -> b t', equal('t, b -> b t', seq, positions), flags)
 
 def straight_through(src, tgt):
-    return tgt + src - src.detach()
+    return tgt + (src - src.detach())
 
 def frac_gradient(t, frac = 1.):
     return t.detach().lerp(t, frac)
@@ -615,6 +615,18 @@ def create_multi_token_prediction_targets(
 
     return out, mask
 
+def soft_mtp_route(
+    logits,
+    weights
+):
+    # MTP Done Right - Jayden Teoh 2026 - https://arxiv.org/abs/2610.38331
+    ntp_logits, mtp_logits = logits[:1].clone(), logits[1:]
+
+    for k, (weight, future_logits) in enumerate(zip(weights, mtp_logits), start = 1):
+        ntp_logits[..., k:, :] = straight_through(-weight * future_logits[..., :-k, :], ntp_logits[..., k:, :])
+
+    return cat((ntp_logits, mtp_logits))
+
 # activations
 
 from x_mlps_pytorch.activations import ReluSquared, SugarBSiLU
@@ -705,6 +717,10 @@ class LossNormalizer(Module):
         self.beta = beta
         self.eps = eps
 
+    @property
+    def rms(self):
+        return self.exp_avg_sq.sqrt().clamp(min = self.eps)
+
     def forward(
         self,
         losses: Tensor | list[Tensor] | dict[str, Tensor],
@@ -715,7 +731,7 @@ class LossNormalizer(Module):
 
         # get the rms value - as mentioned at the end of section 3 in the paper
 
-        rms = exp_avg_sq.sqrt()
+        rms = self.rms
 
         if update_ema:
             decay = 1. - beta
@@ -728,7 +744,7 @@ class LossNormalizer(Module):
 
         assert losses.numel() == rms.numel()
 
-        normed_losses = losses / rms.clamp(min = self.eps)
+        normed_losses = losses / rms
 
         return normed_losses
 
@@ -1471,7 +1487,8 @@ class ActionEmbedder(Module):
         pred_head_index: int | Tensor | None = None,
         parallel_discrete_calc = None,
         return_entropies = False,
-        soft_validate_range = False
+        soft_validate_range = False,
+        soft_mtp_weights = None
     ):
         discrete_action_logits, continuous_action_mean_log_var = self.unembed(
             embeds,
@@ -1480,6 +1497,9 @@ class ActionEmbedder(Module):
             continuous_action_types = continuous_action_types,
             return_split_discrete = True
         )
+
+        if exists(soft_mtp_weights) and not exists(pred_head_index) and exists(discrete_action_logits):
+            discrete_action_logits = tuple(soft_mtp_route(logits, soft_mtp_weights) for logits in discrete_action_logits)
 
         # discrete
 
@@ -5185,7 +5205,7 @@ class SelfFlow(Module):
         lens = None,
         mask = None
     ):
-        teacher_batch_kwargs = dict(**batch_kwargs, return_intermediates = True)
+        teacher_batch_kwargs = dict(batch_kwargs, return_intermediates = True)
 
         if exists(self.teacher_time_modifier_fn):
             teacher_batch_kwargs['time_modifier_fn'] = self.teacher_time_modifier_fn
@@ -5265,6 +5285,7 @@ class DynamicsWorldModel(Module):
         continuous_dist_kwargs: dict = dict(),
         continuous_target_action_range: tuple[float, float] | None = None,
         multi_token_pred_len = 8,                   # they do multi-token prediction of 8 steps forward
+        soft_mtp = True,
         value_head_mlp_depth = 3,
         policy_head_mlp_depth = 3,
         latent_flow_loss_weight = 1.,
@@ -5888,6 +5909,8 @@ class DynamicsWorldModel(Module):
         assert self.reward_loss_weight.numel() in {1, multi_token_pred_len}
         assert self.discrete_action_loss_weight.numel() in {1, multi_token_pred_len}
         assert self.continuous_action_loss_weight.numel() in {1, multi_token_pred_len}
+
+        self.soft_mtp = soft_mtp and multi_token_pred_len > 1 and self.discrete_action_loss_weight.flatten()[0].item() > 0.
 
         self.register_buffer('zero', tensor(0.), persistent = False)
 
@@ -8419,11 +8442,24 @@ class DynamicsWorldModel(Module):
             if has_continuous:
                 continuous_action_targets, continuous_mask = make_mtp_targets(continuous_actions)
 
+            soft_mtp_weights = None
+
+            if self.soft_mtp and has_discrete:
+                loss_weights = self.discrete_action_loss_weight.broadcast_to(self.multi_token_pred_len)
+                ntp_loss_weight, mtp_loss_weights = loss_weights[:1], loss_weights[1:]
+                soft_mtp_weights = mtp_loss_weights / ntp_loss_weight
+
+                if exists(self.discrete_actions_loss_normalizer):
+                    rms = self.discrete_actions_loss_normalizer.rms
+                    ntp_rms, mtp_rms = rms[:1], rms[1:]
+                    soft_mtp_weights = soft_mtp_weights * ntp_rms / mtp_rms
+
             discrete_log_probs, continuous_log_probs = self.action_embedder.log_probs(
                 policy_embed,
                 discrete_targets = discrete_action_targets,
                 continuous_targets = continuous_action_targets,
-                soft_validate_range = True
+                soft_validate_range = True,
+                soft_mtp_weights = soft_mtp_weights
             )
 
             if is_var_len:

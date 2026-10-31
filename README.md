@@ -505,4 +505,16 @@ Passing `--condition_on_actions True` lets you explicitly prompt with velocity a
 }
 ```
 
+```bibtex
+@misc{teoh2026multitokenpredictionright,
+    title   = {Multi-Token Prediction Done Right},
+    author  = {Jayden Teoh},
+    year    = {2026},
+    eprint  = {2610.38331},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2610.38331},
+}
+```
+
 *the conquest of nature is to be achieved through number and measure - angels to Descartes in a dream*
