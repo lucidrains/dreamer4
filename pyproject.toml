@@ -1,6 +1,6 @@
 [project]
 name = "dreamer4"
-version = "0.21.0"
+version = "0.22.0"
 description = "Dreamer4 - PyTorch"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -47,7 +47,7 @@ dependencies = [
     "PoPE_pytorch>=0.2.1",
     "rich",
     "torch>=2.4",
-    "torch-einops-utils>=0.1.36",
+    "torch-einops-utils>=0.1.42",
     "torchaudio",
     "torchvision",
     "tqdm",
@@ -64,7 +64,11 @@ Repository = "https://codeberg.org/lucidrains/dreamer4"
 dreamer4 = "dreamer4.cli:main"
 
 [project.optional-dependencies]
-examples = []
+examples = [
+    "gymnasium",
+    "joblib",
+    "x-ppo>=0.0.30",
+]
 test = [
     "gymnasium",
     "pygame",

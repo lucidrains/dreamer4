@@ -11,7 +11,7 @@ from copy import deepcopy
 from functools import wraps, partial
 from contextlib import nullcontext, contextmanager
 from collections import namedtuple
-from dataclasses import dataclass, asdict, fields
+from dataclasses import dataclass, asdict, fields, replace
 
 import torch
 import torch.nn.functional as F
@@ -175,7 +175,16 @@ class Experience:
 
     @property
     def payload(self):
-        return default(self.latents, self.video, self.critic_state)
+        return default(self.latents, self.video, self.critic_state, self.rewards, self.values, self.proprio, self.agent_embed)
+
+    @property
+    def batch_size(self):
+        return self.payload.shape[0]
+
+    @property
+    def time_steps(self):
+        ref = default(self.latents, self.critic_state, self.rewards, self.values, self.proprio, self.agent_embed)
+        return ref.shape[1] if exists(ref) else self.video.shape[-3]
 
     # memmap replay buffer
 
@@ -190,6 +199,8 @@ class Experience:
                 if exists(v.discrete):    target[f'{k}_discrete'] = v.discrete
                 if exists(v.continuous):  target[f'{k}_continuous'] = v.continuous
             elif exists(v):
+                if k == 'video':
+                    v = rearrange(v, 'b ... c t h w -> b t ... c h w')
                 target[k] = v
 
         return data_dict, meta_dict
@@ -215,14 +226,14 @@ class Experience:
         return ReplayBuffer(*args, **inferred_kwargs, **kwargs)
 
     def add_to_memmap_buffer(self, buffer):
-        data_dict, meta_dict = self.to_buffer_dict()
-        batch_size, time_steps = self.payload.shape[:2]
+        for single_exp in self.cpu().unbind():
+            data_dict, meta_dict = single_exp.to_buffer_dict()
+            seq_len = single_exp.time_steps
 
-        meta_batch = {k: (v if is_tensor(v) else [v] * batch_size) for k, v in meta_dict.items()}
+            data_dict = tree_map_tensor(lambda t: pad_right_at_dim_to(rearrange(t, '1 ... -> ...'), seq_len, dim = 0), data_dict)
+            meta_dict = tree_map_tensor(lambda t: rearrange(t, '1 ... -> ...'), meta_dict)
 
-        with buffer.batched_episode(batch_size = batch_size, **meta_batch):
-            for step in range(time_steps):
-                buffer.store_batch(**{k: v[:, step] for k, v in data_dict.items()})
+            buffer.store_episode(**data_dict, **meta_dict)
 
     @classmethod
     def from_buffer_dict(cls, data_dict):
@@ -243,6 +254,21 @@ class Experience:
             if k in data_dict:
                 kwargs[k] = data_dict[k]
 
+        if 'video' in kwargs and exists(kwargs['video']):
+            kwargs['video'] = rearrange(kwargs['video'], 'b t ... c h w -> b ... c t h w')
+
+        # replay windows carry their own valid length / whether they reach the episode end
+
+        if '_lens' in data_dict and exists(data_dict['_lens']):
+            window_lens = data_dict['_lens']
+            kwargs['lens'] = torch.minimum(kwargs['lens'], window_lens) if exists(kwargs.get('lens')) else window_lens
+
+        if '_reaches_episode_end' in data_dict and exists(data_dict['_reaches_episode_end']):
+            reaches_end = data_dict['_reaches_episode_end']
+            for k in ('terminals', 'is_truncated'):
+                if exists(kwargs.get(k)) and is_tensor(kwargs[k]):
+                    kwargs[k] = kwargs[k] & reaches_end.to(kwargs[k].device)
+
         return cls(**kwargs)
 
     # tensor-like methods
@@ -255,8 +281,63 @@ class Experience:
         experience_dict = tree_map_tensor(lambda t: t.to(device), experience_dict)
         return Experience(**experience_dict)
 
+    def __getitem__(self, idx):
+        idx = slice(idx, idx + 1) if isinstance(idx, int) else idx
+        experience_dict = {f.name: getattr(self, f.name) for f in fields(self)}
+        experience_dict = tree_map_tensor(lambda t: t[idx], experience_dict)
+        return self.__class__(**experience_dict)
+
+    def trim_prompt(self, prompt_len: int | None = None, horizon: int | None = None):
+        prompted = [t for t in (self.latents, self.proprio, self.critic_state, self.rewards, *(self.actions or ())) if exists(t)]
+        generated = [t for t in (self.agent_embed, self.actor_embed, self.critic_embed, self.values, *(self.log_probs or ()), *(self.old_action_unembeds or ())) if exists(t)]
+
+        prompt_len = default(prompt_len, (self.time_steps - self.values.shape[1]) if exists(self.values) else 0)
+
+        if prompt_len <= 0:
+            return self
+
+        avail = [t.shape[1] - prompt_len for t in prompted] + [t.shape[1] for t in generated]
+        if exists(self.video):
+            avail.append(self.video.shape[-3] - prompt_len)
+
+        if not avail:
+            return self
+
+        h = min((horizon, *avail) if exists(horizon) else avail)
+        if h <= 0:
+            return self
+
+        trim_p = lambda t: t[:, prompt_len:prompt_len + h] if exists(t) else None
+        trim_g = lambda t: t[:, :h] if exists(t) else None
+
+        lens = (self.lens - prompt_len).clamp(min = 0, max = h) if exists(self.lens) else None
+        rewards = trim_p(self.rewards)
+        episode_return = None
+
+        if exists(rewards):
+            mask = lens_to_mask(lens, h).float() if exists(lens) else ones_like(rewards)
+            episode_return = einsum(rewards, mask, 'b t, b t -> b')
+
+        return replace(
+            self,
+            latents = trim_p(self.latents),
+            video = self.video[..., prompt_len:prompt_len + h, :, :] if exists(self.video) else None,
+            proprio = trim_p(self.proprio),
+            critic_state = trim_p(self.critic_state),
+            agent_embed = trim_g(self.agent_embed),
+            actor_embed = trim_g(self.actor_embed),
+            critic_embed = trim_g(self.critic_embed),
+            rewards = rewards,
+            actions = tree_map_tensor(trim_p, self.actions),
+            log_probs = tree_map_tensor(trim_g, self.log_probs),
+            old_action_unembeds = tree_map_tensor(trim_g, self.old_action_unembeds),
+            values = trim_g(self.values),
+            lens = lens,
+            episode_return = episode_return
+        )
+
     def unbind(self):
-        batch, time = self.payload.shape[:2]
+        batch, time = self.batch_size, self.time_steps
         is_meta_field = lambda name: name in self.__class__._meta_fields
 
         experiences = []
@@ -264,24 +345,19 @@ class Experience:
             seq_len = int(self.lens[b].item()) if exists(self.lens) else time
 
             def slice_field(name, v):
-                if not exists(v):
-                    return None
-
-                if not is_tensor(v) and not isinstance(v, Actions):
+                if not exists(v) or (not is_tensor(v) and not isinstance(v, Actions)):
                     return v
 
                 is_meta = is_meta_field(name)
 
-                def slice_tensor(t):
-                    return t[b:b+1] if is_meta else t[b:b+1, :seq_len]
+                def slice_t(t):
+                    if is_meta:
+                        return t[b:b+1]
+                    if name == 'video':
+                        return t[b:b+1, ..., :seq_len, :, :]
+                    return t[b:b+1, :seq_len]
 
-                if isinstance(v, Actions):
-                    return Actions(
-                        discrete = slice_tensor(v.discrete) if exists(v.discrete) else None,
-                        continuous = slice_tensor(v.continuous) if exists(v.continuous) else None
-                    )
-
-                return slice_tensor(v)
+                return tree_map_tensor(slice_t, v)
 
             kwargs = {f.name: slice_field(f.name, getattr(self, f.name)) for f in fields(self)}
             experiences.append(self.__class__(**kwargs))
@@ -300,8 +376,8 @@ def combine_experiences(
     # set lens if not there
 
     for exp in exps:
-        payload = default(exp.latents, exp.video)
-        batch, time = payload.shape[:2]
+        payload = exp.payload
+        batch, time = exp.batch_size, exp.time_steps
         device = payload.device
 
         if not exists(exp.lens):
@@ -4102,6 +4178,65 @@ class StateTokenizer(Module):
 
         return ret[0] if len(ret) == 1 else ret
 
+# lightweight convolutional encoder for auxiliary image latents
+
+class SmallConvEncoder(Module):
+    def __init__(
+        self,
+        num_latent_tokens = 4,
+        dim_latent = 32,
+        channels = 3
+    ):
+        super().__init__()
+        self.num_latent_tokens = num_latent_tokens
+        self.dim_latent = dim_latent
+        self.channels = channels
+
+        self.net = nn.Sequential(
+            nn.Conv2d(channels, 32, 4, stride = 2, padding = 1),
+            nn.SiLU(),
+            nn.Conv2d(32, 64, 4, stride = 2, padding = 1),
+            nn.SiLU(),
+            nn.Conv2d(64, 128, 4, stride = 2, padding = 1),
+            nn.SiLU(),
+            nn.AdaptiveAvgPool2d((2, 2)),
+            Rearrange('b c h w -> b (c h w)'),
+            nn.Linear(128 * 4, num_latent_tokens * dim_latent),
+            Rearrange('b (n d) -> b n d', n = num_latent_tokens),
+            nn.Tanh()
+        )
+
+    @torch.no_grad()
+    @eval_decorator
+    def tokenize(self, x: Tensor) -> Tensor:
+        return self.forward(x)
+
+    def forward(
+        self,
+        x: Tensor,
+        return_latents = False,
+        time_cache = None,
+        return_time_cache = False
+    ):
+        if x.dtype == torch.uint8:
+            x = x.float() / 255.
+
+        has_time = x.ndim == 5
+
+        if has_time:
+            b, c, t, h, w = x.shape
+            x = rearrange(x, 'b c t h w -> (b t) c h w')
+
+        latents = self.net(x)
+
+        if has_time:
+            latents = rearrange(latents, '(b t) n d -> b t n d', b = b, t = t)
+
+        if return_time_cache:
+            return latents, time_cache
+
+        return latents
+
 # video tokenizer
 
 @save_load
@@ -5449,7 +5584,8 @@ class DynamicsWorldModel(Module):
 
         if exists(dim_state):
             self.state_to_latents = Sequential(
-                LinearNoBias(dim_state, num_latent_tokens * dim_latent),
+                nn.Linear(dim_state, num_latent_tokens * dim_latent),
+                nn.Tanh(),
                 Rearrange('... (n d) -> ... n d', n = num_latent_tokens, d = dim_latent)
             )
 
@@ -5976,6 +6112,10 @@ class DynamicsWorldModel(Module):
     def has_image_encoder(self):
         return exists(self.video_tokenizer) or self.has_aux_image_encoder
 
+    @property
+    def has_state_encoder(self):
+        return exists(self.state_tokenizer) or exists(self.state_to_latents)
+
     # types of parameters
 
     def muon_parameters(self):
@@ -6006,6 +6146,9 @@ class DynamicsWorldModel(Module):
         if exists(self.critic_transformer):
             params.extend(self.critic_transformer.parameters())
 
+        if exists(self.critic_state_embedder):
+            params.extend(self.critic_state_embedder.parameters())
+
         return params
 
     def agent_parameters(self):
@@ -6031,13 +6174,13 @@ class DynamicsWorldModel(Module):
         return params
 
     def parameters(self, *args, **kwargs):
-        params = set(super().parameters(*args, **kwargs))
+        tokenizer_params = set()
 
         for tokenizer in (self.video_tokenizer, self.state_tokenizer, self.audio_tokenizer):
             if exists(tokenizer):
-                params -= set(tokenizer.parameters())
+                tokenizer_params.update(tokenizer.parameters())
 
-        return list(params)
+        return [param for param in super().parameters(*args, **kwargs) if param not in tokenizer_params]
 
     # aux encoders
 
@@ -6199,7 +6342,13 @@ class DynamicsWorldModel(Module):
         use_time_cache = True,
         store_agent_embed = True,
         store_old_action_unembeds = True,
-        obs_to_latents_fn = None
+        obs_to_latents_fn = None,
+        num_action_candidates = 1,
+        action_filter_horizon = 1,
+        action_filter_gamma = 0.99,
+        action_filter_context = 32,
+        action_filter_num_steps = 2,
+        action_filter_value_coef = 1.
     ):
         device = self.device
 
@@ -6381,6 +6530,54 @@ class DynamicsWorldModel(Module):
                 acc_policy_embed = safe_cat((acc_policy_embed, policy_embed), dim = 1)
 
             sampled_discrete_actions, sampled_continuous_actions = self.action_embedder.sample(policy_embed, pred_head_index = 0, squeeze = True)
+
+            if num_action_candidates > 1 and self.action_embedder.has_actions:
+                assert action_filter_num_steps >= 2, 'action filtering requires at least 2 denoising steps'
+
+                is_single_discrete = self.action_embedder.num_discrete_action_types == 1 and not self.action_embedder.has_continuous_actions
+
+                if is_single_discrete:
+                    num_discrete = self.action_embedder.num_discrete_actions[0].item()
+                    num_candidates = min(num_action_candidates, num_discrete)
+                    offsets = rearrange(arange(num_candidates, device = device), 'k -> 1 k 1')
+                    candidate_actions = Actions((sampled_discrete_actions + offsets) % num_discrete, None)
+                else:
+                    extra_policy_embed = repeat(policy_embed, 'b 1 d -> (b k) d', k = num_action_candidates - 1)
+                    extra_discrete, extra_continuous = self.action_embedder.sample(extra_policy_embed, pred_head_index = 0, squeeze = True)
+
+                    def make_candidates(action, extra):
+                        if not exists(action):
+                            return None
+
+                        extra = rearrange(extra, '(b k) ... -> b k ...', b = batch, k = num_action_candidates - 1)
+                        return cat((action, extra), dim = 1)
+
+                    candidate_actions = Actions(
+                        make_candidates(sampled_discrete_actions, extra_discrete),
+                        make_candidates(sampled_continuous_actions, extra_continuous)
+                    )
+
+                context_len = min(acc_latents.shape[1], action_filter_context) if exists(action_filter_context) else acc_latents.shape[1]
+                tail = lambda t, length: t[:, -length:] if exists(t) and length > 0 else None
+
+                selected_actions = self.filter_actions(
+                    latents = tail(acc_latents, context_len),
+                    action_candidates = candidate_actions,
+                    prompt_actions = Actions(
+                        tail(discrete_actions, context_len - 1),
+                        tail(continuous_actions, context_len - 1)
+                    ),
+                    horizon = action_filter_horizon,
+                    gamma = action_filter_gamma,
+                    value_coef = action_filter_value_coef,
+                    num_steps = action_filter_num_steps,
+                    agent_index = agent_index,
+                    prompt_rewards = tail(rewards, context_len - 1),
+                    prompt_proprio = tail(accumulated_proprio, context_len)
+                )
+
+                selected_actions = tree_map_tensor(lambda t: rearrange(t, 'b ... -> b 1 ...'), selected_actions)
+                sampled_discrete_actions, sampled_continuous_actions = selected_actions
 
             # format actions for the environment, rescaling bounded distributions to target range
 
@@ -6612,18 +6809,29 @@ class DynamicsWorldModel(Module):
 
         assert isinstance(experience, Experience)
 
+        if exists(experience.values) and experience.time_steps > experience.values.shape[1]:
+            experience = experience.trim_prompt()
+
         experience = experience.to(self.device)
 
         latents = experience.latents
         if not exists(latents):
-            assert exists(self.video_tokenizer) or self.has_aux_image_encoder, 'video_tokenizer or aux_image_encoder must be defined'
+            has_video = exists(experience.video) and (exists(self.video_tokenizer) or self.has_aux_image_encoder)
+            has_state = exists(experience.critic_state) and self.has_state_encoder
 
-            if exists(self.video_tokenizer):
-                latents = self.video_tokenizer(experience.video, return_latents = True)
+            assert has_video or has_state, 'video_tokenizer, aux_image_encoder, state_tokenizer, or state_to_latents must be defined when experience.latents is None'
 
-            if self.has_aux_image_encoder:
-                aux_image_tokens = self.encode_aux_image_tokens(experience.video)
-                latents = cat((latents, aux_image_tokens), dim = -2) if exists(latents) else aux_image_tokens
+            if has_video:
+                if exists(self.video_tokenizer):
+                    latents = self.video_tokenizer(experience.video, return_latents = True)
+
+                if self.has_aux_image_encoder:
+                    aux_image_tokens = self.encode_aux_image_tokens(experience.video)
+                    latents = cat((latents, aux_image_tokens), dim = -2) if exists(latents) else aux_image_tokens
+
+            if has_state:
+                state_latents = self.state_tokenizer(experience.critic_state, return_latents = True) if exists(self.state_tokenizer) else self.state_to_latents(experience.critic_state)
+                latents = cat((latents, state_latents), dim = -2) if exists(latents) else state_latents
 
         actions = experience.actions
         proprio = experience.proprio
@@ -6764,6 +6972,7 @@ class DynamicsWorldModel(Module):
                     continuous_actions = continuous_actions,
                     proprio = proprio,
                     latent_is_noised = True,
+                    latent_has_view_dim = latents.ndim == 5,
                     return_pred_only = True,
                     return_intermediates = True
                 )
@@ -7068,6 +7277,7 @@ class DynamicsWorldModel(Module):
         aug_id: bool | int | Tensor = False,
         discrete_temperature = 1.,
         continuous_temperature = 1.,
+        share_noise_groups = 1,
     ): # (b t n d) | (b c t h w)
 
         # handy flag for returning generations for rl
@@ -7197,11 +7407,15 @@ class DynamicsWorldModel(Module):
 
             if exists(decoded_discrete_actions):
                 decoded_discrete_actions = decoded_discrete_actions.clone()
+                if decoded_discrete_actions.shape[1] < prompt_time:
+                    decoded_discrete_actions = pad_right_at_dim_to(decoded_discrete_actions, prompt_time, dim = 1)
             elif num_discrete > 0:
                 decoded_discrete_actions = zeros((batch_size, prompt_time, num_discrete), device = self.device, dtype = torch.long)
 
             if exists(decoded_continuous_actions):
                 decoded_continuous_actions = decoded_continuous_actions.clone()
+                if decoded_continuous_actions.shape[1] < prompt_time:
+                    decoded_continuous_actions = pad_right_at_dim_to(decoded_continuous_actions, prompt_time, dim = 1)
             elif num_continuous > 0:
                 decoded_continuous_actions = zeros((batch_size, prompt_time, num_continuous), device = self.device, dtype = torch.float)
 
@@ -7259,12 +7473,15 @@ class DynamicsWorldModel(Module):
 
             # prepare noised latent / proprio inputs
 
-            noised_latent = randn((batch_size, 1, self.num_video_views, *latent_shape), device = self.device)
+            noise_groups = share_noise_groups if divisible_by(batch_size, share_noise_groups) else 1
+            noise_batch = batch_size // noise_groups
+
+            noised_latent = randn((noise_batch, 1, self.num_video_views, *latent_shape), device = self.device).repeat_interleave(noise_groups, dim = 0)
 
             noised_proprio = None
 
             if has_proprio:
-                noised_proprio = randn((batch_size, 1, self.dim_proprio), device = self.device)
+                noised_proprio = randn((noise_batch, 1, self.dim_proprio), device = self.device).repeat_interleave(noise_groups, dim = 0)
 
             # denoising steps
 
@@ -7564,6 +7781,105 @@ class DynamicsWorldModel(Module):
         return gen, time_cache
 
     @torch.no_grad()
+    @temp_eval
+    def filter_actions(
+        self,
+        latents: Tensor,                     # (b t v? n d) prompt context
+        action_candidates: Actions,          # (b k ...) candidate next actions
+        prompt_actions: Actions | None = None,   # (b t-1 ...) actions preceding the candidates
+        horizon = 1,
+        gamma = 0.99,
+        value_coef = 1.,
+        return_scores = False,
+        **generate_kwargs
+    ):
+        assert horizon >= 1
+        assert isinstance(action_candidates, Actions)
+
+        batch, prompt_time = latents.shape[:2]
+        num_candidates = first(tuple(t.shape[1] for t in action_candidates if exists(t)))
+
+        assert num_candidates >= 1
+        assert prompt_time == 1 or exists(prompt_actions), 'prompt_actions must be given for a multi-step prompt'
+
+        if exists(prompt_actions):
+            assert all(not exists(a) or a.shape[1] == prompt_time - 1 for a in prompt_actions), 'prompt_actions must have one fewer timestep than latents'
+
+        expanded_latents = latents.repeat_interleave(num_candidates, dim = 0)
+
+        def expand_prompt_action(prior, candidates):
+            if not exists(candidates):
+                return None
+
+            candidates = rearrange(candidates, 'b k ... -> (b k) 1 ...')
+
+            if exists(prior):
+                candidates = cat((prior.repeat_interleave(num_candidates, dim = 0), candidates), dim = 1)
+
+            return candidates
+
+        discrete_actions = expand_prompt_action(prompt_actions.discrete if exists(prompt_actions) else None, action_candidates.discrete)
+        continuous_actions = expand_prompt_action(prompt_actions.continuous if exists(prompt_actions) else None, action_candidates.continuous)
+
+        # expand batched prompt inputs by the candidate dimension
+
+        for key in ('prompt_latents', 'prompt_discrete_actions', 'prompt_continuous_actions'):
+            generate_kwargs.pop(key, None)
+
+        batch_keys = ('prompt', 'prompt_audio', 'prompt_state', 'prompt_proprio', 'prompt_rewards', 'tasks', 'latent_gene_ids', 'aug_id')
+        generate_kwargs = {
+            k: v.repeat_interleave(num_candidates, dim = 0) if k in batch_keys and is_tensor(v) and v.ndim > 0 else v
+            for k, v in generate_kwargs.items()
+        }
+
+        generate_kwargs.setdefault('context_signal_noise', 0.)
+        generate_kwargs.setdefault('discrete_temperature', 0.)
+        generate_kwargs.setdefault('continuous_temperature', 0.)
+        generate_kwargs.setdefault('share_noise_groups', num_candidates)
+
+        gen = self.generate(**{
+            **generate_kwargs,
+            'time_steps': prompt_time + horizon,
+            'batch_size': batch * num_candidates,
+            'prompt_latents': expanded_latents,
+            'prompt_discrete_actions': discrete_actions,
+            'prompt_continuous_actions': continuous_actions,
+            'return_for_policy_optimization': True,
+            'return_terminals': False,
+            'return_decoded_video': False,
+            'store_agent_embed': False,
+            'store_old_action_unembeds': False
+        })
+
+        # discounted rewards + bootstrap value, weighted by cumulative survival probability
+
+        gen_horizon = gen.rewards.shape[1] - prompt_time
+        rewards = gen.rewards[:, prompt_time:]
+
+        if self.predict_terminals and gen_horizon > 0:
+            pooled_latents = reduce(gen.latents[:, prompt_time:], 'b t v n d -> b t d', 'mean')
+            terminal_probs = self.to_latent_state_terminal_pred(pooled_latents).sigmoid()
+            survival = (1. - terminal_probs).cumprod(dim = 1)
+        else:
+            survival = ones_like(rewards)
+
+        discounts = gamma ** arange(gen_horizon, device = rewards.device)
+
+        scores = (rewards * survival * discounts).sum(dim = 1)
+
+        if gen_horizon > 0:
+            scores = scores + value_coef * (gamma ** gen_horizon) * gen.values[:, -1] * survival[:, -1]
+
+        scores = rearrange(scores, '(b k) -> b k', b = batch, k = num_candidates)
+
+        best = scores.argmax(dim = -1)
+        batch_indices = arange(batch, device = latents.device)
+
+        selected = tree_map_tensor(lambda t: t[batch_indices, best.to(t.device)], action_candidates)
+
+        return (selected, scores) if return_scores else selected
+
+    @torch.no_grad()
     def apply_fire_(
         self,
         num_iters = 20,
@@ -7767,6 +8083,9 @@ class DynamicsWorldModel(Module):
             step_sizes_log2 = step_sizes_log2_maybe_float.long()
 
             assert (step_sizes_log2 == step_sizes_log2_maybe_float).all(), f'`step_sizes` must be powers of 2'
+
+        if self.prob_shortcut_train == 0. and exists(step_sizes_log2):
+            step_sizes_log2 = zeros_like(step_sizes_log2)
 
         # flow related
 
@@ -8200,7 +8519,7 @@ class DynamicsWorldModel(Module):
 
             # get second prediction for b''
 
-            signal_levels_plus_half_step = signal_levels + half_step_size[:, None]
+            signal_levels_plus_half_step = (signal_levels + half_step_size[:, None]).clamp(max = self.max_steps - 1)
             second_step_pred = wrapped_get_prediction(denoised, signal_levels_plus_half_step, step_sizes_log2_minus_one)
 
             if is_v_space_pred:
