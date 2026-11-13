@@ -1,44 +1,46 @@
 # /// script
 # dependencies = [
 #   "gymnasium",
-#   "stable-baselines3",
-#   "wandb",
 #   "dreamer4",
-#   "joblib"
+#   "fire",
+#   "joblib",
+#   "x-ppo>=0.1.0",
+#   "torch-einops-utils>=0.2.5",
 # ]
 # [tool.uv.sources]
 # dreamer4 = { path = "." }
 # ///
 
 import shutil
+from collections import deque
 from pathlib import Path
 
-import torch
 import numpy as np
-from joblib import Parallel, delayed
+import torch
+from torch import nn
+from torch.distributions import Categorical
+from torch.nn.utils import clip_grad_norm_
+from torch.optim import AdamW
+
+from torch_einops_utils import tree_map_tensor_to_device
+from x_ppo import calc_gae, clipped_value_loss_fn, ppo_actor_loss
 
 import gymnasium as gym
 from gymnasium import spaces
-
-from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-from stable_baselines3.common.vec_env import DummyVecEnv
-
-import wandb
+from joblib import Parallel, delayed
 import fire
 
 from memmap_replay_buffer import ReplayBuffer
-
-from dreamer4.env import RecordToReplayBufferEnvWrapper, RecordToFolderEnvWrapper
+from dreamer4.env import RecordToReplayBufferEnvWrapper
 from dreamer4.web_env import SnakeEnv
 
 # helpers
 
-def exists(v):
-    return v is not None
+def image_shape(env):
+    size = env.grid_size * env.render_cell_size
+    return (3, size, size)
 
-# classes
+# env wrapper
 
 class GymWrapper(gym.Env):
     def __init__(self, env):
@@ -48,161 +50,289 @@ class GymWrapper(gym.Env):
         while hasattr(base_env, 'env'):
             base_env = base_env.env
 
-        self.base_env = base_env
-        self.grid_size = base_env.grid_size
-        self.render_cell_size = base_env.render_cell_size
+        self.action_space = spaces.Discrete(base_env.action_space)
+        self.observation_space = spaces.Box(0, 255, shape = image_shape(base_env), dtype = np.uint8)
 
-        self.action_space = spaces.Discrete(env.action_space)
-        sz = self.grid_size * self.render_cell_size
-        self.observation_space = spaces.Box(low=0, high=255, shape=(3, sz, sz), dtype=np.uint8)
+    def _get_obs(self, obs):
+        image = obs['image'] if isinstance(obs, dict) else obs
+        return np.clip(image, 0, 255).astype(np.uint8)
 
-    def _get_obs(self, obs_dict):
-        # SnakeEnv's canonical observation layout is channel-first (c h w);
-        # forward it as-is, only converting to uint8 to match the observation space
-        img = obs_dict['image']
-        return np.clip(img, 0, 255).astype(np.uint8)
-
-    def reset(self, seed = None, options = None):
+    def reset(self, *, seed = None, options = None):
         super().reset(seed = seed)
-        obs_dict = self.env.reset()
-        return self._get_obs(obs_dict), {}
+        obs = self.env.reset(seed = seed, options = options)
+        obs = obs[0] if isinstance(obs, tuple) else obs
+        return self._get_obs(obs), {}
 
     def step(self, action):
-        out = self.env.step(action)
-        if len(out) == 5:
-            obs_dict, reward, terminated, truncated, info = out
-            return self._get_obs(obs_dict), float(reward), bool(terminated), bool(truncated), info
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        return self._get_obs(obs), float(reward), bool(terminated), bool(truncated), info
 
-        obs_dict, reward, done, info = out
-        return self._get_obs(obs_dict), float(reward), bool(done), False, info
+# actor critic
 
-class PrintReturnsCallback(BaseCallback):
+class ActorCritic(nn.Module):
     def __init__(
         self,
-        video_dir,
-        target_apples = 5.0,
-        log_every = 50,
-        verbose = 0
+        num_actions,
+        image_shape,
+        dim = 128
     ):
-        super().__init__(verbose)
-        self.target_apples = target_apples
+        super().__init__()
+        input_dim = int(np.prod(image_shape))
 
-        self.episode_returns = []
-        self.episode_apples = []
-        self.episode_lengths = []
-
-        self.current_return = 0.
-        self.current_apples = 0.
-        self.current_length = 0
-
-        self.episodes = 0
-        self.log_every = log_every
-        self.video_dir = Path(video_dir)
-
-    def _on_step(self) -> bool:
-        reward = self.locals["rewards"][0]
-        done = self.locals["dones"][0]
-
-        self.current_return += reward
-        self.current_length += 1
-
-        if reward > 0.0:
-            self.current_apples += 1
-
-        if done:
-            self.episodes += 1
-            self.episode_returns.append(self.current_return)
-            self.episode_apples.append(self.current_apples)
-            self.episode_lengths.append(self.current_length)
-
-            if self.current_apples >= self.target_apples:
-                print(f"Reached target of {self.target_apples} apples. Stopping training!")
-                return False
-
-            if self.episodes % self.log_every == 0:
-                avg_return = np.mean(self.episode_returns[-self.log_every:])
-                avg_apples = np.mean(self.episode_apples[-self.log_every:])
-                avg_length = np.mean(self.episode_lengths[-self.log_every:])
-
-                print(f"PPO Episode {self.episodes}: Return = {avg_return:.2f}, Apples = {avg_apples:.2f}, Length = {avg_length:.2f}")
-
-                log_dict = {
-                    "train/return": avg_return,
-                    "train/apples": avg_apples,
-                    "train/length": avg_length,
-                    "train/episode": self.episodes
-                }
-
-                videos = list(self.video_dir.glob('*.mp4'))
-                if len(videos) > 0:
-                    latest_video = max(videos, key=lambda p: p.stat().st_mtime)
-                    try:
-                        log_dict["train/video"] = wandb.Video(str(latest_video), format="mp4")
-                    except Exception:
-                        pass
-
-                wandb.log(log_dict)
-
-            self.current_return = 0.
-            self.current_apples = 0.
-            self.current_length = 0
-
-        return True
-
-class CustomCnnExtractor(BaseFeaturesExtractor):
-    def __init__(self, observation_space: spaces.Box, features_dim: int = 128):
-        super().__init__(observation_space, features_dim)
-
-        self.cnn = torch.nn.Sequential(
-            torch.nn.Conv2d(3, 16, kernel_size=3, padding=1),
-            torch.nn.ReLU(),
-            torch.nn.Conv2d(16, 32, kernel_size=3, padding=1),
-            torch.nn.ReLU(),
-            torch.nn.Flatten()
+        self.encoder = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(input_dim, dim),
+            nn.SiLU()
         )
 
-        c, h, w = observation_space.shape
-        n_flatten = 32 * h * w
+        self.policy = nn.Linear(dim, num_actions)
+        self.value = nn.Linear(dim, 1)
 
-        self.linear = torch.nn.Sequential(
-            torch.nn.Linear(n_flatten, features_dim),
-            torch.nn.ReLU()
+    def features(self, obs):
+        return self.encoder(obs.float() / 255.)
+
+    def forward(self, obs):
+        features = self.features(obs)
+        return self.policy(features), self.value(features).squeeze(-1)
+
+    @torch.no_grad()
+    def act(self, obs, deterministic = False):
+        logits, value = self(obs)
+        dist = Categorical(logits = logits)
+        action = dist.mode if deterministic else dist.sample()
+        return action, dist.log_prob(action), value
+
+    @torch.no_grad()
+    def value_only(self, obs):
+        return self.value(self.features(obs)).squeeze(-1)
+
+# ppo
+
+def collect_rollout(model, envs, obs, n_steps):
+    num_envs = len(envs)
+    obs_buf = torch.empty((n_steps, num_envs, *obs.shape[1:]), dtype = torch.uint8)
+    next_obs_buf = torch.empty_like(obs_buf)
+
+    actions = torch.empty((n_steps, num_envs), dtype = torch.long)
+    log_probs = torch.empty((n_steps, num_envs))
+    values = torch.empty((n_steps, num_envs))
+    rewards = torch.empty((n_steps, num_envs))
+    terminated = torch.empty((n_steps, num_envs), dtype = torch.bool)
+    truncated = torch.empty_like(terminated)
+
+    episode_return = torch.zeros(num_envs)
+    episode_apples = torch.zeros(num_envs)
+    episode_length = torch.zeros(num_envs, dtype = torch.long)
+
+    returns, apples, lengths = [], [], []
+
+    for t in range(n_steps):
+        obs_buf[t] = obs
+
+        action, log_prob, value = model.act(obs)
+        actions[t] = action.cpu()
+        log_probs[t] = log_prob.cpu()
+        values[t] = value.cpu()
+
+        next_obs = torch.empty_like(obs)
+
+        for env_index, env in enumerate(envs):
+            obs_np, reward, terminated_np, truncated_np, _ = env.step(action[env_index].item())
+            obs_t = torch.from_numpy(obs_np)
+
+            next_obs_buf[t, env_index] = obs_t
+            next_obs[env_index] = obs_t
+
+            rewards[t, env_index] = reward
+            terminated[t, env_index] = terminated_np
+            truncated[t, env_index] = truncated_np
+
+            episode_return[env_index] += reward
+            episode_apples[env_index] += float(reward > 0.)
+            episode_length[env_index] += 1
+
+            if terminated_np or truncated_np:
+                returns.append(episode_return[env_index].item())
+                apples.append(episode_apples[env_index].item())
+                lengths.append(episode_length[env_index].item())
+
+                episode_return[env_index] = 0.
+                episode_apples[env_index] = 0.
+                episode_length[env_index] = 0
+
+                obs_np, _ = env.reset()
+                next_obs[env_index] = torch.from_numpy(obs_np)
+
+        obs = next_obs
+
+    flat_next_obs = next_obs_buf.reshape(-1, *obs.shape[1:])
+    next_values = model.value_only(flat_next_obs).reshape(n_steps, num_envs)
+
+    return dict(
+        obs = obs_buf,
+        actions = actions,
+        log_probs = log_probs,
+        values = values,
+        rewards = rewards,
+        terminated = terminated,
+        truncated = truncated,
+        next_values = next_values,
+        current_obs = obs,
+        returns = returns,
+        apples = apples,
+        lengths = lengths
+    )
+
+def train_ppo(
+    model,
+    envs,
+    num_updates = 200,
+    n_steps = 128,
+    epochs = 4,
+    batch_size = 256,
+    gamma = 0.99,
+    lam = 0.95,
+    eps_clip = 0.2,
+    value_clip = 0.2,
+    entropy_coef = 0.01,
+    value_coef = 0.5,
+    max_grad_norm = 0.5,
+    learning_rate = 3e-4,
+    target_apples = 5.,
+    log_every = 10
+):
+    device = next(model.parameters()).device
+    optimizer = AdamW(model.parameters(), lr = learning_rate)
+
+    obs = torch.stack([torch.from_numpy(env.reset()[0]) for env in envs])
+    recent_apples = deque(maxlen = 20)
+
+    for update in range(num_updates):
+        rollout = collect_rollout(model, envs, obs, n_steps)
+        obs = rollout['current_obs']
+
+        rollout = tree_map_tensor_to_device(rollout, device)
+
+        obs_buf = rollout['obs']
+        actions = rollout['actions']
+        old_log_probs = rollout['log_probs']
+        old_values = rollout['values']
+        rewards = rollout['rewards']
+        terminated = rollout['terminated']
+        truncated = rollout['truncated']
+        next_values = rollout['next_values']
+
+        gae = calc_gae(
+            rewards.movedim(0, 1),
+            old_values.movedim(0, 1),
+            terminated = terminated.movedim(0, 1),
+            truncated = truncated.movedim(0, 1),
+            next_values = next_values.movedim(0, 1),
+            gamma = gamma,
+            lam = lam,
+            return_advantages = True
         )
 
-    def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        # SB3 automatically normalizes images to [0, 1] floats
-        x = self.cnn(observations)
-        return self.linear(x)
+        returns = gae.returns.movedim(0, 1)
+        advantages = gae.advantages.movedim(0, 1)
 
-# main
+        total_steps = n_steps * len(envs)
+        flat_obs = obs_buf.reshape(total_steps, *obs_buf.shape[2:])
+        flat_actions = actions.reshape(total_steps)
+        flat_log_probs = old_log_probs.reshape(total_steps)
+        flat_values = old_values.reshape(total_steps)
+        flat_returns = returns.reshape(total_steps)
+        flat_advantages = advantages.reshape(total_steps)
+
+        model.train()
+
+        for _ in range(epochs):
+            indices = torch.randperm(total_steps, device = device)
+
+            for start in range(0, total_steps, batch_size):
+                batch_indices = indices[start:start + batch_size]
+
+                logits, values = model(flat_obs[batch_indices])
+                dist = Categorical(logits = logits)
+
+                log_probs = dist.log_prob(flat_actions[batch_indices])
+                entropy = dist.entropy().mean()
+
+                policy_loss = ppo_actor_loss(
+                    log_probs,
+                    flat_log_probs[batch_indices],
+                    flat_advantages[batch_indices],
+                    eps_clip = eps_clip,
+                    normalize_advantages = True
+                ).mean()
+
+                value_loss = clipped_value_loss_fn(
+                    values,
+                    flat_values[batch_indices],
+                    flat_returns[batch_indices],
+                    clip = value_clip
+                )
+
+                loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
+
+                optimizer.zero_grad()
+                loss.backward()
+                clip_grad_norm_(model.parameters(), max_grad_norm)
+                optimizer.step()
+
+        if len(rollout['apples']) > 0:
+            recent_apples.extend(rollout['apples'])
+
+        if update % log_every == 0 and len(rollout['returns']) > 0:
+            avg_return = np.mean(rollout['returns'])
+            avg_apples = np.mean(rollout['apples'])
+            avg_length = np.mean(rollout['lengths'])
+
+            print(f'update {update}: return {avg_return:.2f} | apples {avg_apples:.2f} | length {avg_length:.2f}', flush = True)
+
+        if len(recent_apples) >= 20 and np.mean(recent_apples) >= target_apples:
+            print(f'reached {target_apples} apples, stopping ppo', flush = True)
+            break
+
+    return model
+
+# replay collection
 
 def collect_episodes(
-    collector_id: int,
-    num_episodes: int,
-    folder: str,
-    max_timesteps: int,
-    grid_size: int,
-    max_steps: int,
-    collision_penalty: float,
-    apple_reward: float,
-    aliveness_penalty: float,
-    model,
-    log_every: int
+    collector_id,
+    num_episodes,
+    folder,
+    max_timesteps,
+    grid_size,
+    max_steps,
+    collision_penalty,
+    apple_reward,
+    aliveness_penalty,
+    policy,
+    log_every
 ):
-    print(f"[Collector {collector_id}] Starting collection of {num_episodes} episodes into {folder}")
+    print(f'[collector {collector_id}] collecting {num_episodes} episodes')
 
-    test_dir = Path(folder)
-    shutil.rmtree(test_dir, ignore_errors = True)
-    test_dir.mkdir(exist_ok = True, parents = True)
+    folder = Path(folder)
+    shutil.rmtree(folder, ignore_errors = True)
+    folder.mkdir(exist_ok = True, parents = True)
+
+    env = SnakeEnv(
+        grid_size = grid_size,
+        max_steps = max_steps,
+        collision_penalty = collision_penalty,
+        apple_reward = apple_reward,
+        aliveness_penalty = aliveness_penalty
+    )
 
     buffer = ReplayBuffer(
-        folder = str(test_dir),
+        folder = str(folder),
         max_episodes = num_episodes,
         max_timesteps = max_timesteps,
         fields = dict(
             rewards = 'float',
             terminated = 'bool',
-            video = ('uint8', (3, grid_size * 2, grid_size * 2)),
+            video = ('uint8', image_shape(env)),
             discrete_actions = 'int'
         ),
         meta_fields = dict(
@@ -211,136 +341,108 @@ def collect_episodes(
         )
     )
 
-    env = SnakeEnv(
-        grid_size = grid_size,
-        max_steps = max_steps,
-        collision_penalty = collision_penalty,
-        apple_reward = apple_reward,
-        aliveness_penalty = aliveness_penalty
-    )
+    env = RecordToReplayBufferEnvWrapper(env, replay_buffer = buffer, rewards = True, terminated = True)
+    env = GymWrapper(env)
 
-    env_with_buffer = RecordToReplayBufferEnvWrapper(
-        env,
-        replay_buffer = buffer,
-        rewards = True,
-        terminated = True
-    )
+    policy.eval()
+    obs, _ = env.reset()
 
-    gym_env_collect = GymWrapper(env_with_buffer)
-
-    episodes_collected = 0
+    episodes = 0
     cum_reward = 0.
     total_apples = 0.
 
-    obs, _ = gym_env_collect.reset()
+    while episodes < num_episodes:
+        obs_t = torch.from_numpy(obs).unsqueeze(0)
+        action, _, _ = policy.act(obs_t)
 
-    while episodes_collected < num_episodes:
-        action, _ = model.predict(obs, deterministic = False)
-        obs, reward, terminated, truncated, _ = gym_env_collect.step(action)
+        obs, reward, terminated, truncated, _ = env.step(action.item())
 
-        cum_reward += float(reward)
-        if reward > 0.0:
-            total_apples += 1.
+        cum_reward += reward
+        total_apples += float(reward > 0.)
 
         if terminated or truncated:
-            buffer.store_meta_datapoint(episodes_collected, 'cum_reward', cum_reward)
-            buffer.store_meta_datapoint(episodes_collected, 'total_apples', total_apples)
+            buffer.store_meta_datapoint(episodes, 'cum_reward', cum_reward)
+            buffer.store_meta_datapoint(episodes, 'total_apples', total_apples)
 
-            episodes_collected += 1
-            if episodes_collected % log_every == 0:
-                print(f"[Collector {collector_id}] Collected {episodes_collected} / {num_episodes} episodes")
+            episodes += 1
+            cum_reward = 0.
+            total_apples = 0.
 
-            if episodes_collected < num_episodes:
-                obs, _ = gym_env_collect.reset()
-                cum_reward = 0.
-                total_apples = 0.
+            if episodes % log_every == 0:
+                print(f'[collector {collector_id}] {episodes} / {num_episodes}')
+
+            if episodes < num_episodes:
+                obs, _ = env.reset()
 
     buffer.flush()
-    print(f"[Collector {collector_id}] Collection complete.")
+    print(f'[collector {collector_id}] done')
+
+# main
 
 def main(
-    project_name: str = "snake-ppo-agent",
-    buffer_folder: str | None = None,
-    video_folder: str | None = None,
-    inspect_replay_buffer: bool = True,
-    grid_size: int = 4,
-    max_steps: int = 20,
-    collision_penalty: float = -10.0,
-    apple_reward: float = 5.0,
-    aliveness_penalty: float = -0.01,
-    ppo_updates_before_collect: int = 500,
-    replay_buffer_size: int = 1000,
-    target_apples: float = 5.0,
-    learning_rate: float = 1e-3,
-    ent_coef: float = 0.01,
-    n_steps: int = 256,
-    batch_size: int = 64,
-    n_epochs: int = 4,
-    log_every: int = 50,
-    num_trajectory_collectors: int = 4,
+    buffer_folder = None,
+    inspect_replay_buffer = True,
+    grid_size = 4,
+    max_steps = 20,
+    collision_penalty = -10.0,
+    apple_reward = 5.0,
+    aliveness_penalty = -0.01,
+    num_updates = 200,
+    num_envs = 8,
+    n_steps = 128,
+    epochs = 4,
+    batch_size = 256,
+    gamma = 0.99,
+    lam = 0.95,
+    eps_clip = 0.2,
+    value_clip = 0.2,
+    value_coef = 0.5,
+    max_grad_norm = 0.5,
+    replay_buffer_size = 1000,
+    num_trajectory_collectors = 4,
+    target_apples = 4.0,
+    learning_rate = 1e-3,
+    entropy_coef = 0.02,
+    log_every = 10,
+    seed = 0
 ):
-    wandb.init(project = project_name)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
 
-    max_timesteps = max_steps + 1
+    buffer_folder = buffer_folder or f'./snake_buffer_ppo_{grid_size}x{grid_size}_{max_steps}steps'
 
-    buffer_folder = buffer_folder or f"./snake_buffer_ppo_{grid_size}x{grid_size}_{max_steps}steps"
-    video_folder = video_folder or f"./snake_videos_ppo_{grid_size}x{grid_size}_{max_steps}steps"
+    envs = [
+        GymWrapper(SnakeEnv(
+            grid_size = grid_size,
+            max_steps = max_steps,
+            collision_penalty = collision_penalty,
+            apple_reward = apple_reward,
+            aliveness_penalty = aliveness_penalty
+        ))
+        for _ in range(num_envs)
+    ]
 
-    video_dir = Path(video_folder)
-
-    print(f"Training policy until {target_apples} apples, then populating replay buffers with prefix {buffer_folder} with {replay_buffer_size} trajectories")
-
-    shutil.rmtree(video_dir, ignore_errors = True)
-    video_dir.mkdir(exist_ok = True, parents = True)
-
-    env = SnakeEnv(
-        grid_size = grid_size,
-        max_steps = max_steps,
-        collision_penalty = collision_penalty,
-        apple_reward = apple_reward,
-        aliveness_penalty = aliveness_penalty
-    )
-
-    env = RecordToFolderEnvWrapper(
-        env,
-        folder = str(video_dir),
-        fps = 4,
-        clear_on_start = True
-    )
-
-    gym_env = GymWrapper(env)
-    vec_env = DummyVecEnv([lambda: gym_env])
-
-    print("Phase 1: Training PPO...")
-
-    # In SB3, CnnPolicy creates the features extractor and then directly attaches
-    # the main policy network (action_net) and value network (value_net) linear heads
-    # to the features output. By setting net_arch = dict(pi=[], vf=[]), we ensure
-    # no hidden layers are placed between the CNN and the output heads.
-
-    model = PPO(
-        "CnnPolicy",
-        vec_env,
-        verbose = 0,
-        device = "cpu",
-        learning_rate = learning_rate,
-        ent_coef = ent_coef,
+    model = ActorCritic(num_actions = 4, image_shape = envs[0].observation_space.shape)
+    model = train_ppo(
+        model,
+        envs,
+        num_updates = num_updates,
         n_steps = n_steps,
+        epochs = epochs,
         batch_size = batch_size,
-        n_epochs = n_epochs,
-        policy_kwargs = dict(
-            features_extractor_class = CustomCnnExtractor,
-            features_extractor_kwargs = dict(features_dim = 128),
-            net_arch = dict(pi=[], vf=[])
-        )
+        gamma = gamma,
+        lam = lam,
+        eps_clip = eps_clip,
+        value_clip = value_clip,
+        value_coef = value_coef,
+        max_grad_norm = max_grad_norm,
+        entropy_coef = entropy_coef,
+        learning_rate = learning_rate,
+        target_apples = target_apples,
+        log_every = log_every
     )
 
-    callback = PrintReturnsCallback(video_dir = video_dir, target_apples = target_apples, log_every = log_every)
-
-    total_ppo_timesteps = ppo_updates_before_collect * n_steps * vec_env.num_envs
-    model.learn(total_timesteps = total_ppo_timesteps, callback = callback)
-
-    print(f"\nPhase 2: Collecting {replay_buffer_size} episodes with {num_trajectory_collectors} collectors...")
+    print(f'collecting {replay_buffer_size} episodes with {num_trajectory_collectors} collectors')
 
     quotient, remainder = divmod(replay_buffer_size, num_trajectory_collectors)
     episodes_per_collector = [quotient + int(i < remainder) for i in range(num_trajectory_collectors)]
@@ -348,26 +450,25 @@ def main(
     Parallel(n_jobs = num_trajectory_collectors)(
         delayed(collect_episodes)(
             collector_id = i,
-            num_episodes = eps,
-            folder = f"{buffer_folder}.{i}",
-            max_timesteps = max_timesteps,
+            num_episodes = episodes,
+            folder = f'{buffer_folder}.{i}',
+            max_timesteps = max_steps + 1,
             grid_size = grid_size,
             max_steps = max_steps,
             collision_penalty = collision_penalty,
             apple_reward = apple_reward,
             aliveness_penalty = aliveness_penalty,
-            model = model,
-            log_every = log_every
+            policy = model,
+            log_every = 50
         )
-        for i, eps in enumerate(episodes_per_collector) if eps > 0
+        for i, episodes in enumerate(episodes_per_collector) if episodes > 0
     )
 
-    print("Collection complete.")
+    print('collection complete')
 
     if inspect_replay_buffer:
-        print("\nStarting replay buffer visualizer...")
         from dreamer4.cli import inspect_replay_buffer as start_visualizer
-        start_visualizer(f"{buffer_folder}.*", port = 9000)
+        start_visualizer(f'{buffer_folder}.*', port = 9000)
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     fire.Fire(main)

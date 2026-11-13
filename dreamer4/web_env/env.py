@@ -65,10 +65,11 @@ class SnakeEnv:
         terminated = False
         truncated = self.steps >= self.max_steps
 
+        # tail vacates -> x
         if (
             new_head[0] < 0 or new_head[0] >= self.grid_size or
             new_head[1] < 0 or new_head[1] >= self.grid_size or
-            new_head in self.snake
+            new_head in self.snake[:-1]
         ):
             terminated = True
             reward = self.collision_penalty
