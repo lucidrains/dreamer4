@@ -15,7 +15,7 @@ from dataclasses import dataclass, asdict, fields, replace
 
 import torch
 import torch.nn.functional as F
-from torch.distributions import Normal, Beta, kl
+from torch.distributions import Normal, Beta
 from torch.nn import Module, ModuleList, ModuleDict, Embedding, Parameter, Linear, RMSNorm
 from torch import nn, cat, stack, tensor, Tensor, is_tensor, zeros, ones, randint, rand, randn, randn_like, empty, full, linspace, arange, rand_like, ones_like, zeros_like
 from torch.utils._pytree import tree_map, tree_flatten, tree_unflatten
@@ -70,7 +70,9 @@ from torch_einops_utils import (
     safe_cat,
     tree_flatten_with_inverse,
     tree_map_tensor,
-    exclusive_cumsum
+    exclusive_cumsum,
+    categorical_kl,
+    kl_divergence
 )
 
 from torch_einops_utils.device import move_inputs_to_module_device
@@ -1673,10 +1675,15 @@ class ActionEmbedder(Module):
         discrete_kl = None
 
         if exists(src_logits) and exists(tgt_logits):
-            src_dist = MultiCategorical(src_logits, use_parallel_multi_discrete = True)
-            tgt_dist = MultiCategorical(tgt_logits, use_parallel_multi_discrete = True)
+            src_logits = src_logits if isinstance(src_logits, (list, tuple)) else (src_logits,)
+            tgt_logits = tgt_logits if isinstance(tgt_logits, (list, tuple)) else (tgt_logits,)
 
-            discrete_kl = src_dist.kl_div(tgt_dist, keep_num_actions_dim = True)
+            assert len(src_logits) > 0 and len(src_logits) == len(tgt_logits)
+
+            discrete_kl = stack([
+                categorical_kl(s, t)
+                for s, t in zip(src_logits, tgt_logits)
+            ], dim = -1)
 
             if reduce_across_num_actions:
                 discrete_kl = discrete_kl.sum(dim = -1)
@@ -1689,7 +1696,7 @@ class ActionEmbedder(Module):
             src_distr = self.continuous_readout.continuous_dist.dist(src_params)
             tgt_distr = self.continuous_readout.continuous_dist.dist(tgt_params)
 
-            continuous_kl = kl.kl_divergence(src_distr, tgt_distr)
+            continuous_kl = kl_divergence(src_distr, tgt_distr)
 
             if reduce_across_num_actions:
                 continuous_kl = continuous_kl.sum(dim = -1)
