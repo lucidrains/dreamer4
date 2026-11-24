@@ -46,6 +46,7 @@ from PoPE_pytorch import PoPE, AxialPoPE, flash_attn_with_pope
 
 from discrete_continuous_embed_readout import MultiCategorical, Readout
 from discrete_continuous_embed_readout.discrete_continuous_embed_readout import BetaDist, rescale
+from mean_conc_beta import Beta as MeanConcBeta
 
 from memmap_replay_buffer import ReplayBuffer
 
@@ -74,7 +75,7 @@ from torch_einops_utils import (
 
 from torch_einops_utils.device import move_inputs_to_module_device
 from torch_einops_utils.save_load import save_load
-from torch_einops_utils.shape import size
+from torch_einops_utils.shape import size, is_shape
 
 # ein related
 
@@ -1282,6 +1283,20 @@ def get_reward_encoder_klass(name: str) -> Module:
 
 # action related
 
+class MeanConcBetaDist(Module):
+    default_range = (0., 1.)
+
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.beta = MeanConcBeta(**dict(bounds = self.default_range, **kwargs))
+
+    def dist(self, params, temperature = 1.):
+        return self.beta(params, temperature = temperature)
+
+    def forward(self, params, differentiable = False, temperature = 1.):
+        dist = self.dist(params, temperature = temperature)
+        return dist.rsample() if differentiable else dist.sample()
+
 ActionEmbeds = namedtuple('ActionEmbed', ('discrete', 'continuous'))
 
 class ActionEmbedder(Module):
@@ -1355,10 +1370,13 @@ class ActionEmbedder(Module):
                 num_continuous = num_continuous_actions,
                 continuous_mean_std = tensor(continuous_norm_stats) if self.continuous_need_norm else None,
                 continuous_dist_type = readout_dist_type,
-                continuous_dist_kwargs = continuous_dist_kwargs,
+                continuous_dist_kwargs = dict() if continuous_dist_type == 'beta' else continuous_dist_kwargs,
                 continuous_squashed = readout_squashed,
                 eps = self.beta_log_prob_eps
             )
+
+            if continuous_dist_type == 'beta':
+                self.continuous_readout.continuous_dist = MeanConcBetaDist(**dict(eps = self.beta_log_prob_eps, **continuous_dist_kwargs))
 
         # defaults
 
@@ -1541,11 +1559,20 @@ class ActionEmbedder(Module):
             sampled_discrete = dist.sample(temperature = discrete_temperature)
 
         if exists(continuous_mean_log_var):
-            sampled_continuous = self.continuous_readout.sample_continuous(
-                continuous_mean_log_var,
-                selector = self.continuous_readout.get_selector(),
-                temperature = continuous_temperature
-            )
+            selector = self.continuous_readout.get_selector()
+
+            if self.continuous_dist_type == 'beta':
+                sampled_continuous = self.continuous_readout.continuous_dist(continuous_mean_log_var, temperature = continuous_temperature)
+
+                if self.continuous_need_norm:
+                    mean, std = selector.continuous_mean_std.data.unbind(dim = -1)
+                    sampled_continuous = sampled_continuous * std + mean
+            else:
+                sampled_continuous = self.continuous_readout.sample_continuous(
+                    continuous_mean_log_var,
+                    selector = selector,
+                    temperature = continuous_temperature
+                )
 
         return sampled_discrete, sampled_continuous
 
@@ -5444,6 +5471,7 @@ class DynamicsWorldModel(Module):
         pmpo_kl_div_loss_weight = .3,
         use_delight_gating = True,
         delight_temperature = 1.,
+        delight_surprisal_clamp: float | None = 10.,
         normalize_advantages = None,
         value_clip = 0.4,
         clip_values = False,
@@ -6012,6 +6040,7 @@ class DynamicsWorldModel(Module):
 
         self.use_delight_gating = use_delight_gating
         self.delight_temperature = delight_temperature
+        self.delight_surprisal_clamp = delight_surprisal_clamp
 
         # rewards related
 
@@ -6184,25 +6213,41 @@ class DynamicsWorldModel(Module):
 
     # aux encoders
 
-    def encode_aux_image_tokens(self, video):
+    def encode_aux_image_tokens(
+        self,
+        video,
+        time_cache = None,
+        return_time_cache = False
+    ):
         context = torch.no_grad if self.freeze_aux_image_encoder else nullcontext
+        use_cache = return_time_cache and getattr(self.aux_image_encoder, 'has_time_cache', False)
 
         with context():
             was_training = self.aux_image_encoder.training
             if self.freeze_aux_image_encoder:
                 self.aux_image_encoder.eval()
 
-            aux_out = self.aux_image_encoder(video)
+            if use_cache:
+                aux_out = self.aux_image_encoder(video, time_cache = time_cache, return_time_cache = True)
+            else:
+                aux_out = self.aux_image_encoder(video)
 
             if self.freeze_aux_image_encoder:
                 self.aux_image_encoder.train(was_training)
 
-        (aux_image_tokens, *_), _ = tree_flatten(aux_out)
+        if use_cache:
+            aux_image_tokens, next_time_cache = aux_out
+        else:
+            (aux_image_tokens, *_), _ = tree_flatten(aux_out)
+            next_time_cache = time_cache
 
         if self.freeze_aux_image_encoder:
             aux_image_tokens = aux_image_tokens.detach()
 
-        return aux_image_tokens
+        if not return_time_cache:
+            return aux_image_tokens
+
+        return aux_image_tokens, next_time_cache
 
     def embed_agent_actions(
         self,
@@ -6434,6 +6479,7 @@ class DynamicsWorldModel(Module):
 
         time_cache = None
         tokenizer_time_cache = None
+        aux_image_time_cache = None
 
         obs = init_obs
         curr_image = image_frame
@@ -6453,7 +6499,11 @@ class DynamicsWorldModel(Module):
                     latents, next_tokenizer_time_cache = self.video_tokenizer(curr_image, return_latents = True, time_cache = tokenizer_time_cache, return_time_cache = True)
 
                 if self.has_aux_image_encoder:
-                    aux_image_tokens = self.encode_aux_image_tokens(curr_image)
+                    aux_image_tokens, aux_image_time_cache = self.encode_aux_image_tokens(
+                        curr_image,
+                        time_cache = aux_image_time_cache,
+                        return_time_cache = True
+                    )
                     latents = safe_cat((latents, aux_image_tokens), dim = -2)
 
             elif exists(curr_state):
@@ -6590,7 +6640,8 @@ class DynamicsWorldModel(Module):
                 policy_embed,
                 pred_head_index = 0,
                 discrete_targets = sampled_discrete_actions,
-                continuous_targets = sampled_continuous_actions
+                continuous_targets = sampled_continuous_actions,
+                soft_validate_range = True
             )
 
             discrete_log_probs = safe_cat((discrete_log_probs, one_discrete_log_probs), dim = 1)
@@ -6618,10 +6669,11 @@ class DynamicsWorldModel(Module):
 
             episode_lens = torch.where(done_flag, episode_lens, episode_lens + 1)
 
-            is_terminated |= terminated
-            is_truncated |= truncated
+            active = ~done_flag
+            is_terminated |= terminated & active
+            is_truncated |= truncated & ~terminated & active
 
-            was_terminated |= terminated
+            was_terminated |= terminated & active
             done_flag |= (is_terminated | is_truncated)
 
             # maybe state entropy bonus
@@ -6679,8 +6731,12 @@ class DynamicsWorldModel(Module):
                         bootstrap_latents, _ = self.video_tokenizer(curr_image, return_latents = True, time_cache = tokenizer_time_cache, return_time_cache = True)
 
                     if self.has_aux_image_encoder:
-                        aux_image_tokens = self.encode_aux_image_tokens(curr_image)
-                        bootstrap_latents = cat((bootstrap_latents, aux_image_tokens), dim = -2) if exists(bootstrap_latents) else aux_image_tokens
+                        aux_image_tokens, _ = self.encode_aux_image_tokens(
+                            curr_image,
+                            time_cache = aux_image_time_cache,
+                            return_time_cache = True
+                        )
+                        bootstrap_latents = safe_cat((bootstrap_latents, aux_image_tokens), dim = -2)
 
                 elif exists(curr_state):
                     curr_state, unpack_views = pack_one(curr_state, '* d')
@@ -6799,12 +6855,14 @@ class DynamicsWorldModel(Module):
         objective: Literal['ppo', 'pmpo', 'spo'] = 'ppo',
         use_delight_gating = None,
         delight_temperature = None,
+        delight_surprisal_clamp = None,
         normalize_advantages = None,
         pmpo_use_magnitude_weighted_global_mean = None,
         eps = 1e-6
     ):
         use_delight_gating = default(use_delight_gating, self.use_delight_gating)
         delight_temperature = default(delight_temperature, self.delight_temperature)
+        delight_surprisal_clamp = default(delight_surprisal_clamp, self.delight_surprisal_clamp)
         pmpo_use_magnitude_weighted_global_mean = default(pmpo_use_magnitude_weighted_global_mean, self.pmpo_use_magnitude_weighted_global_mean)
 
         assert isinstance(experience, Experience)
@@ -7012,7 +7070,7 @@ class DynamicsWorldModel(Module):
         discrete_actions = maybe_slice_time(discrete_actions)
         continuous_actions = maybe_slice_time(continuous_actions)
 
-        log_probs, entropies = self.action_embedder.log_probs(policy_embed, pred_head_index = 0, discrete_targets = discrete_actions, continuous_targets = continuous_actions, return_entropies = True)
+        log_probs, entropies = self.action_embedder.log_probs(policy_embed, pred_head_index = 0, discrete_targets = discrete_actions, continuous_targets = continuous_actions, return_entropies = True, soft_validate_range = True)
 
         # concat discrete and continuous actions into one for optimizing
 
@@ -7042,7 +7100,12 @@ class DynamicsWorldModel(Module):
         # Ian Osband - https://arxiv.org/abs/2603.14608v1
 
         if use_delight_gating:
-            delight_gate = ((-log_probs * advantage) / delight_temperature).sigmoid().detach()
+            surprisal = -log_probs
+
+            if exists(delight_surprisal_clamp):
+                surprisal = surprisal.clamp(-delight_surprisal_clamp, delight_surprisal_clamp)
+
+            delight_gate = ((surprisal * advantage) / delight_temperature).sigmoid().detach()
 
         # maybe pmpo
         # pmpo - weighting the positive and negative advantages equally - ignoring magnitude of advantage and taking the sign
@@ -7950,7 +8013,7 @@ class DynamicsWorldModel(Module):
             if exists(state):
                 state = rearrange(state, 'b ... -> b 1 ...')
 
-            if exists(latents) and not latent_has_view_dim:
+            if exists(latents) and not latent_has_view_dim and not is_shape(latents, 'b t v n d'):
                 latents = rearrange(latents, 'b t ... -> b t 1 ...')
 
         # if raw modalities passed in, tokenize

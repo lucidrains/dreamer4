@@ -43,6 +43,7 @@ from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 
 from torch_einops_utils import pad_at_dim
+from torch_einops_utils.shape import shape, is_shape
 
 from accelerate import Accelerator
 
@@ -89,30 +90,70 @@ def make_env(seed, use_image_input = False, vectorized = False, num_envs = 8, us
 # conv encoder
 
 class SmallConvEncoder(nn.Module):
-    def __init__(self, num_latent_tokens = 4, dim_latent = 32):
+    has_time_cache = True
+
+    def __init__(
+        self,
+        num_latent_tokens = 4,
+        dim_latent = 32,
+        frame_diff_scale = 5.
+    ):
         super().__init__()
         self.num_latent_tokens = num_latent_tokens
         self.dim_latent = dim_latent
+        self.frame_diff_scale = frame_diff_scale
 
         self.net = nn.Sequential(
-            nn.Conv2d(3, 16, 4, stride = 2, padding = 1),
-            nn.ReLU(),
-            nn.Conv2d(16, 32, 4, stride = 2, padding = 1),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, 4, stride = 2, padding = 1),
-            nn.ReLU(),
-            nn.Conv2d(64, num_latent_tokens * dim_latent, 8, stride = 1, padding = 0),
-            nn.Tanh()
+            nn.Conv2d(6, 16, 4, stride = 2, padding = 1, bias = False),
+            nn.GroupNorm(4, 16),
+            nn.SiLU(),
+            nn.Conv2d(16, 32, 4, stride = 2, padding = 1, bias = False),
+            nn.GroupNorm(4, 32),
+            nn.SiLU(),
+            nn.Conv2d(32, 64, 4, stride = 2, padding = 1, bias = False),
+            nn.GroupNorm(8, 64),
+            nn.SiLU(),
+            nn.Conv2d(64, num_latent_tokens * dim_latent, 8, stride = 1, padding = 0, bias = False)
         )
 
-    def forward(self, x, return_latents = False, time_cache = None, return_time_cache = False, **kwargs):
-        is_video = x.ndim == 5
-        if is_video:
-            b, c, t, h, w = x.shape
-            x = rearrange(x, 'b c t h w -> (b t) c h w')
+        self.norm = nn.RMSNorm(dim_latent)
 
-        out = self.net(x)
+    def forward(
+        self,
+        x,
+        return_latents = False,
+        time_cache = None,
+        return_time_cache = False,
+        **kwargs
+    ):
+        is_video = is_shape(x, 'b c t h w')
+
+        # zero-mean spatially
+
+        centered = x - x.mean(dim = (-2, -1), keepdim = True)
+
+        # temporal frame difference
+
+        if is_video:
+            b, t = shape(x, '[b] c [t] h w')
+
+            first_prev = default(time_cache, x[:, :, :1])
+            prev = torch.cat((first_prev, x[:, :, :-1]), dim = 2)
+            diff = (x - prev) * self.frame_diff_scale
+
+            next_cache = x[:, :, -1:].detach()
+        else:
+            diff = torch.zeros_like(centered)
+            next_cache = time_cache
+
+        x_in = torch.cat((centered, diff), dim = 1)
+
+        if is_video:
+            x_in = rearrange(x_in, 'b c t h w -> (b t) c h w')
+
+        out = self.net(x_in)
         out = rearrange(out, 'b (n d) 1 1 -> b n d', n = self.num_latent_tokens, d = self.dim_latent)
+        out = self.norm(out).tanh()
 
         if is_video:
             out = rearrange(out, '(b t) n d -> b t n d', b = b, t = t)
@@ -120,7 +161,7 @@ class SmallConvEncoder(nn.Module):
         if not return_time_cache:
             return out
 
-        return out, None
+        return out, next_cache
 
 # agent
 
@@ -167,8 +208,9 @@ class TransformerPPOAgent(nn.Module):
 
         if use_image_input:
             if use_conv_encoder:
+                num_combined_latents = 4
                 aux_image_encoder = SmallConvEncoder(
-                    num_latent_tokens = num_latent_tokens,
+                    num_latent_tokens = num_combined_latents,
                     dim_latent = 32
                 )
             else:
@@ -285,18 +327,19 @@ class TransformerPPOAgent(nn.Module):
 
 def main(
     num_episodes = 5000,
-    batch_size = 4,
-    grad_accum_every = 2,
-    update_episodes = 16,
+    batch_size = 8,
+    grad_accum_every = 1,
+    update_episodes = 32,
     update_epochs = 4,
-    ppo_replay_updates = 2,
+    ppo_replay_updates = 0,
     max_batches_per_epoch = 800,
     max_timesteps = 500,
     learning_rate = 3e-4,
+    value_loss_weight = 0.2,
     max_grad_norm = 0.5,
     target_return = 450.0,
     use_asym_critic = True,
-    agent_value_gradient_frac = 0.1,
+    agent_value_gradient_frac = 0.0,
     agent_policy_gradient_frac = 1.0,
     seed = 42,
     use_wandb = False,
@@ -329,7 +372,7 @@ def main(
     lapo_use_fdm = True,
     lapo_pred_actions = True,
     tem = False,
-    use_delight_gating = True,
+    use_delight_gating: bool | None = None,
     sigreg_num_subspaces = 1,
     mot_temporal = False,
     actor_spr = False,
@@ -338,6 +381,7 @@ def main(
     run_name = None,
 ):
     torch.manual_seed(seed)
+    use_delight_gating = default(use_delight_gating, not use_continuous_actions)
 
     if vectorized:
         update_episodes = max(1, update_episodes // num_envs)
@@ -562,7 +606,7 @@ def main(
                         use_delight_gating = use_delight_gating
                     )
 
-                    total_loss = (policy_loss + value_loss) / grad_accum_every
+                    total_loss = (policy_loss + value_loss_weight * value_loss) / grad_accum_every
                     accelerator.backward(total_loss)
 
                     is_last_batch = (i + 1) == num_batches
